@@ -128,9 +128,8 @@ pub fn process_sentinel_token() -> String {
 }
 
 /// Best-effort write of the refresh sentinel in `storage_dir`, the project's
-/// GitButler storage directory — how out-of-process writes (notably the `but`
-/// CLI) reach the watchers of the apps. Metadata writes and mutations declared
-/// `#[but_api(refreshes)]` call it. Contents are this process's
+/// GitButler storage directory — how out-of-process writes reach the watchers
+/// of the apps. Metadata writes call it. Contents are this process's
 /// [`process_sentinel_token`] so it can skip its own write. Errors are logged and
 /// swallowed, never failing the mutation.
 pub fn write_refresh_sentinel(storage_dir: &Path) {

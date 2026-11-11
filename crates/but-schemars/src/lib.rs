@@ -392,11 +392,10 @@ pub use schemars::schema_for as internal_schema_for;
 /// Register a type deriving `JsonSchema` to be included as a type in the
 /// packages/but-sdk.
 ///
-/// This can be used across crates. Any crate that is linked into the `but-ts`
-/// crate will have its [`register_sdk_type!`] calls picked up.
-///
-/// Currently we explicitly link the `but-api` crate in the `but-ts` crate which
-/// also includes the dependencies of `but-api`.
+/// This can be used across crates. Any crate that is linked into the binary
+/// collecting the registry will have its [`register_sdk_type!`] calls picked up.
+/// (The TypeScript generator that consumed this registry was removed with the
+/// web front end; the registry itself is slated for removal when survivors are slimmed.)
 ///
 /// If the type being registered has a schema name collision with another
 /// registered type, when type but-sdk types are generated at runtime an error

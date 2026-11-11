@@ -38,8 +38,6 @@ logs
 # Symlink to /.agents/skills so Claude Code discovers the repo's skills.
 !/.claude/skills
 
-debug-graph-??.svg
-
 # written to by cargo-flamegraph
 /cargo-flamegraph.trace/
 

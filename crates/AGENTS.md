@@ -15,7 +15,8 @@ Fixed decisions (owner-approved). The virtual-branch code is gone; the new crate
   (`but-installer`, `but-update`), plus `but-settings` and `but-db`.
 - **Planned new crates**: `gitcthulhu-git` (UI-agnostic plain-Git backend, blocking API, no GPUI),
   `gitcthulhu-oplog` (snapshot-based undo/redo on `but_core::snapshot`, no virtual-branch state), and
-  `gitcthulhu` (the GUI binary on `gpui-kit` from crates.io; it embeds the fonts in `assets/fonts`).
+  `gitcthulhu` (the GUI binary on `gpui-kit` from crates.io; it embeds the fonts in `assets/fonts`
+  and the app icons in `assets/app-icon`, still GitButler's artwork until GitCthulhu's own replaces it).
 - App data and config identity is `gitcthulhu`. GitButler on-disk state (`.git/gitbutler/*`, `refs/gitbutler/*`,
   `gitbutler.*` config) is neither read nor written.
 - Do not reintroduce virtual branches, stacks, workspace commits, API/CLI layers or Tauri/JS tooling.

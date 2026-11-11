@@ -2,8 +2,7 @@ use std::{path::Path, time::UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow};
 use but_askpass as askpass;
-use but_core::{extract_remote_name_and_short_name, ref_metadata::StackId};
-use but_ctx::Context;
+use but_core::extract_remote_name_and_short_name;
 use but_error::Code;
 use serde::Serialize;
 
@@ -29,112 +28,52 @@ pub struct PushResult {
     pub branch_sha_updates: Vec<(String, String, String)>,
 }
 
-/// Higher-level fetch and push helpers implemented for [`Context`].
-#[expect(clippy::too_many_arguments)]
-pub trait GitContextExt {
-    /// Fetch from the given remote using its configured fetch refspecs.
-    fn fetch(&self, remote_name: &str, askpass: Option<String>) -> Result<()>;
+/// Push a temporary branch to the remote and immediately delete it again, to test that pushing works.
+///
+/// `askpass` is passed on to [`push_with_askpass()`].
+pub fn git_test_push(
+    repo: &gix::Repository,
+    remote_name: &str,
+    branch_name: &str,
+    askpass: Option<Option<String>>,
+) -> Result<()> {
+    let target_branch_refname: gix::refs::FullName =
+        format!("refs/remotes/{remote_name}/{branch_name}").try_into()?;
+    let mut branch = repo
+        .try_find_reference(&target_branch_refname.to_string())?
+        .ok_or(anyhow!("failed to find branch {target_branch_refname}"))?;
 
-    /// Push the given commit to the provided remote branch.
-    ///
-    /// Returns the stderr output of the Git executable if used.
-    fn push<B>(
-        &self,
-        head: gix::ObjectId,
-        branch: B,
-        with_force: bool,
-        force_push_protection: bool,
-        refspec: Option<String>,
-        askpass_broker: Option<Option<StackId>>,
-        push_opts: Vec<String>,
-    ) -> Result<String>
-    where
-        B: TryInto<gix::refs::FullName>,
-        B::Error: Into<anyhow::Error>;
+    let commit_id = branch.peel_to_commit()?.id;
+    let branch_name = format!("test-push-{}", now_ms());
+    let refname: gix::refs::FullName =
+        format!("refs/remotes/{remote_name}/{branch_name}").try_into()?;
 
-    /// Push a temporary branch to the remote and immediately delete it again.
-    fn git_test_push(
-        &self,
-        remote_name: &str,
-        branch_name: &str,
-        askpass: Option<Option<StackId>>,
-    ) -> Result<()>;
-}
+    push_with_askpass(
+        repo,
+        commit_id,
+        refname.clone(),
+        false,
+        false,
+        None,
+        askpass.clone(),
+        vec![],
+    )
+    .map_err(|err| anyhow!(err.to_string()))?;
 
-impl GitContextExt for Context {
-    fn fetch(&self, remote_name: &str, askpass: Option<String>) -> Result<()> {
-        fetch_with_askpass(self.workdir_or_gitdir()?, remote_name, askpass)
-    }
+    let empty_refspec = Some(format!(":refs/heads/{branch_name}"));
+    push_with_askpass(
+        repo,
+        commit_id,
+        refname,
+        false,
+        false,
+        empty_refspec,
+        askpass,
+        vec![],
+    )
+    .map_err(|err| anyhow!(err.to_string()))?;
 
-    fn push<B>(
-        &self,
-        head: gix::ObjectId,
-        branch: B,
-        with_force: bool,
-        force_push_protection: bool,
-        refspec: Option<String>,
-        askpass_broker: Option<Option<StackId>>,
-        push_opts: Vec<String>,
-    ) -> Result<String>
-    where
-        B: TryInto<gix::refs::FullName>,
-        B::Error: Into<anyhow::Error>,
-    {
-        push_with_askpass(
-            &*self.repo.get()?,
-            head,
-            branch,
-            with_force,
-            force_push_protection,
-            refspec,
-            askpass_broker,
-            push_opts,
-        )
-    }
-
-    fn git_test_push(
-        &self,
-        remote_name: &str,
-        branch_name: &str,
-        askpass: Option<Option<StackId>>,
-    ) -> Result<()> {
-        let target_branch_refname: gix::refs::FullName =
-            format!("refs/remotes/{remote_name}/{branch_name}").try_into()?;
-        let repo = self.repo.get()?;
-        let mut branch = repo
-            .try_find_reference(&target_branch_refname.to_string())?
-            .ok_or(anyhow!("failed to find branch {target_branch_refname}"))?;
-
-        let commit_id = branch.peel_to_commit()?.id;
-        let branch_name = format!("test-push-{}", now_ms());
-        let refname: gix::refs::FullName =
-            format!("refs/remotes/{remote_name}/{branch_name}").try_into()?;
-
-        self.push(
-            commit_id,
-            refname.clone(),
-            false,
-            false,
-            None,
-            askpass,
-            vec![],
-        )
-        .map_err(|err| anyhow!(err.to_string()))?;
-
-        let empty_refspec = Some(format!(":refs/heads/{branch_name}"));
-        self.push(
-            commit_id,
-            refname,
-            false,
-            false,
-            empty_refspec,
-            askpass,
-            vec![],
-        )
-        .map_err(|err| anyhow!(err.to_string()))?;
-
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Fetch from `remote_name`, forwarding credential prompts through the application askpass broker
@@ -291,7 +230,7 @@ pub fn push_with_askpass<B>(
     with_force: bool,
     force_push_protection: bool,
     refspec: Option<String>,
-    askpass_broker: Option<Option<but_core::Id<'S'>>>,
+    askpass_broker: Option<Option<String>>,
     push_opts: Vec<String>,
 ) -> Result<String>
 where
@@ -303,7 +242,7 @@ where
     let refspec = refspec.unwrap_or_else(|| format!("{head}:refs/heads/{branch_name}"));
 
     let on_prompt = if askpass::get_broker().is_some() {
-        Some(move |prompt: String| handle_git_prompt_push(prompt, askpass_broker))
+        Some(move |prompt: String| handle_git_prompt_push(prompt, askpass_broker.clone()))
     } else {
         None
     };
@@ -395,15 +334,12 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-async fn handle_git_prompt_push(
-    prompt: String,
-    askpass: Option<Option<StackId>>,
-) -> Option<String> {
-    if let Some(branch_id) = askpass {
-        tracing::info!("received prompt for branch push {branch_id:?}: {prompt:?}");
+async fn handle_git_prompt_push(prompt: String, askpass: Option<Option<String>>) -> Option<String> {
+    if let Some(branch) = askpass {
+        tracing::info!("received prompt for branch push {branch:?}: {prompt:?}");
         askpass::get_broker()
             .expect("askpass broker must be initialized")
-            .submit_prompt(prompt, askpass::Context::Push { branch_id })
+            .submit_prompt(prompt, askpass::Context::Push { branch })
             .await
     } else {
         tracing::warn!("received askpass push prompt but no broker was supplied; returning None");

@@ -185,7 +185,7 @@ pub fn url(generate: &mut schemars::SchemaGenerator) -> schemars::Schema {
 /// #[derive(schemars::JsonSchema)]
 /// struct Example {
 ///     #[schemars(schema_with = "but_schemars::project_id")]
-///     id: gitbutler_project::ProjectId,
+///     id: ProjectId,
 /// }
 /// ```
 pub fn project_id(generate: &mut schemars::SchemaGenerator) -> schemars::Schema {

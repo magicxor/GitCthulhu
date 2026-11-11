@@ -18,7 +18,7 @@ mod repository;
 
 #[cfg(feature = "tokio")]
 pub use self::context::{
-    GitContextExt, PushResult, fetch_with_askpass, prune_with_askpass, push_with_askpass,
+    PushResult, fetch_with_askpass, git_test_push, prune_with_askpass, push_with_askpass,
     remote_failure_reason,
 };
 #[cfg(feature = "tokio")]

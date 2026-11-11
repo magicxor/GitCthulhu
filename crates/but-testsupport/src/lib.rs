@@ -13,11 +13,6 @@ use gix_testtools::{Creation, FixtureState, PostResult, tempfile};
 mod in_memory_meta;
 pub use in_memory_meta::{InMemoryRefMetadata, InMemoryRefMetadataHandle, StackState};
 
-#[cfg(feature = "sandbox")]
-mod sandbox;
-#[cfg(feature = "sandbox")]
-pub use sandbox::Sandbox;
-
 /// Choose a slightly more obvious, yet easy to type syntax than a function with 4 parameters.
 /// i.e. `hunk_header("-1,10", "+1,10")`.
 /// Returns `( (old_start, old_lines), (new_start, new_lines) )`.
@@ -737,9 +732,6 @@ pub fn sanitize_uuids_and_timestamps(input: String) -> String {
 pub fn debug_str(input: &dyn std::fmt::Debug) -> String {
     format!("{input:#?}")
 }
-
-mod graph;
-pub use graph::{graph_tree, graph_workspace, graph_workspace_determinisitcally};
 
 mod prepare_cmd_env;
 pub use prepare_cmd_env::{isolate_env_std_cmd, isolate_env_std_cmd_with_additional_removals};

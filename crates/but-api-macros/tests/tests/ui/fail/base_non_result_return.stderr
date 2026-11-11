@@ -1,5 +1,0 @@
-error: expected Result<T> or Result<T, E>
- --> tests/ui/fail/base_non_result_return.rs:9:20
-  |
-9 | fn not_result() -> i32 {
-  |                    ^^^

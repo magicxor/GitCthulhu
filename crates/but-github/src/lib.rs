@@ -579,7 +579,7 @@ mod tests {
                 }
                 (ctx, expected) => panic!("{status}: got {ctx:?}, expected {expected:?}"),
             }
-            // `but_api::json::Error` serializes the context message when present, else the chain.
+            // The API layer's JSON error serializes the context message when present, else the chain.
             let api_message = err
                 .custom_context_or_error_chain()
                 .message

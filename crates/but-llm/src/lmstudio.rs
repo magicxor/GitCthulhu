@@ -1,6 +1,6 @@
+use crate::tool::Toolset;
 use anyhow::Result;
 use async_openai::{Client, config::OpenAIConfig};
-use but_tools::tool::Toolset;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 

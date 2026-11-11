@@ -8,6 +8,7 @@ mod ollama;
 mod openai;
 mod openai_utils;
 mod openrouter;
+pub mod tool;
 
 use std::sync::Arc;
 
@@ -356,7 +357,7 @@ impl LLMProvider {
         &self,
         system_message: &str,
         chat_messages: Vec<ChatMessage>,
-        tool_set: &mut impl but_tools::tool::Toolset,
+        tool_set: &mut impl crate::tool::Toolset,
         model: &str,
         on_token: impl Fn(&str) + Send + Sync + 'static,
     ) -> anyhow::Result<(String, Vec<ChatMessage>)> {
@@ -427,7 +428,7 @@ impl LLMProvider {
         &self,
         system_message: &str,
         chat_messages: Vec<ChatMessage>,
-        tool_set: &mut impl but_tools::tool::Toolset,
+        tool_set: &mut impl crate::tool::Toolset,
         model: &str,
     ) -> anyhow::Result<String> {
         match &self.client {

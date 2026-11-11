@@ -1,7 +1,7 @@
+use crate::tool::Toolset;
 use anyhow::{Context as _, Result};
 use async_openai::{Client, config::OpenAIConfig};
 use but_secret::{Sensitive, secret};
-use but_tools::tool::Toolset;
 use reqwest::header::{HeaderMap, HeaderValue};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;

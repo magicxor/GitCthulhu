@@ -9,7 +9,7 @@ use crate::LegacyProjectId;
 
 /// A self-describing handle to the path of the project on disk, typically the `.git` directory.
 ///
-/// Use it in places where you can't use `but_ctx::Context::gitdir`.
+/// Use it in places where no repository context is available.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProjectHandle(String);
 

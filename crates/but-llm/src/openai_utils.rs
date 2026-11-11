@@ -1,5 +1,6 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
+use crate::tool::Toolset;
 use anyhow::{Context, Result};
 use async_openai::{
     Client,
@@ -12,7 +13,6 @@ use async_openai::{
         CreateChatCompletionRequestArgs, ResponseFormat, ResponseFormatJsonSchema,
     },
 };
-use but_tools::tool::Toolset;
 use futures::StreamExt;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;

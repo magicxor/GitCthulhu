@@ -25,7 +25,6 @@ askpass = []
 [dependencies]
 but-askpass.workspace = true
 but-core.workspace = true
-but-ctx.workspace = true
 but-error.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

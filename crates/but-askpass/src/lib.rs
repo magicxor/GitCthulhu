@@ -19,7 +19,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use but_core::ref_metadata::StackId;
 use serde::Serialize;
 use tokio::sync::{Mutex, oneshot};
 
@@ -101,10 +100,10 @@ pub type AskpassRequestId = but_core::Id<'A'>;
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Context {
-    /// A prompt encountered while pushing a stack.
+    /// A prompt encountered while pushing a branch.
     Push {
-        /// The stack being pushed, if one is associated with the prompt.
-        branch_id: Option<StackId>,
+        /// The name of the branch being pushed, if one is associated with the prompt.
+        branch: Option<String>,
     },
     /// A prompt encountered while fetching.
     Fetch {
@@ -113,8 +112,8 @@ pub enum Context {
     },
     /// A prompt encountered while signing a commit.
     SignedCommit {
-        /// The stack being signed, if one is associated with the prompt.
-        branch_id: Option<StackId>,
+        /// The name of the branch being committed to, if one is associated with the prompt.
+        branch: Option<String>,
     },
     /// A prompt encountered while cloning.
     Clone {

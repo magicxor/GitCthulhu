@@ -1,8 +1,8 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
+use crate::tool::Toolset;
 use anyhow::{Context as _, Result};
 use but_secret::{Sensitive, secret};
-use but_tools::tool::Toolset;
 use reqwest::{
     Response,
     header::{CONTENT_TYPE, HeaderMap, HeaderValue},
@@ -831,7 +831,7 @@ fn handle_text_response(
     });
 }
 
-fn convert_tool_to_anthropic_format(tool: &dyn but_tools::tool::Tool) -> serde_json::Value {
+fn convert_tool_to_anthropic_format(tool: &dyn crate::tool::Tool) -> serde_json::Value {
     serde_json::json!({
         "name": tool.name(),
         "description": tool.description(),

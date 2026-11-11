@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["master", "plain-git-client"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo fmt --check
+        run: cargo fmt --check --all
+
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+      - name: Linux dependencies
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          # libdbus: the keyring (but-secret). The rest: the gpui-kit GUI.
+          sudo ./scripts/install-minimal-debian-dependencies.sh
+          sudo timeout 300 apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 libxcb1-dev libxkbcommon-x11-dev libfontconfig-dev
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace

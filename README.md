@@ -1,85 +1,37 @@
-<div align="center">
-  
-  <img align="center" width="100px" src="https://gitbutler-docs-images-public.s3.us-east-1.amazonaws.com/md-logo.png" alt="GitButler logo" />
-  <br />
+# GitCthulhu
 
-  <h1 align="center">GitButler</h1>
-  
-  <br/>
+GitCthulhu is a deliberately boring, plain Git GUI client. It is forked from
+[GitButler](https://github.com/gitbutlerapp/gitbutler) with virtual branches, stacks and the web/Tauri front end
+removed: it works with ordinary Git branches, the index and the working tree, like any standard Git client.
 
-  <img width="100%" src="https://gitbutler-docs-images-public.s3.us-east-1.amazonaws.com/app-preview-light.png" alt="GitButler desktop app preview" />
-  <p align="center"><i>Our beautiful GUI</i></p>
+- **GUI**: Rust, built on [gpui-kit](https://crates.io/crates/gpui-kit), with a layout modelled on Gitnuro. The
+  long-term feature direction is GitKraken.
+- **Kept from GitButler**: forge integrations (GitHub, GitLab, Bitbucket), AI assistance (for example commit
+  message generation), snapshot-based undo/redo, an embedded terminal, and the installer/updater crates.
+- **Git engine**: reads through `gix` in-process, mutations through the `git` executable so hooks, signing and
+  credential helpers behave as usual.
 
-  <img width="100%" src="https://gitbutler-docs-images-public.s3.us-east-1.amazonaws.com/cli-preview.png" alt="GitButler CLI preview" />
-  <p align="center"><i>Our amazing <code>but</code> CLI</i></p>
+## Status
 
-  <br/>
+Under construction. The virtual-branch code and the old front ends are gone; the new backend (`gitcthulhu-git`),
+the undo log (`gitcthulhu-oplog`) and the GUI (`gitcthulhu`) are being built. There is no usable application yet.
 
-[![TWEET][s1]][l1] [
-![BLUESKY][s8]][l8] [![DISCORD][s2]][l2]
+## Building
 
-[![CI][s0]][l0] [![INSTA][s3]][l3] [![YOUTUBE][s5]][l5] [![DEEPWIKI][s7]][l7]
+Requirements:
 
-[s0]: https://github.com/gitbutlerapp/gitbutler/actions/workflows/push.yaml/badge.svg
-[l0]: https://github.com/gitbutlerapp/gitbutler/actions/workflows/push.yaml
-[s1]: https://img.shields.io/badge/Twitter-black?logo=x&logoColor=white
-[l1]: https://twitter.com/intent/follow?screen_name=gitbutler
-[s2]: https://img.shields.io/discord/1060193121130000425?label=Discord&color=5865F2
-[l2]: https://discord.gg/MmFkmaJ42D
-[s3]: https://img.shields.io/badge/Instagram-E4405F?logo=instagram&logoColor=white
-[l3]: https://www.instagram.com/gitbutler/
-[s5]: https://img.shields.io/youtube/channel/subscribers/UCEwkZIHGqsTGYvX8wgD0LoQ
-[l5]: https://www.youtube.com/@gitbutlerapp
-[s7]: https://deepwiki.com/badge.svg
-[l7]: https://deepwiki.com/gitbutlerapp/gitbutler
-[s8]: https://img.shields.io/badge/Bluesky-0285FF?logo=bluesky&logoColor=fff
-[l8]: https://bsky.app/profile/gitbutler.com
+- Rust, as pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
+- Windows: the Windows SDK (`fxc.exe`)
+- [Zig 0.17](https://ziglang.org/download/) on `PATH` (builds libghostty-vt for the embedded terminal, `but-tty`)
+- Linux: libxcb, xkbcommon-x11, fontconfig and libdbus development packages
 
-</div>
+```sh
+cargo check --workspace --all-targets
+cargo test --workspace
+```
 
-<br/>
-
-GitButler is a powerful new Git-based version control system, designed from scratch to be simple, powerful and flexible. It is designed for ease of use and modern agentic workflows.
-
-It features stacked branches, parallel branches, unlimited undo, easy commit mutations, forge integrations and more.
-
-Works instantly in any existing Git repo as a friendlier and more powerful drop-in Git user interface replacement - for you and your agents.
-
-Why use GitButler instead of vanilla Git? What a great question.
-
-- **Stacked Branches** ([gui](https://docs.gitbutler.com/features/branch-management/stacked-branches), [cli](https://docs.gitbutler.com/cli-guides/cli-tutorial/branching-and-commiting#stacked-branches))
-  - Effortlessly create branches stacked on other branches. Amend or edit any commit easily with automatic restacking.
-- **Parallel Branches** ([gui](https://docs.gitbutler.com/features/branch-management/virtual-branches), [cli](https://docs.gitbutler.com/cli-guides/cli-tutorial/branching-and-commiting#parallel-branches))
-  - Organize work on multiple branches simultaneously, rather than constantly switching branches.
-- **Easy Commit Management** ([gui](https://docs.gitbutler.com/features/branch-management/commits), [cli](https://docs.gitbutler.com/cli-guides/cli-tutorial/rubbing))
-  - Uncommit, reword, amend, move, split and squash commits by dragging and dropping or simple CLI commands. Forget about `rebase -i`, you don't need it anymore.
-- **Undo Timeline** ([gui](https://docs.gitbutler.com/features/timeline), [cli](https://docs.gitbutler.com/cli-guides/cli-tutorial/operations-log))
-  - Logs all operations and changes and allows you to easily undo or revert any operation.
-- **First Class Conflicts** ([gui](https://docs.gitbutler.com/overview#conflicting-branches), [cli](https://docs.gitbutler.com/cli-guides/cli-tutorial/conflict-resolution))
-  - Rebases always succeed. Commits can be marked as conflicted and resolved at any time, in any order.
-- **Forge Integration** ([gui](https://docs.gitbutler.com/features/forge-integration/github-integration), [cli](https://docs.gitbutler.com/cli-guides/cli-tutorial/forges))
-  - Authenticate to GitHub, GitLab, or Bitbucket to easily open and update Pull Requests, list branches, get CI statuses and more. No other tools required.
-- **AI Tooling** ([gui](https://docs.gitbutler.com/features/ai-integration/ai-overview), [cli](https://docs.gitbutler.com/cli-guides/cli-tutorial/ai-stuff))
-  - Use built-in AI handlers to help create commit messages, branch names, PR descriptions and more.
-  - Easily install hooks or skills for all modern agent systems to level up their Git management.
-
-## Documentation
-
-You can find our end user documentation at: <https://docs.gitbutler.com>
-
-## Bugs and Feature Requests
-
-If you have a bug or feature request, feel free to open an [issue](https://github.com/gitbutlerapp/gitbutler/issues/new),
-or [join our Discord server](https://discord.gg/MmFkmaJ42D).
+See [DEVELOPMENT.md](DEVELOPMENT.md) for more.
 
 ## License
 
-The TLDR is that GitButler is under a [Fair Source](https://fair.io/) software license, meaning that you can use it, view the source, contribute, etc. You just can't build a competitor with it. It also becomes MIT after 2 years. So, MIT with an expiring non-compete clause.
-
-## Contributing
-
-So you want to help out? Please check out the [CONTRIBUTING.md](CONTRIBUTING.md)
-document.
-
-If you want to skip right to getting the code to actually compile, take a look
-at the [DEVELOPMENT.md](DEVELOPMENT.md) file.
+See [LICENSE.md](LICENSE.md). Code inherited from GitButler remains under its Functional Source License terms.

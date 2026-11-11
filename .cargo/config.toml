@@ -1,6 +1,6 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
-target-dir = "target" # Needs to be the default directory as this assumption is used by some of the TypeScript files
+target-dir = "target"
 
 # Without this `SNAPSHOTS=overwrite cargo test` run from worktrees will update
 # snapshot files in the root repo rather than the worktree. This fixes that

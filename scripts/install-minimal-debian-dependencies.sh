@@ -21,5 +21,5 @@ for attempt in 1 2 3; do
     fi
 done
 
-# Install the dependencies needed to build the but-server and the CLI.
+# Install the dependencies needed to build the workspace (libdbus for the keyring in but-secret).
 timeout 300 apt-get install -y --no-install-recommends "${apt_options[@]}" libdbus-1-dev pkg-config

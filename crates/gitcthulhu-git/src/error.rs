@@ -55,12 +55,6 @@ pub enum GitError {
         /// What is not supported.
         what: &'static str,
     },
-    /// Stub bodies during development (WP-B0a).
-    #[error("not implemented yet: {op}")]
-    NotImplemented {
-        /// `<module>::<function>`.
-        op: &'static str,
-    },
     /// The operation was cancelled through its `CancelToken`.
     #[error("the operation was cancelled")]
     Cancelled,
@@ -440,7 +434,6 @@ pub enum GitErrorKind {
     BareRepository,
     UnbornHead,
     Unsupported,
-    NotImplemented,
     Cancelled,
     AuthFailed,
     AuthCancelled,
@@ -495,7 +488,6 @@ impl GitError {
             GitError::BareRepository => K::BareRepository,
             GitError::UnbornHead => K::UnbornHead,
             GitError::Unsupported { .. } => K::Unsupported,
-            GitError::NotImplemented { .. } => K::NotImplemented,
             GitError::Cancelled => K::Cancelled,
             GitError::AuthFailed { .. } => K::AuthFailed,
             GitError::AuthCancelled { .. } => K::AuthCancelled,

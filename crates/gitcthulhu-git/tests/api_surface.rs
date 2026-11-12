@@ -492,3 +492,24 @@ fn thread_safety_contracts() {
     fn std_error<E: std::error::Error + Send + Sync + 'static>() {}
     std_error::<GitError>();
 }
+
+/// Integration step (spec §12): the skeleton's `NotImplemented` stubs are gone for good.
+#[test]
+fn no_not_implemented_stubs_remain() {
+    fn visit(dir: &Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("source directory is readable") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                visit(&path, hits);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("source file is UTF-8");
+                if text.contains(concat!("Not", "Implemented")) {
+                    hits.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    visit(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hits);
+    assert!(hits.is_empty(), "stub markers are left in: {hits:?}");
+}

@@ -14,7 +14,7 @@ mod support;
 use std::sync::Arc;
 
 use gitcthulhu_git::{
-    CancelToken, DiffContent, DiffOptions, DiffTarget, GitErrorKind, HunkHeader, LineKind, LineRef,
+    CancelToken, DiffContent, DiffOptions, DiffTarget, HunkHeader, LineKind, LineRef,
     NoPrompter, Repo, Selection, SelectionRequest, diff, stage,
 };
 use support::{TestEnv, TestRepo};
@@ -68,7 +68,7 @@ struct OurDiff {
     base_new: Option<gix::ObjectId>,
 }
 
-fn our_diff(t: &TestRepo, repo: &Repo, old: &[u8], new: &[u8]) -> OurDiff {
+fn our_diff(repo: &Repo) -> OurDiff {
     let target = DiffTarget::Unstaged {
         path: "f".into(),
         previous_path: None,
@@ -103,11 +103,6 @@ fn our_diff(t: &TestRepo, repo: &Repo, old: &[u8], new: &[u8]) -> OurDiff {
                 base_new: file_diff.new.map(|side| side.id),
             }
         }
-        Err(err) if err.kind() == GitErrorKind::NotImplemented => OurDiff {
-            hunks: engine::hunks(old, new, CONTEXT_LINES),
-            base_old: Some(oid(&t.git(&["rev-parse", ":f"]))),
-            base_new: Some(oid(&t.git(&["hash-object", "--", "f"]))),
-        },
         Err(err) => panic!("file_diff failed: {err:?}"),
     }
 }
@@ -193,7 +188,7 @@ fn oracle_each_hunk_equals_git_apply_cached() {
     for name in FIXTURES {
         let (t, old, new) = setup(&env, name);
         let repo = t.open();
-        let diff = our_diff(&t, &repo, &old, &new);
+        let diff = our_diff(&repo);
         assert!(!diff.hunks.is_empty(), "{name}: the fixture has changes");
         for (i, hunk) in diff.hunks.iter().enumerate() {
             let patch = env.path(&format!("{name}-{i}.patch"));
@@ -229,9 +224,9 @@ fn oracle_each_hunk_equals_git_apply_cached() {
 fn oracle_full_stage_equals_git_add() {
     let env = TestEnv::new();
     for name in FIXTURES {
-        let (t, old, new) = setup(&env, name);
+        let (t, _old, _new) = setup(&env, name);
         let repo = t.open();
-        let diff = our_diff(&t, &repo, &old, &new);
+        let diff = our_diff(&repo);
         t.git(&["add", "f"]);
         let expected = index_id(&t);
         t.git(&["reset", "-q"]);
@@ -265,99 +260,5 @@ fn oracle_full_stage_equals_git_add() {
             expected,
             "{name}: staging every line equals git add"
         );
-    }
-}
-
-/// Test-side hunk computation used while `diff::file_diff` is not available: the algorithm of §4.3.
-mod engine {
-    use gix::diff::blob::{Algorithm, InternedInput, diff_with_slider_heuristics};
-
-    use super::{Hunk, Line};
-    use gitcthulhu_git::{HunkHeader, LineKind};
-
-    pub fn hunks(old: &[u8], new: &[u8], context: u32) -> Vec<Hunk> {
-        let old_lines = super::raw_lines(old);
-        let new_lines = super::raw_lines(new);
-        let mut input: InternedInput<&[u8]> = InternedInput::default();
-        input.update_before(old_lines.iter().copied());
-        input.update_after(new_lines.iter().copied());
-        let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
-        let changes: Vec<_> = diff.hunks().collect();
-        let (old_len, new_len) = (old_lines.len() as u32, new_lines.len() as u32);
-
-        // Git's grouping: changes whose gap of equal lines is at most 2 * context share a hunk.
-        let mut groups: Vec<Vec<gix::diff::blob::Hunk>> = Vec::new();
-        for change in changes {
-            match groups.last_mut() {
-                Some(group)
-                    if change.before.start
-                        - group.last().expect("groups are never empty").before.end
-                        <= 2 * context =>
-                {
-                    group.push(change)
-                }
-                _ => groups.push(vec![change]),
-            }
-        }
-
-        groups
-            .into_iter()
-            .map(|group| {
-                let first = group.first().expect("groups are never empty");
-                let last = group.last().expect("groups are never empty");
-                let lead = first.before.start.min(context);
-                let trail = (old_len - last.before.end).min(context);
-                let (old_start, new_start) = (first.before.start - lead, first.after.start - lead);
-                let (old_end, new_end) = (last.before.end + trail, last.after.end + trail);
-                debug_assert!(new_end <= new_len, "both sides share the trailing context");
-
-                let mut lines = Vec::new();
-                let (mut i, mut j) = (old_start, new_start);
-                for change in &group {
-                    while i < change.before.start {
-                        lines.push(Line {
-                            kind: LineKind::Context,
-                            old: Some(i + 1),
-                            new: Some(j + 1),
-                        });
-                        i += 1;
-                        j += 1;
-                    }
-                    lines.extend(change.before.clone().map(|o| Line {
-                        kind: LineKind::Removed,
-                        old: Some(o + 1),
-                        new: None,
-                    }));
-                    lines.extend(change.after.clone().map(|n| Line {
-                        kind: LineKind::Added,
-                        old: None,
-                        new: Some(n + 1),
-                    }));
-                    i = change.before.end;
-                    j = change.after.end;
-                }
-                while i < old_end {
-                    lines.push(Line {
-                        kind: LineKind::Context,
-                        old: Some(i + 1),
-                        new: Some(j + 1),
-                    });
-                    i += 1;
-                    j += 1;
-                }
-                let (old_count, new_count) = (old_end - old_start, new_end - new_start);
-                // An empty side starts at the line before, like Git.
-                let start = |s: u32, count: u32| if count == 0 { s } else { s + 1 };
-                Hunk {
-                    header: HunkHeader {
-                        old_start: start(old_start, old_count),
-                        old_lines: old_count,
-                        new_start: start(new_start, new_count),
-                        new_lines: new_count,
-                    },
-                    lines,
-                }
-            })
-            .collect()
     }
 }

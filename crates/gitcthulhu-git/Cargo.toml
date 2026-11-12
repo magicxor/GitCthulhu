@@ -60,7 +60,6 @@ windows = { version = "0.62.0", features = [
 nix = { workspace = true, features = ["signal", "process"] }
 
 [dev-dependencies]
-but-testsupport.workspace = true
 snapbox.workspace = true
 proptest.workspace = true
 sysinfo = { workspace = true, features = ["system"] }

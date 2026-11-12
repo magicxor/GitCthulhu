@@ -3045,7 +3045,6 @@ dependencies = [
  "bitflags 2.13.0",
  "bstr",
  "but-core",
- "but-testsupport",
  "chardetng",
  "encoding_rs",
  "gitbutler-filemonitor",

@@ -3,9 +3,6 @@
 //! UI-agnostic and blocking: every public function must be called from a background thread. Reads run in-process
 //! with `gix`; mutations run the `git` executable (so hooks, filters and signing behave natively). See
 //! `GitCthulhu.plan/20-backend-architecture.md`.
-//!
-//! The crate is the shared skeleton of several work packages: every module exists with its final public signatures,
-//! and modules whose package has not landed return [`GitError::NotImplemented`].
 // `unsafe` is allowed only in src/cli/kill.rs (Job Object / killpg) and src/helper_main/askpass/windows*.rs (pipe
 // client), which use #[allow(unsafe_code)].
 #![deny(unsafe_code)]

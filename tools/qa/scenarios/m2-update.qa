@@ -1,0 +1,28 @@
+# Milestone 2 (X5): the update notice in the bottom bar, its right-click menu, the Updates settings page and the
+# snooze, dark theme, 1280x720. `update serve` starts the REAL update service against a loopback manifest announcing
+# 9.9.9 (QA runs never leave the machine), so every step goes through the code a release build uses.
+resize 1280x720
+set theme dark
+update serve 9.9.9 https://example.com/gitcthulhu/releases/v9.9.9
+wait idle
+assert update notice 9.9.9
+shot m2-update-01-welcome-notice
+open repository linear
+wait idle
+shot m2-update-02-repository-notice
+open update menu
+wait idle
+shot m2-update-03-notice-menu
+close menu
+open settings page updates
+wait idle
+shot m2-update-04-updates-page
+update check
+wait idle
+shot m2-update-05-check-now
+close dialog
+update snooze 24
+wait idle
+assert update notice none
+shot m2-update-06-snoozed
+assert no error

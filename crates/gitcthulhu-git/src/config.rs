@@ -14,7 +14,7 @@ use crate::{
     CancelToken, ConfigScope, GitError, GitRuntime, Identity, IdentityInfo, OpClass, OpContext,
     OpOutcome, PartialIdentity, PullMode, RefreshSet, Repo, RepoExclusive, Result, SigningConfig,
     SigningFormat,
-    cli::{CommandKind, GitCommand, run_checked_global},
+    cli::{CommandKind, GitCommand, run_checked, run_checked_global},
     internal::outcome::run_one,
 };
 
@@ -394,6 +394,55 @@ pub fn commit_graph_present(repo: &Repo) -> bool {
             .join("commit-graphs")
             .join("commit-graph-chain")
             .is_file()
+}
+
+/// Reachable commits above which a repository gets a commit-graph written in the background (§9).
+pub const COMMIT_GRAPH_THRESHOLD: usize = 10_000;
+
+/// Background maintenance: writes the commit-graph when the repository has none and more than `threshold` commits
+/// are reachable from its branches, remotes and tags (counting stops at `threshold + 1`, so the probe is cheap).
+/// Returns whether it wrote. Cancellable through `ctx`.
+///
+/// It takes no [`RepoExclusive`]: a commit-graph is a derived file under `objects/info` that Git itself writes
+/// under its own lock, and nothing in the repository's visible state changes, so it may run beside any operation.
+pub fn write_commit_graph_if_large(repo: &Repo, threshold: usize, ctx: &OpContext) -> Result<bool> {
+    if commit_graph_present(repo) {
+        return Ok(false);
+    }
+    ctx.cancel.check()?;
+    let count = run_checked(
+        repo,
+        GitCommand::new(repo, CommandKind::Read).args([
+            "rev-list".to_owned(),
+            "--count".to_owned(),
+            format!("--max-count={}", threshold.saturating_add(1)),
+            "--branches".to_owned(),
+            "--remotes".to_owned(),
+            "--tags".to_owned(),
+        ]),
+        ctx,
+        OpClass::Generic,
+    )?;
+    let reachable = String::from_utf8_lossy(&count.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0);
+    if reachable <= threshold {
+        return Ok(false);
+    }
+    ctx.cancel.check()?;
+    run_checked(
+        repo,
+        GitCommand::new(repo, CommandKind::Mutation).args([
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--changed-paths",
+        ]),
+        ctx,
+        OpClass::Generic,
+    )?;
+    Ok(true)
 }
 
 /// `git commit-graph write --reachable --changed-paths` (offered once for large repos, §9).

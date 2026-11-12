@@ -49,11 +49,12 @@ impl RepoTab {
                 ui.rebase_plan.is_some(),
             )
         };
+        let mut dropped = false;
         if blame && self.views.blame.is_none() {
             let ctx = self.ctx.clone();
             self.views.blame = Some(cx.new(|cx| crate::blame::BlameView::new(ctx, window, cx)));
         } else if !blame {
-            self.views.blame = None;
+            dropped |= self.views.blame.take().is_some();
         }
         match history {
             Some(path) if self.views.history.as_ref().map(|(p, _)| p) != Some(&path) => {
@@ -65,7 +66,7 @@ impl RepoTab {
                 self.views.history = Some((path, view));
             }
             Some(_) => {}
-            None => self.views.history = None,
+            None => dropped |= self.views.history.take().is_some(),
         }
         if rebase && self.views.rebase.is_none() {
             let ctx = self.ctx.clone();
@@ -74,7 +75,17 @@ impl RepoTab {
                     crate::rebase_interactive::RebaseInteractiveView::new(ctx, window, cx)
                 }));
         } else if !rebase {
-            self.views.rebase = None;
+            dropped |= self.views.rebase.take().is_some();
+        }
+        // A view that was dropped while it held the keyboard focus (closed by something other than its own close
+        // button, for example a new selection) must not leave the focus nowhere: the frame takes it back.
+        // The dropped entity releases its focus handle only after this render, hence the deferral.
+        if dropped {
+            cx.defer_in(window, |this, window, cx| {
+                if window.focused(cx).is_none() {
+                    window.focus(&this.focus, cx);
+                }
+            });
         }
     }
 

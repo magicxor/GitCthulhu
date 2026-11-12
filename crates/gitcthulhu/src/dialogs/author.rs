@@ -28,8 +28,18 @@ use crate::widgets::{CheckboxText, PrimaryButton, observed};
 pub enum IdentityChoice {
     /// Use this identity for one commit (`CommitOptions::identity_override`).
     Override(Identity),
-    /// The identity was saved (`save_author`); commit normally.
-    Saved,
+    /// The identity was saved (`save_author`); commit normally. Carries the identity that was saved, which a
+    /// sign-off text uses (the saved configuration may not be reloaded yet).
+    Saved(Identity),
+}
+
+impl IdentityChoice {
+    /// The identity the user entered.
+    pub fn identity(&self) -> &Identity {
+        match self {
+            IdentityChoice::Override(identity) | IdentityChoice::Saved(identity) => identity,
+        }
+    }
 }
 
 /// Element ids of the author dialogs.
@@ -366,8 +376,9 @@ impl CommitIdentityDialog {
             // Save into the user's .gitconfig first; the commit continues once that is written.
             let saved = {
                 let on_done = on_done.clone();
+                let identity = identity.clone();
                 Box::new(move |window: &mut Window, cx: &mut App| {
-                    on_done(IdentityChoice::Saved, window, cx)
+                    on_done(IdentityChoice::Saved(identity.clone()), window, cx)
                 })
             };
             self.tab.with_tab(window, cx, move |t, window, cx| {

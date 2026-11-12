@@ -118,12 +118,33 @@ pub mod ids {
 
 /// Width of the graph column for a drag padding (08 §2.2): `max(100, 120 + padding)`.
 pub fn graph_width(padding: f32) -> f32 {
-    (m::GRAPH_DEFAULT_W + padding).max(m::GRAPH_MIN_W)
+    graph_width_from(m::GRAPH_DEFAULT_W, padding)
+}
+
+/// Width of the graph column for a drag padding on top of `default_w` (see [`default_graph_width`]).
+pub fn graph_width_from(default_w: f32, padding: f32) -> f32 {
+    (default_w + padding).max(m::GRAPH_MIN_W)
 }
 
 /// The padding accumulator, clamped so that dragging below the minimum width leaves no dead zone (fix of 08 §9.3).
 pub fn clamp_padding(padding: f32) -> f32 {
-    padding.max(m::GRAPH_MIN_W - m::GRAPH_DEFAULT_W)
+    clamp_padding_from(m::GRAPH_DEFAULT_W, padding)
+}
+
+/// [`clamp_padding`] for a column whose default width is `default_w`.
+pub fn clamp_padding_from(default_w: f32, padding: f32) -> f32 {
+    padding.max(m::GRAPH_MIN_W - default_w)
+}
+
+/// The default graph width (21 §6 #38): 120 dp, or the width that shows every lane
+/// (`graph_real_width(120, max_lane)`) when that is at most [`metrics::PANE_MAX_FRACTION`] of the log pane's width
+/// `pane_w` (dp, `None` before the pane was laid out). A wider graph keeps 120 dp and scrolls horizontally.
+pub fn default_graph_width(max_lane: Option<u16>, pane_w: Option<f32>) -> f32 {
+    let fitted = graph_real_width(m::GRAPH_DEFAULT_W, max_lane);
+    match pane_w {
+        Some(pane) if fitted <= pane * metrics::PANE_MAX_FRACTION => fitted,
+        _ => m::GRAPH_DEFAULT_W,
+    }
 }
 
 /// The scrollable width of the graph (08 §2.2): `max(graph_w, (max_lane + 2) × 30)`, `max_lane` = 2 while no commit
@@ -160,6 +181,10 @@ pub struct LogView {
     anchor: Option<(ObjectId, usize)>,
     /// Layout row height of the last frame, in pixels.
     row_px: Pixels,
+    /// Width of the log pane in pixels as of the last paint (0 = not laid out yet).
+    pane_w: Rc<std::cell::Cell<Pixels>>,
+    /// The default graph width of the last frame in dp (the drag clamp depends on it).
+    graph_default: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -201,6 +226,8 @@ impl LogView {
             shown_uncommitted: None,
             anchor: None,
             row_px: px(metrics::SPACED.log_row),
+            pane_w: Rc::default(),
+            graph_default: m::GRAPH_DEFAULT_W,
             _subscriptions: subscriptions,
         }
     }
@@ -378,7 +405,7 @@ impl LogView {
         };
         let scale = window.rem_size().as_f32() / BASE_REM;
         let moved = (x - press).as_f32() / scale.max(f32::EPSILON);
-        let padding = clamp_padding(start + moved);
+        let padding = clamp_padding_from(self.graph_default, start + moved);
         self.ctx.ui.update(cx, |ui, cx| {
             if ui.graph_padding != padding {
                 ui.graph_padding = padding;
@@ -420,6 +447,27 @@ impl LogView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| this.drag = None),
             )
+    }
+
+    /// An invisible element that records the log pane's width and repaints the view when it changes (the default
+    /// graph width depends on it).
+    fn pane_tracker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cell = self.pane_w.clone();
+        let view = cx.entity().downgrade();
+        gpui_kit::canvas(
+            move |bounds, window, cx| {
+                if cell.replace(bounds.size.width) != bounds.size.width {
+                    window.defer(cx, move |_, cx| {
+                        view.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
     }
 
     /// Records the scroll anchor and requests the next page when few rows remain below the viewport.
@@ -610,13 +658,14 @@ impl Render for LogView {
         };
         self.chips
             .sync(refs.as_ref(), settings.group_branches_with_remotes);
-        let graph_w = graph_width(clamp_padding(padding));
-        let has_commits = snapshot.as_ref().is_some_and(|s| s.rows.len() > 1);
-        let real_w = graph_real_width(
-            graph_w,
-            has_commits.then(|| snapshot.as_ref().map_or(0, |s| s.max_lane)),
-        );
         let scale = window.rem_size().as_f32() / BASE_REM;
+        let has_commits = snapshot.as_ref().is_some_and(|s| s.rows.len() > 1);
+        let max_lane = has_commits.then(|| snapshot.as_ref().map_or(0, |s| s.max_lane));
+        let pane_w = self.pane_w.get().as_f32();
+        let default_w = default_graph_width(max_lane, (pane_w > 0.).then(|| pane_w / scale));
+        self.graph_default = default_w;
+        let graph_w = graph_width_from(default_w, clamp_padding_from(default_w, padding));
+        let real_w = graph_real_width(graph_w, max_lane);
         self.hscroll_max = px((real_w - graph_w).max(0.) * scale);
         self.hscroll = self.hscroll.clamp(px(0.), self.hscroll_max);
         let offset = usize::from(!show);
@@ -746,6 +795,7 @@ impl Render for LogView {
             .flex_col()
             .overflow_hidden()
             .bg(t.background)
+            .child(self.pane_tracker(cx))
             .children(search_bar)
             .child(header)
             .child(list_area)

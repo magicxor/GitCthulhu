@@ -559,6 +559,32 @@ fn prompt_texts_cover_every_kind() {
     );
 }
 
+#[test]
+fn password_prompt_shows_the_url_without_the_user_name() {
+    let cancel = CancelToken::new();
+    let texts = |url: &str, username: Option<&str>| {
+        credentials::prompt_texts(&request(
+            PromptKind::HttpsPassword {
+                url: url.into(),
+                username: username.map(Into::into),
+            },
+            1,
+            cancel.clone(),
+        ))
+        .subtitle
+    };
+    let subtitle = texts("http://qa-user@127.0.0.1:5284/repo.git", Some("qa-user"));
+    assert!(
+        subtitle.starts_with("Password for qa-user at http://127.0.0.1:5284/repo.git"),
+        "the user name is named once: {subtitle}"
+    );
+    assert!(texts("https://github.com", None).starts_with("Password for https://github.com"));
+    assert!(
+        texts("https://me@host/a@b", Some("me")).contains("https://host/a@b"),
+        "an at sign in the path is kept"
+    );
+}
+
 #[gpui_kit::test]
 fn credential_dialog_kinds(cx: &mut TestAppContext) {
     let handle = mount(cx);
@@ -744,6 +770,56 @@ fn credential_dialog_closes_on_cancel_token(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_cancelled_request_closes_its_own_dialog_not_the_one_above(cx: &mut TestAppContext) {
+    let handle = mount(cx);
+    let cancel = CancelToken::new();
+    let (reply, answer) = sync_channel(1);
+    open_in(cx, handle, |window, cx| {
+        credentials::open(
+            window,
+            cx,
+            request(
+                PromptKind::SshPassphrase { key_path: None },
+                1,
+                cancel.clone(),
+            ),
+            reply,
+        );
+    });
+    // Another dialog (here a single-field one) was opened on top of the credential prompt.
+    open_in(cx, handle, |window, cx| {
+        crate::dialogs::SingleTextFieldDialog::open(
+            window,
+            cx,
+            crate::dialogs::SingleFieldConfig::new(
+                crate::icons::AppIcon::Branch,
+                "New branch",
+                "Create",
+                |_, _, _| {},
+            ),
+        );
+    });
+    assert!(present(cx, handle, "single-field-input"));
+    cancel.cancel();
+    cx.executor().advance_clock(Duration::from_millis(250));
+    cx.run_until_parked();
+    settle(cx, handle);
+    assert_eq!(
+        answer_of(answer.try_recv().expect("answered")),
+        None,
+        "the prompt answers Cancel"
+    );
+    assert!(
+        present(cx, handle, "single-field-input"),
+        "the dialog above it stays open"
+    );
+    assert!(
+        !present(cx, handle, credentials::ids::CREDENTIAL_DIALOG),
+        "the credential prompt itself is gone"
+    );
+}
+
+#[gpui_kit::test]
 fn host_key_dialog_no_yes(cx: &mut TestAppContext) {
     let handle = mount(cx);
     let kind = || PromptKind::HostKey {
@@ -815,10 +891,7 @@ fn clone_dialog_is_720_wide_and_validates_in_order(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn clone_uses_default_directory(cx: &mut TestAppContext) {
     let fx = Fixture::new();
-    fx.write(
-        "a.txt", "one
-",
-    );
+    fx.write("a.txt", "one\n");
     fx.commit_all("init");
     let (handle, _app, _tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
     let default_dir = fx.dir.path().join("default-clones");
@@ -1173,6 +1246,43 @@ fn change_upstream_dialog_preselects_and_filters(cx: &mut TestAppContext) {
         !present(cx, handle, "upstream-branch-option-1"),
         "`HEAD` is not offered as an upstream branch"
     );
+}
+
+#[gpui_kit::test]
+fn change_upstream_reports_accept_and_cancel_to_the_caller(cx: &mut TestAppContext) {
+    for (accept, expected) in [(true, true), (false, false)] {
+        let (handle, _app, tab) = mount_seeded(cx, seed_with_upstream(), DEFAULT_SIZE);
+        let ctx = cx.update(|cx| tab.read(cx).ctx().clone());
+        let answers = Rc::new(RefCell::new(Vec::<bool>::new()));
+        let sink = answers.clone();
+        open_in(cx, handle, |window, cx| {
+            branch::open_change_upstream_then(
+                window,
+                cx,
+                ctx.clone(),
+                full("refs/heads/main"),
+                Box::new(move |accepted| sink.borrow_mut().push(accepted)),
+            )
+        });
+        assert!(
+            answers.borrow().is_empty(),
+            "nothing is reported while open"
+        );
+        if accept {
+            click(cx, handle, "dialog-primary");
+        } else {
+            press(cx, handle, "escape");
+        }
+        for _ in 0..3 {
+            settle(cx, handle);
+        }
+        assert_eq!(
+            answers.borrow().as_slice(),
+            [expected],
+            "exactly one answer (accept {accept})"
+        );
+        assert!(!dialog_open(cx, handle));
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ reset dialog
@@ -1600,7 +1710,10 @@ fn commit_identity_saved_choice_continues_after_the_save(cx: &mut TestAppContext
     }
     assert_eq!(
         got.borrow().as_slice(),
-        [author::IdentityChoice::Saved],
+        [author::IdentityChoice::Saved(Identity {
+            name: "Eve".into(),
+            email: "eve@example.com".into()
+        })],
         "the continuation ran after the save finished"
     );
     assert!(

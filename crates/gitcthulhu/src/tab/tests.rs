@@ -1686,3 +1686,70 @@ fn fixture_commit_records_entry_and_reloads(cx: &mut TestAppContext) {
         "a commit has no success toast (07 §12.5)"
     );
 }
+
+#[gpui_kit::test]
+fn commit_graph_is_written_once_in_the_background_for_unexhausted_logs(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    for n in 0..3 {
+        fx.write("a.txt", &format!("{n}\n"));
+        fx.commit_all(&format!("c{n}"));
+    }
+    let (_handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let present = |cx: &mut TestAppContext, tab: &Entity<RepoTab>| {
+        cx.update(|cx| {
+            let handle = tab
+                .read(cx)
+                .ctx()
+                .backend
+                .handle()
+                .cloned()
+                .expect("handle");
+            crate::backend::git::config::commit_graph_present(&handle.repo)
+        })
+    };
+    assert!(
+        !cx.update(|cx| tab.read(cx).loader.commit_graph_checked()),
+        "an exhausted first load does not start the check"
+    );
+    tab.update(cx, |t, cx| t.start_commit_graph(true, 2, cx));
+    cx.run_until_parked();
+    assert!(!present(cx, &tab), "an exhausted log writes nothing");
+    tab.update(cx, |t, cx| t.start_commit_graph(false, 100, cx));
+    cx.run_until_parked();
+    assert!(
+        !present(cx, &tab),
+        "a repository below the threshold gets no commit-graph"
+    );
+    assert!(cx.update(|cx| tab.read(cx).loader.commit_graph_checked()));
+    tab.update(cx, |t, cx| t.start_commit_graph(false, 1, cx));
+    cx.run_until_parked();
+    assert!(
+        !present(cx, &tab),
+        "the check runs once per session, even with a lower threshold"
+    );
+}
+
+#[gpui_kit::test]
+fn commit_graph_is_written_for_a_large_repository(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    for n in 0..3 {
+        fx.write("a.txt", &format!("{n}\n"));
+        fx.commit_all(&format!("c{n}"));
+    }
+    let (_handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    tab.update(cx, |t, cx| t.start_commit_graph(false, 2, cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let handle = tab
+            .read(cx)
+            .ctx()
+            .backend
+            .handle()
+            .cloned()
+            .expect("handle");
+        assert!(
+            crate::backend::git::config::commit_graph_present(&handle.repo),
+            "3 commits are more than 2"
+        );
+    });
+}

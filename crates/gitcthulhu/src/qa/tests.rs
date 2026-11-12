@@ -72,6 +72,8 @@ fn the_verb_table_has_the_documented_verbs(cx: &mut TestAppContext) {
         "set theme",
         "resize",
         "wait idle",
+        "wait dialog",
+        "begin action",
         "shot",
         "assert no error toast",
         "quit",
@@ -81,6 +83,22 @@ fn the_verb_table_has_the_documented_verbs(cx: &mut TestAppContext) {
             "verbs.txt lists '{usage}':\n{listing}"
         );
     }
+}
+
+#[gpui_kit::test]
+fn begin_action_does_not_wait_for_the_app_to_settle(cx: &mut TestAppContext) {
+    let (_handle, _tab, _dir) = mount(cx, RepoSeed::linear(1));
+    cx.update(|cx| {
+        let tokens = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let (begin, words) = verbs::lookup(cx, &tokens("begin action Push")).expect("begin action");
+        assert_eq!((begin.name(), words), ("begin action", 2));
+        assert!(
+            !begin.settle,
+            "an operation waiting for a prompt never settles"
+        );
+        let (action, _) = verbs::lookup(cx, &tokens("action Push")).expect("action");
+        assert!(action.settle, "the plain action still waits");
+    });
 }
 
 #[gpui_kit::test]

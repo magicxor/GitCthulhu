@@ -572,3 +572,86 @@ fn ctrl_c_copies_the_selection_with_indentation(cx: &mut TestAppContext) {
     })
     .expect("window");
 }
+
+/// A blame view that is dropped by something else than its close button (here: the state is cleared) while it holds
+/// the focus hands the focus back to the frame.
+#[gpui_kit::test]
+fn dropping_the_focused_blame_view_refocuses_the_frame(cx: &mut TestAppContext) {
+    let f = Fixture::new();
+    f.write("main.rs", "fn main() {}\n");
+    f.commit_all("main");
+    let (handle, _app, tab) = mount_fixture(cx, &f, DEFAULT_SIZE);
+    open(cx, handle, &tab, "main.rs", BlameRev::Worktree);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click((ids::BLAME_CODE, 0usize), cx);
+        window.render_frame(cx);
+        assert!(window.focused(cx).is_some(), "the click focused the view");
+    })
+    .expect("window");
+    cx.update(|cx| crate::blame::close(&tab.read(cx).ctx().clone(), cx));
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            tab.read(cx).focus.contains_focused(window, cx),
+            "the frame has the focus after the view went away"
+        );
+    })
+    .expect("window");
+}
+
+/// An endpoint that scrolled out of the list still cuts its line where the selection starts or ends (the copy used
+/// to take the whole line), and the selection still counts as one when every selected line is out of view.
+#[gpui_kit::test]
+fn partial_endpoints_survive_scrolling_out(cx: &mut TestAppContext) {
+    let f = Fixture::new();
+    let text: String = (0..300).map(|i| format!("row number {i}\n")).collect();
+    f.write("many.txt", &text);
+    f.commit_all("many");
+    let (handle, _app, tab) = mount_fixture(cx, &f, DEFAULT_SIZE);
+    open(cx, handle, &tab, "many.txt", BlameRev::Worktree);
+    let view = cx.update(|cx| tab.read(cx).views.blame.clone().expect("blame view"));
+    let scroll = cx.update(|cx| view.read(cx).scroll.clone());
+    cx.update_window(handle, |_, window, cx| {
+        scroll.scroll_to_item(5, gpui_kit::ScrollStrategy::Top);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let first = bounds(window, (ids::BLAME_CODE, 7usize));
+        let last = bounds(window, (ids::BLAME_CODE, 9usize));
+        // From inside "row number 7" to inside "row number 9".
+        let from = gpui_kit::point(first.left() + gpui_kit::px(17. + 40.), first.center().y);
+        let to = gpui_kit::point(last.left() + gpui_kit::px(17. + 60.), last.center().y);
+        window.drag(from, to, cx);
+        window.render_frame(cx);
+        let before = view.read(cx).bridge.selected_text(cx);
+        let lines: Vec<&str> = before.lines().collect();
+        assert_eq!(lines.len(), 3, "three lines: {before:?}");
+        assert!(
+            "row number 7".ends_with(lines[0]) && lines[0].len() < "row number 7".len(),
+            "the first line is cut at the start: {before:?}"
+        );
+        assert_eq!(lines[1], "row number 8");
+        assert!(
+            "row number 9".starts_with(lines[2]) && lines[2].len() < "row number 9".len(),
+            "the last line is cut at the end: {before:?}"
+        );
+        scroll.scroll_to_item(200, gpui_kit::ScrollStrategy::Top);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find((ids::BLAME_CODE, 8usize)).is_none(),
+            "scrolled out"
+        );
+        assert!(
+            view.read(cx).bridge.has_selection(cx),
+            "a selection that is entirely out of view still counts"
+        );
+        assert_eq!(
+            view.read(cx).bridge.selected_text(cx),
+            before,
+            "the endpoints keep their offsets"
+        );
+    })
+    .expect("window");
+}

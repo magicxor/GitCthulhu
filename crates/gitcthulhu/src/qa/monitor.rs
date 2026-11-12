@@ -23,6 +23,9 @@ pub struct Monitor {
     scenario_dialog: Option<Instant>,
     /// The scenario opened an error dialog itself (`open dialog error`).
     scenario_error: bool,
+    /// An operation started with `begin action` waits for prompts (credential dialogs): they are expected until
+    /// `wait dialog closed` ends the wait. Error dialogs still count.
+    expecting_prompts: bool,
 }
 
 impl Global for Monitor {}
@@ -59,6 +62,12 @@ impl Monitor {
 /// Tells the monitor that the scenario opened (`true`) or closed (`false`) a dialog itself, so it is not reported.
 pub fn scenario_dialog(cx: &mut App, open: bool) {
     cx.default_global::<Monitor>().scenario_dialog = open.then(Instant::now);
+}
+
+/// Tells the monitor that dialogs raised by a running operation (credential prompts) are expected (`true`, set by
+/// `begin action`) or no longer expected (`false`, set by `wait dialog closed`).
+pub fn expect_prompts(cx: &mut App, expecting: bool) {
+    cx.default_global::<Monitor>().expecting_prompts = expecting;
 }
 
 /// Tells the monitor that the scenario queued an error dialog itself (`open dialog error`).
@@ -112,7 +121,7 @@ pub fn sample(window: &mut Window, cx: &mut App) {
             monitor.scenario_dialog = None;
             monitor.scenario_error = false;
         }
-    } else if monitor.scenario_dialog.is_none() {
+    } else if monitor.scenario_dialog.is_none() && !monitor.expecting_prompts {
         note_dialog(
             monitor,
             "a dialog is open that the scenario did not open".into(),

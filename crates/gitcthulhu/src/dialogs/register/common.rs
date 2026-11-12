@@ -13,7 +13,7 @@ use gpui_kit::{
     Window, div,
 };
 
-use crate::dialogs::{DialogFrame, DialogSpec, IconBasedDialog, SingleFieldConfig};
+use crate::dialogs::{DialogFrame, DialogSpec, IconBasedDialog, LayerId, SingleFieldConfig};
 use crate::metrics::{self, dp};
 use crate::theme::{TextStyleExt as _, Tokens};
 use crate::widgets::field::{FieldEvent, OutlinedField};
@@ -84,14 +84,15 @@ pub fn pick_folder(
         .detach();
 }
 
-/// Opens `view` as a dialog of `content_w` dp content width (the frame adds its 16 dp padding on both sides).
+/// Opens `view` as a dialog of `content_w` dp content width (the frame adds its 16 dp padding on both sides) and
+/// returns its layer id (`dialogs::close_layer`).
 pub fn open_view<V: Render + 'static>(
     window: &mut Window,
     cx: &mut App,
     content_w: f32,
     est_height: f32,
     view: Entity<V>,
-) {
+) -> LayerId {
     DialogFrame::open(
         window,
         cx,
@@ -100,7 +101,7 @@ pub fn open_view<V: Render + 'static>(
             est_height,
         },
         move |_, _| view.clone().into_any_element(),
-    );
+    )
 }
 
 /// The current text of a field.

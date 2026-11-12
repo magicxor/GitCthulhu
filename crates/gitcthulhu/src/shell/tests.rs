@@ -136,12 +136,12 @@ fn set_recent(cx: &mut TestAppContext, paths: Vec<PathBuf>) {
     cx.update(|cx| state::update(cx, |s| s.recent_repositories = paths));
 }
 
-/// Whether a dialog opened or the stub of the not yet implemented dialog toasted.
-fn opened_something(app: &Entity<AppView>, window: &mut Window, cx: &mut App, what: &str) -> bool {
+/// Whether a dialog is open (the real one: a "Not implemented yet" toast no longer counts).
+fn dialog_is_open(app: &Entity<AppView>, window: &mut Window, cx: &mut App) -> bool {
     window.has_active_dialog(cx)
-        || toast_texts(app, cx)
+        && !toast_texts(app, cx)
             .iter()
-            .any(|t| t == &format!("Not implemented yet: {what}"))
+            .any(|t| t.starts_with("Not implemented yet"))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -681,7 +681,7 @@ fn welcome_button_opens(cx: &mut TestAppContext, id: &'static str, what: &str) {
     cx.run_until_parked();
     frame(cx, handle, |window, cx| {
         assert!(
-            opened_something(&app, window, cx, what),
+            dialog_is_open(&app, window, cx),
             "{id} opens the {what} dialog"
         );
     });
@@ -1115,7 +1115,10 @@ fn bottom_bar_identity_click_opens_author(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     frame(cx, handle, |window, cx| {
-        assert!(opened_something(&app, window, cx, "Author settings"));
+        assert!(
+            dialog_is_open(&app, window, cx),
+            "the identity opens the Author dialog"
+        );
     });
 }
 
@@ -1161,6 +1164,7 @@ fn bottom_bar_lays_out_update_slot_before_the_version_link(cx: &mut TestAppConte
 
 fn busy(kind: OpKind, phase: Option<&str>) -> BusyState {
     BusyState {
+        detail: None,
         kind,
         cancel: crate::backend::CancelToken::new(),
         cancellable: Cancellable::Yes,
@@ -1354,6 +1358,32 @@ fn welcome_clear_button_keeps_the_focus_in_the_search_field(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
+fn welcome_click_on_an_empty_area_keeps_the_focus_in_the_search_field(cx: &mut TestAppContext) {
+    init_app(cx);
+    set_recent(cx, vec![PathBuf::from("/work/alpha")]);
+    let (handle, app) = open_app(cx, DEFAULT_SIZE);
+    frame(cx, handle, |_, _| ());
+    cx.run_until_parked();
+    let welcome = cx.update(|cx| match &app.read(cx).tabs()[0].content {
+        TabContent::Welcome(view) => view.clone(),
+        _ => panic!("a welcome tab"),
+    });
+    frame(cx, handle, |window, cx| {
+        window.click(ids::WELCOME_TITLE, cx)
+    });
+    frame(cx, handle, |window, cx| {
+        assert!(
+            welcome
+                .read(cx)
+                .recent()
+                .read(cx)
+                .search_focused(window, cx),
+            "a press on the page's title left the search field focused"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn a_failed_open_returns_to_a_welcome_page_and_the_error_keeps_the_focus(cx: &mut TestAppContext) {
     let fx = Fixture::new();
     let not_a_repo = fx.dir.path().join("plain");
@@ -1424,5 +1454,43 @@ fn welcome_focuses_the_search_field_or_the_page(cx: &mut TestAppContext) {
         let page = welcome.read(cx);
         assert!(page.is_focused(window, cx));
         assert!(!page.recent().read(cx).search_focused(window, cx));
+    });
+}
+
+/// The Pull overlay names the upstream: the current branch's, or the remote branch that was asked for.
+#[gpui_kit::test]
+fn pull_overlay_names_the_upstream(cx: &mut TestAppContext) {
+    let mut seed = RepoSeed::branchy();
+    let head = match &seed.refs.head {
+        crate::backend::HeadState::Branch { name, .. } => name.clone(),
+        other => panic!("the fixture has a branch checked out: {other:?}"),
+    };
+    let current = seed
+        .refs
+        .local
+        .iter_mut()
+        .find(|b| b.full == head)
+        .expect("the current branch is listed");
+    current.upstream = Some(crate::backend::Upstream {
+        remote: "origin".into(),
+        merge: crate::test_support::seed::full("refs/heads/trunk"),
+        tracking: Some(crate::test_support::seed::full("refs/remotes/origin/trunk")),
+        gone: false,
+    });
+    let (handle, _app, tab) = mount_seeded(cx, seed, DEFAULT_SIZE);
+    cx.update(|cx| {
+        crate::test_support::script_op(&tab, cx, Ok(noop_outcome()), Duration::from_secs(5))
+    });
+    cx.update_window(handle, |_, window, cx| {
+        tab.update(cx, |t, cx| t.pull(None, window, cx))
+    })
+    .expect("window");
+    cx.update(|cx| {
+        let detail = tab.read(cx).busy().and_then(|b| b.detail.clone());
+        assert_eq!(
+            detail.as_deref(),
+            Some("Pulling changes from origin/trunk to the current"),
+            "a plain pull names the branch's upstream"
+        );
     });
 }

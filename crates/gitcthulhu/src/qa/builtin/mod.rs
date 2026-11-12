@@ -3,12 +3,12 @@
 //!
 //! | Area | Verbs |
 //! |---|---|
-//! | App | `new tab`, `open repository`, `select tab`, `close tab`, `reload`, `resize`, `set theme`, `set scale`, `set diff`, `toggle diff`, `set option`, `key`, `type`, `action`, `close dialog`, `close menu` |
+//! | App | `new tab`, `open repository`, `select tab`, `close tab`, `reload`, `resize`, `set theme`, `set scale`, `set diff`, `toggle diff`, `set option`, `key`, `type`, `action`, `begin action`, `close dialog`, `close menu` |
 //! | Selection | `select uncommitted row`, `select log row`, `select commit`, `select branch`, `select tag`, `select stash`, `select file`, `clear file selection`, `open diff`, `open blame`, `open history`, `close view` |
 //! | Menus | `open context menu <target>` |
 //! | Dialogs | `open dialog <name>`, `open settings page <name>` |
 //! | Checks | `assert no error toast`, `assert no error dialog`, `assert no error`, `assert toast`, `assert tab count`, `assert tab title`, `assert dialog`, `assert log rows` |
-//! | Runner | `wait idle`, `wait <ms>`, `shot`, `quit` |
+//! | Runner | `wait idle`, `wait dialog`, `wait <ms>`, `shot`, `quit` |
 
 use gpui_kit::{App, Entity};
 
@@ -32,6 +32,15 @@ pub fn register_all(cx: &mut App) {
             "wait idle [ms]",
             "Waits until operations finished, loads settled and frames were drawn (fails after [ms], default 20000)",
             RunnerVerb::WaitIdle,
+        ),
+    );
+    register_verb(
+        cx,
+        Verb::runner(
+            "wait dialog",
+            "wait dialog open|closed [ms]",
+            "Waits until a dialog is (not) open (fails after [ms], default 20000); for prompts an operation waits on",
+            RunnerVerb::WaitDialog,
         ),
     );
     register_verb(

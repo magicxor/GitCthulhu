@@ -730,9 +730,52 @@ fn the_proxy_password_goes_to_the_secret_store_only(cx: &mut TestAppContext) {
     assert!(!json.contains("s3cret"), "the settings file never holds it");
     set_text(cx, handle, &field, "");
     advance(cx, 500);
+    assert_eq!(
+        cell.lock().expect("lock").as_deref(),
+        Some("s3cret"),
+        "an emptied field never deletes the stored secret"
+    );
+    assert_eq!(
+        cx.update(|cx| v.read(cx).password_state().clone()),
+        PasswordState::Stored(true)
+    );
+    click(cx, handle, "settings-proxy-password-remove");
+    advance(cx, 500);
     assert!(
         cell.lock().expect("lock").is_none(),
-        "an empty field removes it"
+        "the Remove link deletes it"
+    );
+    assert_eq!(
+        cx.update(|cx| v.read(cx).password_state().clone()),
+        PasswordState::Stored(false)
+    );
+}
+
+#[gpui_kit::test]
+fn closing_with_an_empty_password_field_keeps_the_stored_secret(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (store, cell) = SecretStore::in_memory();
+    (store.store)("kept").expect("store");
+    cx.update(|cx| {
+        cx.set_global(SecretStoreGlobal(store));
+        settings::update(cx, |s| {
+            s.use_proxy = true;
+            s.proxy_auth = true;
+        })
+    });
+    let (handle, _) = open_app(cx, DEFAULT_SIZE);
+    show(cx, handle, Some(SettingsPage::Proxy));
+    cx.run_until_parked();
+    let v = view(cx);
+    let field = cx.update(|cx| v.read(cx).fields.proxy_password.clone());
+    set_text(cx, handle, &field, "x");
+    set_text(cx, handle, &field, "");
+    click(cx, handle, ids::ACCEPT);
+    cx.run_until_parked();
+    assert_eq!(
+        cell.lock().expect("lock").as_deref(),
+        Some("kept"),
+        "Accept inside the quiet period with an empty field leaves the secret alone"
     );
 }
 

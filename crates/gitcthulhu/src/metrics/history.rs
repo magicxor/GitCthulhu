@@ -31,7 +31,3 @@ pub const DIGIT_W: f32 = 7.8; // 09 §1.3
 pub const TEXT_PAD_START: f32 = 16.; // 09 §1.3
 /// Width of the divider between the two sides of a split diff (09 §1.4).
 pub const SPLIT_DIVIDER_W: f32 = 4.; // 09 §1.4
-/// Estimated height of a diff row before it is measured (13 sp mono, line height 1.30).
-pub const DIFF_ROW_ESTIMATE: f32 = 17.; // 21 §3.4
-/// Overdraw of the diff list in dp (21 §4.1).
-pub const DIFF_OVERDRAW: f32 = 400.; // 21 §4.1

@@ -102,7 +102,7 @@ fn history_replaces_frame_content(cx: &mut TestAppContext) {
         let v = view.read(cx);
         assert_eq!(v.items().len(), 5);
         assert!(v.exhausted(), "5 commits fit in one page");
-        assert!(v.diff_doc().is_none(), "no initial selection");
+        assert!(v.diff_doc(cx).is_none(), "no initial selection");
         assert_eq!(&*v.items()[0].summary, "revision 4", "newest first");
     });
     cx.update_window(handle, |_, window, cx| {
@@ -150,7 +150,7 @@ fn history_replaces_frame_content(cx: &mut TestAppContext) {
             (diff.left().as_f32() - m::LIST_W).abs() < 0.5,
             "the diff area starts after the list"
         );
-        assert!(window.try_find((ids::HISTORY_DIFF_ROW, 0usize)).is_none());
+        assert!(window.try_find(crate::diff::ids::LIST).is_none());
     })
     .expect("window");
 }
@@ -219,27 +219,33 @@ fn history_diff_follows_setting(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))
         .expect("window");
     let unified_rows = cx.update(|cx| {
-        let doc = view
-            .read(cx)
-            .diff_doc()
-            .cloned()
-            .expect("the diff is shown");
+        let doc = view.read(cx).diff_doc(cx).expect("the diff is shown");
         assert_eq!(doc.mode, DiffMode::Unified);
         assert!(!doc.rows.is_empty());
         doc.rows.len()
     });
     cx.update_window(handle, |_, window, _| {
         // Row 0 is the hunk header; the diff is one hunk (3 + 1 removed + 1 added + 3 lines of context).
-        assert!(window.try_find((ids::HISTORY_DIFF_ROW, 0usize)).is_some());
+        assert!(window.try_find((crate::diff::ids::HUNK, 0usize)).is_some());
         assert!(
             window
-                .try_find((ids::HISTORY_DIFF_ROW, unified_rows - 1))
+                .try_find((crate::diff::ids::LINE, unified_rows - 1))
                 .is_some()
         );
         assert!(
             window
-                .try_find((ids::HISTORY_DIFF_ROW, unified_rows))
+                .try_find((crate::diff::ids::LINE, unified_rows))
                 .is_none()
+        );
+        assert!(
+            window.try_find(crate::diff::ids::HEADER).is_none(),
+            "no diff header, no actions (09 §2.2)"
+        );
+        assert!(
+            window
+                .try_find((crate::diff::ids::HUNK_STAGE, 0usize))
+                .is_none(),
+            "a history diff is read-only"
         );
     })
     .expect("window");
@@ -249,7 +255,7 @@ fn history_diff_follows_setting(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))
         .expect("window");
     let split_rows = cx.update(|cx| {
-        let doc = view.read(cx).diff_doc().cloned().expect("still shown");
+        let doc = view.read(cx).diff_doc(cx).expect("still shown");
         assert_eq!(doc.mode, DiffMode::Split, "the mode switched live");
         doc.rows.len()
     });
@@ -259,7 +265,7 @@ fn history_diff_follows_setting(cx: &mut TestAppContext) {
         "the removed and added line share one row"
     );
     cx.update_window(handle, |_, window, _| {
-        let row = bounds(window, (ids::HISTORY_DIFF_ROW, 1usize));
+        let row = bounds(window, (crate::diff::ids::LINE, 1usize));
         let area = bounds(window, ids::HISTORY_DIFF);
         assert!(
             (row.size.width - area.size.width).abs().as_f32() < 0.5,
@@ -277,7 +283,7 @@ fn history_diff_follows_setting(cx: &mut TestAppContext) {
     .expect("window");
     cx.run_until_parked();
     cx.update(|cx| {
-        let doc = view.read(cx).diff_doc().cloned().expect("a diff");
+        let doc = view.read(cx).diff_doc(cx).expect("a diff");
         assert_eq!(
             doc.diff.kind,
             crate::backend::ChangeKind::Added,
@@ -352,7 +358,7 @@ fn history_follows_renames_and_lists_deletions(cx: &mut TestAppContext) {
     .expect("window");
     cx.run_until_parked();
     cx.update(|cx| {
-        let doc = view.read(cx).diff_doc().cloned().expect("a diff");
+        let doc = view.read(cx).diff_doc(cx).expect("a diff");
         assert_eq!(doc.diff.path, RelaPath::from("old.txt"));
     });
 
@@ -373,7 +379,7 @@ fn history_follows_renames_and_lists_deletions(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let v = view.read(cx);
         assert_eq!(&*v.items()[0].summary, "remove");
-        let doc = v.diff_doc().cloned().expect("the deletion's diff");
+        let doc = v.diff_doc(cx).expect("the deletion's diff");
         assert_eq!(doc.diff.kind, crate::backend::ChangeKind::Deleted);
     });
 }
@@ -404,16 +410,7 @@ fn history_of_an_unknown_file_is_empty(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn mode_switch_keeps_the_diff_row(cx: &mut TestAppContext) {
     let f = Fixture::new();
-    let body = |tag: &str| -> String {
-        (0..300)
-            .map(|i| {
-                format!(
-                    "{tag} line {i}
-"
-                )
-            })
-            .collect()
-    };
+    let body = |tag: &str| -> String { (0..300).map(|i| format!("{tag} line {i}\n")).collect() };
     f.write("big.txt", &body("old"));
     f.commit_all("first");
     f.write("big.txt", &body("new"));
@@ -425,7 +422,7 @@ fn mode_switch_keeps_the_diff_row(cx: &mut TestAppContext) {
     })
     .expect("window");
     cx.run_until_parked();
-    let list = cx.update(|cx| view.read(cx).diff_list.clone());
+    let list = cx.update(|cx| view.read(cx).diff_view().read(cx).list_state().clone());
     cx.update_window(handle, |_, window, cx| {
         list.scroll_to(gpui_kit::ListOffset {
             item_ix: 120,
@@ -438,7 +435,7 @@ fn mode_switch_keeps_the_diff_row(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| {
         assert_eq!(
-            view.read(cx).diff_doc().expect("shown").mode,
+            view.read(cx).diff_doc(cx).expect("shown").mode,
             DiffMode::Split
         );
     });
@@ -459,4 +456,39 @@ fn mode_switch_keeps_the_diff_row(cx: &mut TestAppContext) {
         0,
         "another commit starts at the top"
     );
+}
+
+/// The history diff is the shared read-only diff view: its text can be selected and copied, and a long line is cut
+/// with the same markers as the main diff (the old private renderer did neither).
+#[gpui_kit::test]
+fn history_diff_supports_selection_and_cut_lines(cx: &mut TestAppContext) {
+    let f = Fixture::new();
+    let long = format!("start {} end", "x".repeat(3000));
+    f.write("wide.txt", "short\n");
+    f.commit_all("first");
+    f.write("wide.txt", &format!("short\n{long}\n"));
+    f.commit_all("second");
+    let (handle, _app, tab) = mount_fixture(cx, &f, DEFAULT_SIZE);
+    let view = open(cx, handle, &tab, "wide.txt");
+    cx.update_window(handle, |_, window, cx| {
+        window.click((ids::HISTORY_ROW, 0usize), cx)
+    })
+    .expect("window");
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+        .expect("window");
+    let diff = cx.update(|cx| view.read(cx).diff_view().clone());
+    cx.update(|cx| {
+        diff.update(cx, |view, cx| {
+            let selection = view.selection();
+            assert!(!selection.has_selection(cx), "nothing is selected yet");
+            selection.select_all(cx);
+            assert!(selection.has_selection(cx), "select all works");
+            let text = selection.selected_text(cx).expect("selected text");
+            assert!(
+                text.contains(&long),
+                "copying a cut line yields the full source line"
+            );
+        });
+    });
 }

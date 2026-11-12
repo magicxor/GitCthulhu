@@ -267,10 +267,11 @@ fn text_cell(
         LineKind::Removed => Some(tokens.diff_content_removed),
         LineKind::Context => None,
     };
+    let syntax = doc.syntax.tokens();
     let runs = highlights(
         &text,
         doc.inline.get(li).map_or(&[][..], |s| &s[..]),
-        doc.syntax.get(li).map_or(&[][..], |s| &s[..]),
+        syntax.get(li).map_or(&[][..], |s| &s[..]),
         change_bg,
         &tokens,
     );

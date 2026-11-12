@@ -2065,3 +2065,25 @@ fn read_only_rebase_step_follows_head_across_stops(cx: &mut TestAppContext) {
     );
     assert!(cx.update(|cx| box_of(&tab, cx).read(cx).is_read_only()));
 }
+
+/// Git's MERGE_MSG has `#<TAB>path` lines; the field shows the gap (the kit draws a tab with no width) and the
+/// committed message still has the tabs.
+#[gpui_kit::test]
+fn tab_characters_are_shown_and_kept(cx: &mut TestAppContext) {
+    let (handle, _app, tab) =
+        mount_seeded(cx, seed(&[("a.txt", ChangeKind::Added)], &[]), DEFAULT_SIZE);
+    let commit_box = cx.update(|cx| box_of(&tab, cx));
+    let original = "Merge branch 'dev'\n\n# Conflicts:\n#\tdocs/guide.md\n";
+    cx.update_window(handle, |_, window, cx| {
+        commit_box.update(cx, |b, cx| b.set_message(original.to_owned(), window, cx));
+        window.render_frame(cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
+    let shown = cx.update(|cx| commit_box.read(cx).shown_text(cx));
+    assert!(
+        shown.contains("#   docs/guide.md") && !shown.contains('\t'),
+        "the field shows the gap: {shown:?}"
+    );
+    assert_eq!(message(cx, &tab), original, "the message keeps its tabs");
+}

@@ -199,3 +199,100 @@ fn buttons_are_right_aligned_with_an_8_dp_gap(cx: &mut TestAppContext) {
     })
     .expect("window");
 }
+
+/// Reports through `alive` whether the layer that owns it still exists (the kit drops a layer's builder when the
+/// layer closes).
+struct LayerProbe(Rc<std::cell::Cell<bool>>);
+
+impl Drop for LayerProbe {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+fn open_probe_layer(
+    window: &mut Window,
+    cx: &mut App,
+    label: &'static str,
+) -> (LayerId, Rc<std::cell::Cell<bool>>) {
+    let alive = Rc::new(std::cell::Cell::new(true));
+    let probe = LayerProbe(alive.clone());
+    let id = DialogFrame::open(
+        window,
+        cx,
+        DialogSpec {
+            width: 300.,
+            est_height: 100.,
+        },
+        move |_, _| {
+            let _probe = &probe;
+            div().child(label).into_any_element()
+        },
+    );
+    window.render_frame(cx);
+    window.render_frame(cx);
+    (id, alive)
+}
+
+#[gpui_kit::test]
+fn closing_a_layer_by_id_leaves_the_dialog_above_it_open(cx: &mut TestAppContext) {
+    let handle = mount(cx);
+    cx.update_window(handle, |_, window, cx| {
+        let (below, below_alive) = open_probe_layer(window, cx, "below");
+        let (above, above_alive) = open_probe_layer(window, cx, "above");
+        assert_ne!(below, above, "layers have distinct ids");
+
+        close_layer(window, cx, below);
+        window.render_frame(cx);
+        assert!(!below_alive.get(), "the named layer is closed");
+        assert!(above_alive.get(), "the layer above it stays open");
+        assert!(window.has_active_dialog(cx));
+
+        // A layer that is already gone is ignored: it must not close the one that is left.
+        close_layer(window, cx, below);
+        window.render_frame(cx);
+        assert!(above_alive.get(), "closing a closed layer is a no-op");
+
+        close_layer(window, cx, above);
+        window.render_frame(cx);
+        assert!(!above_alive.get());
+        assert!(!window.has_active_dialog(cx), "no layer is left");
+    })
+    .expect("window");
+}
+
+/// Whether the registry still counts the layer `id` as open.
+fn registered(cx: &mut App, id: LayerId) -> bool {
+    let layers = cx.default_global::<Layers>();
+    layers.prune();
+    layers.stack.iter().any(|layer| layer.id == id)
+}
+
+#[gpui_kit::test]
+fn the_registry_notices_layers_the_kit_closed_itself(cx: &mut TestAppContext) {
+    let handle = mount(cx);
+    cx.update_window(handle, |_, window, cx| {
+        let (bottom, bottom_alive) = open_probe_layer(window, cx, "bottom");
+        let (middle, _) = open_probe_layer(window, cx, "middle");
+        let (top, _) = open_probe_layer(window, cx, "top");
+
+        // Escape closes the top layer behind the registry's back.
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!registered(cx, top), "Escape closed the top layer");
+        assert!(registered(cx, middle) && registered(cx, bottom));
+
+        // Closing the middle layer by id now pops it (it is the top one) and does not touch the bottom layer.
+        close_layer(window, cx, middle);
+        window.render_frame(cx);
+        assert!(!registered(cx, middle));
+        assert!(
+            bottom_alive.get() && registered(cx, bottom),
+            "the bottom layer is untouched"
+        );
+        close_layer(window, cx, bottom);
+        window.render_frame(cx);
+        assert!(!window.has_active_dialog(cx), "no layer is left");
+    })
+    .expect("window");
+}

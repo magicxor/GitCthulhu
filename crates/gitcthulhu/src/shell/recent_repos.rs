@@ -73,10 +73,45 @@ pub fn parent_display(path: &Path, home: Option<&Path>) -> String {
     parent.display().to_string()
 }
 
+/// How a [`RecentRepos`] differs from the welcome page's list.
+#[derive(Clone, Debug)]
+pub struct RecentOptions {
+    /// A repository left out of the list (the Open popup: "recent repos excluding the current one", 07 §5.2).
+    pub exclude: Option<PathBuf>,
+    /// Rows have the "Remove repository from recent" button (off in the Open popup).
+    pub removable: bool,
+}
+
+impl Default for RecentOptions {
+    fn default() -> Self {
+        Self {
+            exclude: None,
+            removable: true,
+        }
+    }
+}
+
+/// The remembered repositories without the excluded one. Only the excluded path is canonicalised: the stored
+/// entries are canonical already (`UiState::push_recent`), and canonicalising every entry on the UI thread would
+/// block on unreachable network drives.
+fn visible_entries(all: &[PathBuf], exclude: Option<&Path>) -> Vec<PathBuf> {
+    let Some(excluded) = exclude else {
+        return all.to_vec();
+    };
+    let canon = state::canonical(excluded);
+    all.iter()
+        .filter(|path| path.as_path() != excluded && **path != canon)
+        .cloned()
+        .collect()
+}
+
 /// The filterable list of `UiState::recent_repositories`.
 pub struct RecentRepos {
     on_open: OnOpen,
+    options: RecentOptions,
     field: Entity<OutlinedField>,
+    /// `UiState::recent_repositories` as last seen (before leaving out the excluded repository).
+    all: Vec<PathBuf>,
     entries: Vec<PathBuf>,
     /// Indices into `entries` that match the filter.
     shown: Vec<usize>,
@@ -93,6 +128,16 @@ impl EventEmitter<RecentReposEvent> for RecentRepos {}
 impl RecentRepos {
     /// A list that calls `on_open` with the picked repository.
     pub fn new(on_open: OnOpen, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_options(on_open, RecentOptions::default(), window, cx)
+    }
+
+    /// A list with `options` (the Open popup leaves out the current repository and has no remove buttons).
+    pub fn with_options(
+        on_open: OnOpen,
+        options: RecentOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let field = cx.new(|cx| {
             OutlinedField::new(ids::RECENT_FILTER, window, cx).hint(
                 "Search for recent repositories",
@@ -100,7 +145,8 @@ impl RecentRepos {
                 cx,
             )
         });
-        let entries = state::get(cx).recent_repositories.clone();
+        let all = state::get(cx).recent_repositories.clone();
+        let entries = visible_entries(&all, options.exclude.as_deref());
         let subscriptions = vec![
             cx.subscribe_in(
                 &field,
@@ -115,8 +161,9 @@ impl RecentRepos {
             ),
             // Every UI-state save (tab selection, window bounds) lands here: only a changed list refilters.
             cx.observe_global::<state::UiStateGlobal>(|this, cx| {
-                if state::get(cx).recent_repositories != this.entries {
-                    this.entries = state::get(cx).recent_repositories.clone();
+                if state::get(cx).recent_repositories != this.all {
+                    this.all = state::get(cx).recent_repositories.clone();
+                    this.entries = visible_entries(&this.all, this.options.exclude.as_deref());
                     this.refilter(cx);
                 }
             }),
@@ -124,7 +171,9 @@ impl RecentRepos {
         let shown = filter_recent(&entries, "");
         Self {
             on_open,
+            options,
             field,
+            all,
             entries,
             shown,
             filter: String::new(),
@@ -234,6 +283,7 @@ impl RecentRepos {
         let tokens = *cx.tokens();
         let search_focused = self.search_has_focus(window, cx);
         let (home, on_open) = (self.home.clone(), self.on_open.clone());
+        let removable = self.options.removable;
         range
             .filter_map(|v| {
                 let path = self.entries.get(*self.shown.get(v)?)?.clone();
@@ -310,35 +360,37 @@ impl RecentRepos {
                                         .child(parent),
                                 ),
                         )
-                        .child(
-                            div()
-                                .id((ids::RECENT_REMOVE, v))
-                                .flex_none()
-                                .size(dp(dims::RECENT_REMOVE))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .opacity(0.)
-                                .group_hover(group, |s| s.opacity(1.))
-                                .hover(move |s| s.bg(tokens.hover_layer()))
-                                .active(move |s| s.bg(tokens.press_layer()))
-                                .delayed_tooltip("Remove repository from recent")
-                                // Keep the focus in the filter field (a focusable host would take it).
-                                .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                    window.prevent_default()
-                                })
-                                .on_click(move |_, _, cx| {
-                                    cx.stop_propagation();
-                                    state::update(cx, |s| s.remove_recent(&remove_path));
-                                })
-                                .child(icon(
-                                    AppIcon::Close,
-                                    metrics::ICON_MD,
-                                    tokens.on_background_secondary,
-                                ))
-                                .test_support(),
-                        )
+                        .when(removable, |row| {
+                            row.child(
+                                div()
+                                    .id((ids::RECENT_REMOVE, v))
+                                    .flex_none()
+                                    .size(dp(dims::RECENT_REMOVE))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .opacity(0.)
+                                    .group_hover(group, |s| s.opacity(1.))
+                                    .hover(move |s| s.bg(tokens.hover_layer()))
+                                    .active(move |s| s.bg(tokens.press_layer()))
+                                    .delayed_tooltip("Remove repository from recent")
+                                    // Keep the focus in the filter field (a focusable host would take it).
+                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                        window.prevent_default()
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        state::update(cx, |s| s.remove_recent(&remove_path));
+                                    })
+                                    .child(icon(
+                                        AppIcon::Close,
+                                        metrics::ICON_MD,
+                                        tokens.on_background_secondary,
+                                    ))
+                                    .test_support(),
+                            )
+                        })
                         .test_support(),
                 )
             })

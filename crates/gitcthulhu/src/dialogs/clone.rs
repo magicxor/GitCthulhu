@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 
 use super::register::common::{self, FocusOnce};
+use super::{LayerId, close_layer_or_top};
 use crate::backend::prompt::progress_text;
 use crate::backend::{CancelToken, CloneOptions, GitErrorKind, validate};
 use crate::icons::AppIcon;
@@ -79,6 +80,8 @@ pub struct CloneDialog {
     cancel: Option<CancelToken>,
     last_progress: Option<Instant>,
     focus: FocusOnce,
+    /// The layer of this dialog: it closes by id, so that another dialog opened above it stays open.
+    layer: Option<LayerId>,
     _subscriptions: Vec<Subscription>,
     _progress: Option<Task<()>>,
 }
@@ -183,7 +186,7 @@ impl CloneDialog {
                         settings.clone_default_directory = Some(directory)
                     });
                 }
-                window.close_dialog(cx);
+                close_layer_or_top(window, cx, self.layer);
             }
             Err(err) => {
                 self.phase = Phase::Form;
@@ -455,9 +458,11 @@ pub fn open(window: &mut Window, cx: &mut App) {
             cancel: None,
             last_progress: None,
             focus: FocusOnce::default(),
+            layer: None,
             _subscriptions: subscriptions,
             _progress: None,
         }
     });
-    common::open_view(window, cx, CLONE_W, 560., view);
+    let layer = common::open_view(window, cx, CLONE_W, 560., view.clone());
+    view.update(cx, |this, _| this.layer = Some(layer));
 }

@@ -3,30 +3,35 @@
 //! across renames) and the read-only diff of the clicked commit.
 //!
 //! Reads: the pager is created in the background together with its first page; the next page is requested when
-//! the last visible row gets within [`m::PAGE_AHEAD`] rows of the end. The diff of a clicked commit is read and
-//! built into a [`DiffDoc`] in one background read; a click on another commit cancels it.
+//! the last visible row gets within [`m::PAGE_AHEAD`] rows of the end. The diff of a clicked commit is shown by a
+//! read-only [`DiffView`] (the same list, selection, context menu, highlighting and line cutting as the main diff);
+//! a click on another commit retargets it and cancels the read in flight.
+//!
+//! Like Gitnuro (09 §2.2) the view opens with no commit selected and an empty diff area; the diff appears on the
+//! first click.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::{
-    App, Context, IntoElement, ListAlignment, ListOffset, ListState, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, UniformListScrollHandle, WeakEntity, Window, div,
-    list, px, uniform_list,
+    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
+    Styled as _, Subscription, UniformListScrollHandle, WeakEntity, Window, div, uniform_list,
 };
 use parking_lot::Mutex;
 
 use crate::app_view::show_toast;
 use crate::backend::history::HistoryPager;
 use crate::backend::{
-    ByteSlice as _, CancelToken, FileHistoryPage, GitError, GitErrorKind, GitTime, RelaPath,
+    Against, ByteSlice as _, CancelToken, DiffTarget, FileHistoryPage, GitError, GitErrorKind,
+    GitTime, RelaPath,
 };
 use crate::blame::view_header;
-use crate::diff::model::{DiffDoc, DiffMode, build_doc};
-use crate::diff::selection::DiffSelection;
+use crate::diff::DiffView;
+use crate::diff::model::DiffDoc;
 use crate::metrics::dp;
 use crate::metrics::history as m;
 use crate::notifications::ToastKind;
-use crate::settings::{self, DiffViewMode, SettingsGlobal};
+use crate::settings::{self, SettingsGlobal};
 use crate::tab::TabCtx;
 use crate::tab::read::ReadSlot;
 use crate::tab::ui::{CloseableView, RepoUiEvent};
@@ -35,7 +40,6 @@ use crate::widgets::date::{DateFormat, local_offset_minutes};
 use crate::widgets::observed;
 use crate::widgets::scroll::list_scrollbar;
 
-mod diff_body;
 mod rows;
 
 pub use rows::HistoryItem;
@@ -61,8 +65,6 @@ pub mod ids {
     pub const HISTORY_DATE: &str = "history-date";
     /// The diff area.
     pub const HISTORY_DIFF: &str = "history-diff";
-    /// Row `ix` of the diff (tuple id).
-    pub const HISTORY_DIFF_ROW: &str = "history-diff-row";
 }
 
 /// Opens the history of `path` (replaces everything under the toolbar; Esc closes it). The "File history" menu
@@ -88,19 +90,6 @@ pub fn close(ctx: &TabCtx, cx: &mut App) {
     });
 }
 
-/// The diff shown on the right.
-struct Shown {
-    doc: Arc<DiffDoc>,
-    /// `@@ -a,b +c,d @@` per hunk, built with the document (no `format!` per frame).
-    headers: Arc<Vec<SharedString>>,
-    selection: Rc<DiffSelection>,
-}
-
-/// What a diff read returns.
-type DiffResult = Result<(DiffDoc, Vec<SharedString>), GitError>;
-
-use std::rc::Rc;
-
 /// What a page read returns: the (possibly new) pager and the page.
 type PageResult = Result<(Arc<Mutex<HistoryPager>>, FileHistoryPage), GitError>;
 
@@ -115,32 +104,28 @@ pub struct FileHistoryView {
     page: ReadSlot,
     /// The clicked row (no highlight, 09 §2.2; kept for reloads).
     selected: Option<usize>,
-    diff_read: ReadSlot,
-    diff: Option<Shown>,
-    diff_generation: u64,
-    /// The next document replaces one of the same commit in the other mode: keep the row index (09 §1.1, the list
-    /// state survives a unified/split toggle).
-    keep_scroll: bool,
-    /// Settings the view reacts to: unified/split switches live, the date format re-formats the rows.
-    diff_mode: DiffViewMode,
+    /// The diff of the selected commit: unified/split, full file and the scroll position follow the settings and
+    /// the target by themselves.
+    diff_view: Entity<DiffView>,
+    /// The date format re-formats the rows when it changes.
     date_format: DateFormat,
     list_scroll: UniformListScrollHandle,
-    diff_list: ListState,
     _subscriptions: Vec<Subscription>,
 }
 
 impl FileHistoryView {
     /// Whether a page of the history or the selected commit's diff is loading (the QA runner's idle check).
-    pub fn is_loading(&self) -> bool {
-        self.page.is_running() || self.diff_read.is_running()
+    pub fn is_loading(&self, cx: &App) -> bool {
+        self.page.is_running() || self.diff_view.read(cx).is_loading()
     }
 
     /// The history of `path` in the tab of `ctx`.
-    pub fn new(ctx: TabCtx, path: RelaPath, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(ctx: TabCtx, path: RelaPath, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = settings::get_or_default(cx);
         let subscriptions = vec![cx.observe_global::<SettingsGlobal>(|this, cx| {
             this.on_settings(cx);
         })];
+        let diff_view = cx.new(|cx| DiffView::read_only(ctx.clone(), window, cx));
         let mut view = Self {
             ctx,
             path,
@@ -150,15 +135,9 @@ impl FileHistoryView {
             failed: false,
             page: ReadSlot::default(),
             selected: None,
-            diff_read: ReadSlot::default(),
-            diff: None,
-            diff_generation: 0,
-            keep_scroll: false,
-            diff_mode: settings.diff_view,
+            diff_view,
             date_format: DateFormat::from_settings(&settings),
             list_scroll: UniformListScrollHandle::new(),
-            diff_list: ListState::new(0, ListAlignment::Top, px(m::DIFF_OVERDRAW))
-                .with_uniform_item_height(px(m::DIFF_ROW_ESTIMATE)),
             _subscriptions: subscriptions,
         };
         view.load_page(cx);
@@ -186,8 +165,13 @@ impl FileHistoryView {
     }
 
     /// The document of the diff on the right, if one is shown.
-    pub fn diff_doc(&self) -> Option<&Arc<DiffDoc>> {
-        self.diff.as_ref().map(|s| &s.doc)
+    pub fn diff_doc(&self, cx: &App) -> Option<Arc<DiffDoc>> {
+        self.diff_view.read(cx).doc().cloned()
+    }
+
+    /// The read-only diff view on the right.
+    pub fn diff_view(&self) -> &Entity<DiffView> {
+        &self.diff_view
     }
 
     fn now() -> GitTime {
@@ -257,95 +241,19 @@ impl FileHistoryView {
 
     /// A click on row `ix`: shows the diff of that commit.
     pub fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.items.len() {
+        let Some(item) = self.items.get(ix) else {
             return;
-        }
+        };
+        let target = DiffTarget::Commit {
+            commit: item.entry.commit.id,
+            against: Against::FirstParent,
+            path: item.entry.path.clone(),
+            previous_path: item.entry.previous_path.clone(),
+        };
         self.selected = Some(ix);
-        self.keep_scroll = false;
-        self.load_diff(cx);
-    }
-
-    fn load_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = self.selected.and_then(|ix| self.items.get(ix)) else {
-            return;
-        };
-        let Some(repo) = self.ctx.backend.repo().cloned() else {
-            return;
-        };
-        let entry = item.entry.clone();
-        let settings = settings::get_or_default(cx);
-        let mode = match settings.diff_view {
-            DiffViewMode::Unified => DiffMode::Unified,
-            DiffViewMode::Split => DiffMode::Split,
-        };
-        let full_file = settings.diff_full_file;
-        self.diff_generation += 1;
-        let generation = self.diff_generation;
-        self.diff_read.start(
-            cx,
-            |this| &mut this.diff_read,
-            move |cancel| -> DiffResult {
-                let diff = crate::backend::history::commit_diff(&repo, &entry, full_file, cancel)?;
-                let doc = build_doc(Arc::new(diff), mode, generation, cancel);
-                let headers = diff_body::text_of(&doc)
-                    .map(|text| {
-                        text.hunks
-                            .iter()
-                            .map(|h| SharedString::from(diff_body::hunk_header_text(&h.header)))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok((doc, headers))
-            },
-            |this, result, cx| this.apply_diff(result, cx),
-        );
-    }
-
-    fn apply_diff(&mut self, result: DiffResult, cx: &mut Context<Self>) {
-        match result {
-            Ok((doc, headers)) => self.show(Arc::new(doc), Arc::new(headers), cx),
-            Err(err) if err.kind() == GitErrorKind::Cancelled => {}
-            Err(err) => {
-                // 09 §2.2 shows an empty area for failures; reads report through a toast (21 §6 #17).
-                self.diff = None;
-                show_toast(
-                    cx,
-                    Some(self.ctx.id),
-                    ToastKind::Error,
-                    format!("Loading the diff failed: {err}"),
-                    None,
-                );
-            }
-        }
+        self.diff_view
+            .update(cx, |view, cx| view.set_target(Some(target), cx));
         cx.notify();
-    }
-
-    fn show(&mut self, doc: Arc<DiffDoc>, headers: Arc<Vec<SharedString>>, cx: &mut Context<Self>) {
-        let mut selection = DiffSelection::new(cx);
-        selection.reset(&doc, cx);
-        // Only text diffs have rows; everything else is an empty area (09 §2.2).
-        let rows = if diff_body::text_of(&doc).is_some() {
-            doc.rows.len()
-        } else {
-            0
-        };
-        // A new commit starts at the top (deviation: Gitnuro keeps one list state for the view's lifetime, the bug
-        // 7b10bc66 fixed for the main diff); a unified/split switch keeps the row index like the main diff.
-        let keep = std::mem::take(&mut self.keep_scroll)
-            .then(|| self.diff_list.logical_scroll_top().item_ix);
-        self.diff_list
-            .reset_with_uniform_height(rows, px(m::DIFF_ROW_ESTIMATE));
-        if let Some(item_ix) = keep.filter(|_| rows > 0) {
-            self.diff_list.scroll_to(ListOffset {
-                item_ix: item_ix.min(rows - 1),
-                offset_in_item: px(0.),
-            });
-        }
-        self.diff = Some(Shown {
-            doc,
-            headers,
-            selection: Rc::new(selection),
-        });
     }
 
     fn on_settings(&mut self, cx: &mut Context<Self>) {
@@ -361,11 +269,6 @@ impl FileHistoryView {
                     .map(|item| item.with_date(now, &format))
                     .collect(),
             );
-        }
-        if settings.diff_view != self.diff_mode {
-            self.diff_mode = settings.diff_view;
-            self.keep_scroll = self.diff.is_some();
-            self.load_diff(cx);
         }
         cx.notify();
     }
@@ -409,33 +312,15 @@ impl FileHistoryView {
 
     fn diff_area(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let tokens = *cx.tokens();
-        let area = observed(ids::HISTORY_DIFF)
+        // Nothing is shown before the first click; the read-only view renders nothing without a target either.
+        observed(ids::HISTORY_DIFF)
             .relative()
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(tokens.background);
-        let Some(shown) = self
-            .diff
-            .as_ref()
-            .filter(|s| diff_body::text_of(&s.doc).is_some())
-        else {
-            return area.into_any_element();
-        };
-        let env = Rc::new(diff_body::DiffEnv {
-            doc: shown.doc.clone(),
-            headers: shown.headers.clone(),
-            selection: shown.selection.clone(),
-            tokens,
-        });
-        area.child(
-            list(self.diff_list.clone(), move |ix, window, cx| {
-                diff_body::render_row(&env, ix, window, cx)
-            })
-            .size_full(),
-        )
-        .child(list_scrollbar("history-diff-scrollbar", &self.diff_list))
-        .into_any_element()
+            .bg(tokens.background)
+            .child(self.diff_view.clone())
+            .into_any_element()
     }
 }
 

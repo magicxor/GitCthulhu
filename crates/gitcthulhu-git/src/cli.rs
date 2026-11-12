@@ -424,7 +424,7 @@ fn execute(
     };
 
     let mut vars = env::child_env(rt, &cmd, trace_dir.as_ref().map(|dir| dir.path()));
-    let mut args = env::global_args(rt, cmd.kind);
+    let mut args = env::global_args();
     if cmd.kind != CommandKind::Read {
         let config_dir = match target {
             Target::Repo(_) | Target::Cwd => Some(cmd.cwd.as_path()),

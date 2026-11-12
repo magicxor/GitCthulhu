@@ -1379,3 +1379,81 @@ fn read_only_view_shows_fixed_targets_without_header(cx: &mut TestAppContext) {
     cx.update(|cx| view.update(cx, |v, cx| v.set_target(None, cx)));
     assert!(cx.update(|cx| view.read(cx).doc().is_none()));
 }
+
+/// `big.rs` with 700 committed lines, all of them changed in the worktree: more than the first pass highlights.
+fn many_changes_fixture() -> Fixture {
+    let fx = Fixture::new();
+    let body = |tag: &str| -> String {
+        (0..700)
+            .map(|i| format!("fn f{i}() {{ let x = {i}; /* {tag} */ }}\n"))
+            .collect()
+    };
+    fx.write("big.rs", &body("old"));
+    fx.commit_all("init");
+    fx.write("big.rs", &body("new"));
+    fx
+}
+
+#[test]
+fn highlighting_runs_in_two_passes_on_one_document() {
+    use super::highlight::FIRST_PASS_CHANGED_LINES;
+    let fx = many_changes_fixture();
+    let diff = Arc::new(file_diff(&fx, unstaged("big.rs")));
+    let doc = build_doc(diff, DiffMode::Unified, 1, &CancelToken::new());
+    assert!(
+        !doc.syntax.is_complete(),
+        "the first pass stops at its limit"
+    );
+    let first = doc.syntax.tokens();
+    let last = first.len() - 1;
+    assert!(
+        !first[1].is_empty() && first[last].is_empty(),
+        "early lines are highlighted, late ones are plain after the first pass"
+    );
+    let copy = model::rebuild_mode(&doc, DiffMode::Split, 2);
+
+    assert!(!doc.highlight_full(&{
+        let c = CancelToken::new();
+        c.cancel();
+        c
+    }));
+    assert!(
+        !doc.syntax.is_complete(),
+        "a cancelled pass changes nothing"
+    );
+    assert!(doc.highlight_full(&CancelToken::new()));
+    assert!(doc.syntax.is_complete());
+    let full = doc.syntax.tokens();
+    assert!(
+        !full[last].is_empty(),
+        "the second pass reaches the late lines"
+    );
+    assert_eq!(
+        full[FIRST_PASS_CHANGED_LINES / 2],
+        first[FIRST_PASS_CHANGED_LINES / 2],
+        "lines of the first pass keep their tokens"
+    );
+    assert!(
+        copy.syntax.is_complete() && !copy.syntax.tokens()[last].is_empty(),
+        "a document copy for another mode sees the second pass"
+    );
+    assert!(
+        !doc.highlight_full(&CancelToken::new()),
+        "nothing is left to do"
+    );
+}
+
+#[gpui_kit::test]
+fn second_highlight_pass_keeps_the_document_and_selection(cx: &mut TestAppContext) {
+    let fx = many_changes_fixture();
+    let (_handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    select(cx, &tab, FileList::Unstaged, "big.rs");
+    let shown = doc(&tab, cx);
+    assert!(shown.syntax.is_complete(), "the second pass has run");
+    let last = shown.syntax.tokens().len() - 1;
+    assert!(!shown.syntax.tokens()[last].is_empty());
+    assert_eq!(
+        shown.generation, 1,
+        "the document was built and installed once"
+    );
+}

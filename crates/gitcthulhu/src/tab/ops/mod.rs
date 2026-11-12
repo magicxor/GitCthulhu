@@ -148,6 +148,8 @@ pub struct OpSpec<T: Send + 'static> {
     pub extra_refresh: RefreshSet,
     /// `OpContext::label`, shown in credential dialogs ("Push to origin").
     pub label: String,
+    /// Replaces the subtitle of the processing overlay (it names what the operation works on).
+    pub detail: Option<SharedString>,
     /// Overrides the `OpKind` text; `Some("")` = no toast.
     pub success_toast: Option<SharedString>,
     /// Replaces the success toast depending on the value (it keeps the undo action of a recorded run).
@@ -176,6 +178,7 @@ impl<T: Send + 'static> OpSpec<T> {
             base_refresh: RefreshSet::empty(),
             extra_refresh: RefreshSet::empty(),
             label: kind.processing_title().to_owned(),
+            detail: None,
             success_toast: None,
             toast_with: None,
             then: None,
@@ -248,6 +251,12 @@ impl<T: Send + 'static> OpSpec<T> {
         self
     }
 
+    /// Sets the processing overlay's subtitle for this run (the default is the kind's generic text).
+    pub fn detail(mut self, text: impl Into<SharedString>) -> Self {
+        self.detail = Some(text.into());
+        self
+    }
+
     /// Overrides the success toast; `""` = none.
     pub fn toast(mut self, text: impl Into<SharedString>) -> Self {
         self.success_toast = Some(text.into());
@@ -311,6 +320,8 @@ pub struct BusyState {
     pub overlay_visible: bool,
     /// The newest progress line ("Receiving objects 42%").
     pub phase: Option<SharedString>,
+    /// Replaces the overlay's subtitle ("Pulling changes from origin/main to the current", see [`OpSpec::detail`]).
+    pub detail: Option<SharedString>,
 }
 
 /// The background half of an operation.
@@ -592,6 +603,7 @@ impl RepoTab {
             base_refresh,
             extra_refresh,
             label,
+            detail,
             success_toast,
             toast_with,
             then,
@@ -607,7 +619,7 @@ impl RepoTab {
             retry_without_hooks,
         };
         let cancel = CancelToken::new();
-        self.begin_busy(kind, cancel.clone(), cancellable, window, cx);
+        self.begin_busy(kind, cancel.clone(), cancellable, detail, window, cx);
         match self.ctx.backend.clone() {
             TabBackend::Real(handle) => {
                 let (pump, progress) = ProgressPump::channel();
@@ -680,6 +692,7 @@ impl RepoTab {
         kind: OpKind,
         cancel: CancelToken,
         cancellable: Cancellable,
+        detail: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -692,6 +705,7 @@ impl RepoTab {
             started: Instant::now(),
             overlay_visible: false,
             phase: None,
+            detail,
         });
         self.emit(RepoTabEvent::OpStarted { kind }, cx);
         self.overlay_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -986,6 +1000,7 @@ impl RepoTab {
             OpKind::RecoverUndo,
             CancelToken::new(),
             Cancellable::No,
+            None,
             window,
             cx,
         );
@@ -1054,7 +1069,14 @@ impl RepoTab {
             RestoreKind::Redo => OpKind::Redo,
             RestoreKind::RestoreTo(_) => OpKind::RestoreTo,
         };
-        self.begin_busy(op_kind, CancelToken::new(), Cancellable::No, window, cx);
+        self.begin_busy(
+            op_kind,
+            CancelToken::new(),
+            Cancellable::No,
+            None,
+            window,
+            cx,
+        );
         match self.ctx.backend.clone() {
             TabBackend::Real(handle) => {
                 let asker = self.asker.clone();

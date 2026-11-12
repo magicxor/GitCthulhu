@@ -22,6 +22,7 @@ pub mod changes_list;
 pub mod commit_box;
 pub mod data;
 pub mod platform;
+mod tabs;
 
 use changes_list::ChangesList;
 use commit_box::CommitBox;

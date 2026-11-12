@@ -6,14 +6,15 @@
 //! dialog is centred vertically from an estimated height; stacked dialogs keep the kit's 16 px offset
 //! (deviation 33).
 
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::dialog::DialogEntrance;
+use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,
-    RenderOnce, SharedString, Styled as _, Subscription, Window, div, px, transparent_black,
+    AnyElement, App, AppContext as _, Context, Entity, Global, IntoElement, ParentElement as _,
+    Render, RenderOnce, SharedString, Styled as _, Subscription, Window, div, px,
+    transparent_black,
 };
 
 use crate::icons::{AppIcon, icon};
@@ -77,36 +78,127 @@ impl DialogFrame {
 
     /// Opens a dialog layer of `spec.width` whose content is `build` wrapped in the frame. `build` may run again
     /// whenever the kit rebuilds the layer, so it must be cheap and capture entities created before the call.
-    /// Escape closes the dialog; clicking outside does nothing.
+    /// Escape closes the dialog; clicking outside does nothing. Returns the id of the layer, for [`close_layer`].
     pub fn open(
         window: &mut Window,
         cx: &mut App,
         spec: DialogSpec,
         build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
-    ) {
+    ) -> LayerId {
         let build = Rc::new(build);
-        window.open_dialog(cx, move |dialog, window, _| {
-            let build = build.clone();
-            let margin = centered_margin_top(
-                window.viewport_size().height.as_f32(),
-                dpx(spec.est_height, window).as_f32(),
-            );
-            dialog
-                .entrance(DialogEntrance::None)
-                .close_button(false)
-                .overlay_closable(false)
-                // Enter is handled by the dialog's own field and buttons, never by the kit's default OK.
-                .on_ok(|_, _, _| false)
-                .p_0()
-                .border_0()
-                .bg(transparent_black())
-                .shadow_none()
-                .w(dpx(spec.width, window))
-                .margin_top(px(margin))
-                .content(move |content, window, cx| {
-                    content.child(DialogFrame::new(build(window, cx)))
-                })
-        });
+        open_layer(
+            window,
+            cx,
+            Rc::new(move |dialog, window, _| {
+                let build = build.clone();
+                let margin = centered_margin_top(
+                    window.viewport_size().height.as_f32(),
+                    dpx(spec.est_height, window).as_f32(),
+                );
+                dialog
+                    .entrance(DialogEntrance::None)
+                    .close_button(false)
+                    .overlay_closable(false)
+                    // Enter is handled by the dialog's own field and buttons, never by the kit's default OK.
+                    .on_ok(|_, _, _| false)
+                    .p_0()
+                    .border_0()
+                    .bg(transparent_black())
+                    .shadow_none()
+                    .w(dpx(spec.width, window))
+                    .margin_top(px(margin))
+                    .content(move |content, window, cx| {
+                        content.child(DialogFrame::new(build(window, cx)))
+                    })
+            }),
+        )
+    }
+}
+
+/// Identifies one dialog layer of the window (see [`open_layer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LayerId(u64);
+
+/// Builds the kit dialog of one layer.
+type LayerBuilder = Rc<dyn Fn(Dialog, &mut Window, &mut App) -> Dialog>;
+
+/// One open layer as the registry knows it.
+struct Layer {
+    id: LayerId,
+    /// The kit's layer holds the only strong reference to its builder, so this one dies when the kit pops the
+    /// layer (Escape, a button or `close_dialog`): the registry never needs to be told about those closes, and it
+    /// never keeps a dialog's entities alive (their `Drop` is what reports a dialog closed without an answer).
+    build: Weak<dyn Fn(Dialog, &mut Window, &mut App) -> Dialog>,
+}
+
+/// The open dialog layers, bottom first (the kit stacks them in the order they were opened).
+#[derive(Default)]
+struct Layers {
+    next: u64,
+    stack: Vec<Layer>,
+}
+
+impl Global for Layers {}
+
+impl Layers {
+    /// Forgets the layers the kit has closed.
+    fn prune(&mut self) {
+        self.stack.retain(|layer| layer.build.strong_count() > 0);
+    }
+}
+
+/// Opens `build` as a new kit dialog layer and registers it, so that it can be closed by id later. Every dialog
+/// of the app goes through here (the kit's `close_dialog` only knows the top-most layer).
+pub(crate) fn open_layer(window: &mut Window, cx: &mut App, build: LayerBuilder) -> LayerId {
+    let layers = cx.default_global::<Layers>();
+    layers.prune();
+    layers.next += 1;
+    let id = LayerId(layers.next);
+    register_layer(window, cx, id, build);
+    id
+}
+
+fn register_layer(window: &mut Window, cx: &mut App, id: LayerId, build: LayerBuilder) {
+    cx.default_global::<Layers>().stack.push(Layer {
+        id,
+        build: Rc::downgrade(&build),
+    });
+    // The kit drops this closure, and with it the builder, when the layer closes.
+    window.open_dialog(cx, move |dialog, window, cx| build(dialog, window, cx));
+}
+
+/// Closes the layer `id`, whatever its place in the stack, and leaves every other layer open. A layer that is
+/// already gone is ignored. The top-most layer is popped; a layer below others cannot be taken out of the kit's
+/// stack, so the layers are closed and the others opened again in their order.
+pub fn close_layer(window: &mut Window, cx: &mut App, id: LayerId) {
+    let layers = cx.default_global::<Layers>();
+    layers.prune();
+    let Some(position) = layers.stack.iter().position(|layer| layer.id == id) else {
+        return;
+    };
+    if position + 1 == layers.stack.len() {
+        layers.stack.pop();
+        window.close_dialog(cx);
+        return;
+    }
+    let survivors: Vec<(LayerId, LayerBuilder)> = layers
+        .stack
+        .drain(..)
+        .filter(|layer| layer.id != id)
+        .filter_map(|layer| Some((layer.id, layer.build.upgrade()?)))
+        .collect();
+    window.close_all_dialogs(cx);
+    for (id, build) in survivors {
+        register_layer(window, cx, id, build);
+    }
+}
+
+/// Closes the layer `id` when it is known, else the top-most dialog (a dialog that was not opened through
+/// [`DialogFrame::open`]).
+pub fn close_layer_or_top(window: &mut Window, cx: &mut App, id: Option<LayerId>) {
+    match id {
+        Some(id) => close_layer(window, cx, id),
+        None => window.close_dialog(cx),
     }
 }
 
@@ -238,8 +330,6 @@ impl RenderOnce for IconBasedDialog {
                     div()
                         .pb(dp(16.))
                         .w_full()
-                        .flex()
-                        .justify_center()
                         .text_center()
                         .text_body2()
                         .text_color(tokens.on_background)

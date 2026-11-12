@@ -50,6 +50,8 @@ pub enum RunnerVerb {
     WaitIdle,
     /// `wait <ms>`.
     Wait,
+    /// `wait dialog open|closed [ms]`.
+    WaitDialog,
     /// `shot <name> [window]`.
     Shot,
     /// `quit [code]`.

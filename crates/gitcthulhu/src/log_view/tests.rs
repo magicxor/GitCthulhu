@@ -660,14 +660,12 @@ fn chip_double_click_checks_out(cx: &mut TestAppContext) {
         window.double_click(ids::chip(2, 0), cx)
     });
     cx.run_until_parked();
-    let toasts = cx.update(|cx| toast_texts(&_app, cx));
-    let checked_out = ops(&tab, cx)
-        .iter()
-        .any(|(k, _)| *k == OpKind::CheckoutBranch)
-        || toasts.iter().any(|t| t.contains("Checkout branch"));
     assert!(
-        checked_out,
-        "double-click checks the branch out ({toasts:?})"
+        ops(&tab, cx)
+            .iter()
+            .any(|(k, _)| *k == OpKind::CheckoutBranch),
+        "double-click checks the branch out: {:?}",
+        ops(&tab, cx)
     );
 }
 
@@ -1318,7 +1316,7 @@ fn history_ops_record_titles_and_refresh(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn empty_pick_offers_skip_or_commit(cx: &mut TestAppContext) {
-    let (handle, app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
     let empty = || {
         Err::<OpOutcome<SequenceOutcome>, _>(OpFailure::Git(Arc::new(GitError::EmptyPick {
             commit: None,
@@ -1352,12 +1350,11 @@ fn empty_pick_offers_skip_or_commit(cx: &mut TestAppContext) {
         window.click(("choice-option", 0usize), cx)
     });
     cx.run_until_parked();
-    let skipped = ops(&tab, cx).iter().any(|(k, _)| *k == OpKind::SkipRebase)
-        || cx
-            .update(|cx| toast_texts(&app, cx))
-            .iter()
-            .any(|t| t.contains("Skip"));
-    assert!(skipped, "Skip runs skip_operation");
+    assert!(
+        ops(&tab, cx).iter().any(|(k, _)| *k == OpKind::SkipRebase),
+        "Skip runs skip_operation: {:?}",
+        ops(&tab, cx)
+    );
 }
 
 #[gpui_kit::test]
@@ -1642,4 +1639,74 @@ fn short_rev_strips_namespaces() {
     assert_eq!(short_rev("refs/heads/main"), "main");
     assert_eq!(short_rev("refs/remotes/origin/x"), "origin/x");
     assert_eq!(short_rev("v1.0"), "v1.0");
+}
+
+/// 21 §6 #38: the default graph width grows to show every lane when that fits in 40 % of the log pane, else it
+/// stays 120 dp and the graph scrolls.
+#[test]
+fn default_graph_width_fits_the_lanes_within_40_percent() {
+    // (max_lane + 2) x 30 dp: lane 3 needs 150, lane 5 needs 210.
+    assert_eq!(default_graph_width(Some(3), Some(1000.)), 150.);
+    assert_eq!(default_graph_width(Some(5), Some(1000.)), 210.);
+    assert_eq!(
+        default_graph_width(Some(5), Some(530.)),
+        210.,
+        "just under 40 % of the pane fits"
+    );
+    assert_eq!(
+        default_graph_width(Some(5), Some(520.)),
+        120.,
+        "more than 40 % keeps the default and scrolls"
+    );
+    assert_eq!(
+        default_graph_width(Some(0), Some(1000.)),
+        120.,
+        "never below 120"
+    );
+    assert_eq!(default_graph_width(None, Some(1000.)), 120., "an empty log");
+    assert_eq!(
+        default_graph_width(Some(5), None),
+        120.,
+        "pane not laid out yet"
+    );
+    // The drag minimum stays 100 dp whatever the default is.
+    assert_eq!(
+        graph_width_from(210., clamp_padding_from(210., -500.)),
+        100.
+    );
+    assert_eq!(graph_width_from(210., 0.), 210.);
+}
+
+/// A repository with several lanes opens with a graph column wide enough for them.
+#[gpui_kit::test]
+fn wide_graphs_open_with_a_column_that_fits_their_lanes(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::branchy(), DEFAULT_SIZE);
+    // Five lanes (the fixture's own graph needs only two).
+    let max_lane = 5;
+    cx.update(|cx| {
+        let model = tab.read(cx).ctx().model.clone();
+        model.update(cx, |m, cx| {
+            let wide = m.log.value.as_ref().map(|s| LogSnapshot {
+                rows: s.rows.clone(),
+                max_lane,
+                exhausted: s.exhausted,
+                generation: s.generation,
+            });
+            m.log.value = wide.map(std::sync::Arc::new);
+            cx.notify();
+        });
+    });
+    let wanted = (f32::from(max_lane) + 2.) * 30.;
+    assert!(wanted > 120.);
+    // Let the pane be measured, then repaint.
+    frame(cx, handle, |_, _| ());
+    frame(cx, handle, |_, _| ());
+    frame(cx, handle, |window, _| {
+        let pane = bounds(window, ids::LOG_VIEW).size.width.as_f32();
+        assert!(
+            wanted <= pane * 0.4,
+            "the lanes fit in 40 % of the {pane} px pane"
+        );
+        assert_width(window, ids::HEADER_GRAPH, wanted);
+    });
 }

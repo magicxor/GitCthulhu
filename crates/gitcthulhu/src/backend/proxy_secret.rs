@@ -33,19 +33,26 @@ pub fn exists() -> Result<bool, Unavailable> {
     retrieve().map(|secret| secret.is_some())
 }
 
-/// Stores `password`; an empty password deletes the entry. Errors: the keychain is unavailable.
+/// Stores `password`. An empty password changes nothing: an emptied text field must never delete the stored secret
+/// (use [`remove`]). Errors: the keychain is unavailable.
 #[cfg(feature = "services")]
 pub fn store(password: &str) -> Result<(), Unavailable> {
-    let result = if password.is_empty() {
-        but_secret::secret::delete(HANDLE, but_secret::secret::Namespace::Global)
-    } else {
-        but_secret::secret::persist(
-            HANDLE,
-            &but_secret::Sensitive(password.to_owned()),
-            but_secret::secret::Namespace::Global,
-        )
-    };
-    result.map_err(|err| Unavailable(err.to_string()))
+    if password.is_empty() {
+        return Ok(());
+    }
+    but_secret::secret::persist(
+        HANDLE,
+        &but_secret::Sensitive(password.to_owned()),
+        but_secret::secret::Namespace::Global,
+    )
+    .map_err(|err| Unavailable(err.to_string()))
+}
+
+/// Deletes the stored password. Errors: the keychain is unavailable.
+#[cfg(feature = "services")]
+pub fn remove() -> Result<(), Unavailable> {
+    but_secret::secret::delete(HANDLE, but_secret::secret::Namespace::Global)
+        .map_err(|err| Unavailable(err.to_string()))
 }
 
 #[cfg(feature = "services")]
@@ -64,6 +71,12 @@ pub fn exists() -> Result<bool, Unavailable> {
 /// Stores `password`. Errors: always, in builds without the keychain.
 #[cfg(not(feature = "services"))]
 pub fn store(_password: &str) -> Result<(), Unavailable> {
+    Err(unavailable())
+}
+
+/// Deletes the stored password. Errors: always, in builds without the keychain.
+#[cfg(not(feature = "services"))]
+pub fn remove() -> Result<(), Unavailable> {
     Err(unavailable())
 }
 

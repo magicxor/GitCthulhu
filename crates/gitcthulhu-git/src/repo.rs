@@ -32,8 +32,10 @@ pub struct RuntimeConfig {
     /// Merge the login shell's `PATH` into the environment of child processes; default true on macOS/Linux, ignored
     /// on Windows.
     pub login_shell_env: bool,
-    /// `-c key=value` pairs added to every Network command (GUI proxy / TLS settings: `http.proxy`, `http.sslVerify`;
-    /// replaces Gitnuro's JVM proxy properties, 05 §6.5).
+    /// `key=value` config pairs added to every Mutation and Network command (GUI proxy / TLS settings: `http.proxy`,
+    /// `http.sslVerify`; replaces Gitnuro's JVM proxy properties, 05 §6.5). They reach git through
+    /// `GIT_CONFIG_COUNT/KEY_n/VALUE_n` environment variables, never on the command line, so a proxy URL may
+    /// carry a password.
     pub network_config: Vec<(String, String)>,
     /// Tests only: isolate every child git and every gix open from the developer's config (§10).
     #[doc(hidden)]

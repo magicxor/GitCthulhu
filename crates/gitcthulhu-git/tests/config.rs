@@ -367,6 +367,35 @@ fn write_commit_graph_creates_file() {
 }
 
 #[test]
+fn commit_graph_is_written_in_the_background_only_for_large_repositories() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env = TestEnv::new();
+    let fixture = env.repo("repo");
+    for n in 0..5 {
+        commit(&fixture, &format!("c{n}"));
+    }
+    let repo = fixture.open();
+    let ctx = fixture.op_ctx(
+        CancelToken::new(),
+        std::sync::Arc::new(gitcthulhu_git::NoPrompter),
+    );
+    assert!(
+        !config::write_commit_graph_if_large(&repo, 5, &ctx).expect("probe"),
+        "5 commits are not more than 5"
+    );
+    assert!(!config::commit_graph_present(&repo), "nothing was written");
+    assert!(
+        config::write_commit_graph_if_large(&repo, 4, &ctx).expect("write"),
+        "5 commits are more than 4"
+    );
+    assert!(config::commit_graph_present(&repo), "the file exists");
+    assert!(
+        !config::write_commit_graph_if_large(&repo, 4, &ctx).expect("again"),
+        "an existing commit-graph is left alone"
+    );
+}
+
+#[test]
 fn add_safe_directory_writes_global_config() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = TestEnv::new();

@@ -4,6 +4,7 @@
 //! quiet period, after which the runner also waits for frames to be drawn. Regions whose own asynchronous work is
 //! invisible here (for example a diff or a commit-details load) add a probe with [`register_idle_probe`].
 
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::{App, Global, Window};
 
 use crate::app_view::{AppViewGlobal, TabContent};
@@ -26,8 +27,10 @@ pub fn register_idle_probe(cx: &mut App, probe: IdleProbe) {
 }
 
 /// Why the app is busy right now, or `None` when it is idle.
-pub fn busy_reason(window: &mut Window, cx: &App) -> Option<String> {
-    if let Some(reason) = app_probe(cx) {
+pub fn busy_reason(window: &mut Window, cx: &mut App) -> Option<String> {
+    // An operation that waits for a dialog (a credential prompt) waits for the scenario, not for the app.
+    let dialog_open = window.has_active_dialog(cx);
+    if let Some(reason) = app_probe(cx, dialog_open) {
         return Some(reason);
     }
     let probes: Vec<IdleProbe> = cx
@@ -38,7 +41,7 @@ pub fn busy_reason(window: &mut Window, cx: &App) -> Option<String> {
 }
 
 /// The built-in probe: repositories being opened, the active tab's operation and loads.
-fn app_probe(cx: &App) -> Option<String> {
+fn app_probe(cx: &App, dialog_open: bool) -> Option<String> {
     let view = cx.try_global::<AppViewGlobal>()?.0.upgrade()?;
     let view = view.read(cx);
     for slot in view.tabs() {
@@ -47,7 +50,9 @@ fn app_probe(cx: &App) -> Option<String> {
         }
     }
     let tab = view.active_tab()?.read(cx);
-    if let Some(busy) = tab.busy() {
+    if let Some(busy) = tab.busy()
+        && !dialog_open
+    {
         return Some(format!("operation {:?} running", busy.kind));
     }
     let model = tab.ctx().model.read(cx);
@@ -73,7 +78,7 @@ fn views_busy(views: &crate::tab::RegionViews, cx: &App) -> Option<String> {
     if views
         .history
         .as_ref()
-        .is_some_and(|(_, h)| h.read(cx).is_loading())
+        .is_some_and(|(_, h)| h.read(cx).is_loading(cx))
     {
         return Some("the file history is loading".into());
     }

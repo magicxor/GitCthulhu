@@ -9,7 +9,9 @@
 //!   on Windows, `HOME` and the `XDG_*` variables elsewhere) and `GIT_CONFIG_GLOBAL` lie inside the sandbox, so the
 //!   user's real settings, Git configuration and credential helpers are never read;
 //! * `GIT_CONFIG_NOSYSTEM=1` and `GIT_ALLOW_PROTOCOL=file` keep the system configuration out and forbid every
-//!   network protocol (the fixture remotes are local bare repositories);
+//!   network protocol (the fixture remotes are local bare repositories). The one exception is the credential
+//!   scenario: `run-gui.ps1 -HttpServer` starts a local test server on `127.0.0.1` and sets
+//!   `GIT_ALLOW_PROTOCOL=file:http` together with [`LOOPBACK_HTTP_ENV`]` = 127.0.0.1:<port>`; only that pair passes;
 //! * every repository a scenario opens must lie inside the sandbox ([`Sandbox::check_repository`]).
 //!
 //! The checks are pure functions over an environment lookup, so they are unit-tested without touching the process.
@@ -23,6 +25,9 @@ pub const SANDBOX_ENV: &str = "GITCTHULHU_QA_SANDBOX";
 pub const MARKER_FILE: &str = ".qa-sandbox";
 /// The first line of the marker file.
 pub const MARKER_TEXT: &str = "gitcthulhu-qa-sandbox v1";
+/// Set by `run-gui.ps1 -HttpServer` to `127.0.0.1:<port>` of the local Git test server; the only way `http` passes
+/// the protocol check.
+pub const LOOPBACK_HTTP_ENV: &str = "GITCTHULHU_QA_LOOPBACK_HTTP";
 /// The process exit code of a refusal.
 pub const EXIT_REFUSED: i32 = 3;
 
@@ -170,13 +175,34 @@ pub fn check(
     if get("GIT_CONFIG_NOSYSTEM").is_none_or(|v| v != "1") {
         return Err("GIT_CONFIG_NOSYSTEM=1 is required (no system Git configuration in QA)".into());
     }
-    if get("GIT_ALLOW_PROTOCOL").is_none_or(|v| v != "file") {
-        return Err(
+    check_protocols(&get)?;
+    Ok(Sandbox { root })
+}
+
+/// `GIT_ALLOW_PROTOCOL` is `file`, or `file:http` while [`LOOPBACK_HTTP_ENV`] names a loopback port.
+fn check_protocols(get: &dyn Fn(&str) -> Option<OsString>) -> Result<(), String> {
+    let protocols = get("GIT_ALLOW_PROTOCOL");
+    match protocols.as_deref().and_then(|v| v.to_str()) {
+        Some("file") => Ok(()),
+        Some("file:http") => {
+            let loopback = get(LOOPBACK_HTTP_ENV)
+                .and_then(|v| v.into_string().ok())
+                .and_then(|v| v.strip_prefix("127.0.0.1:").map(str::to_owned))
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port != 0);
+            if loopback.is_some() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "GIT_ALLOW_PROTOCOL=file:http needs {LOOPBACK_HTTP_ENV}=127.0.0.1:<port> (the local test server)"
+                ))
+            }
+        }
+        _ => Err(
             "GIT_ALLOW_PROTOCOL=file is required (QA never uses the network, only local bare remotes)"
                 .into(),
-        );
+        ),
     }
-    Ok(Sandbox { root })
 }
 
 /// Resolves `.` and `..` lexically and strips the Windows extended-length prefix, so paths compare without the
@@ -366,6 +392,27 @@ mod tests {
         let mut env = good_env(dir.path());
         env.insert("GIT_ALLOW_PROTOCOL".into(), "file:https".into());
         assert!(run(&env).is_err(), "only the file protocol is allowed");
+    }
+
+    #[test]
+    fn http_is_allowed_only_for_the_loopback_test_server() {
+        let dir = sandbox_dir();
+        let mut env = good_env(dir.path());
+        env.insert("GIT_ALLOW_PROTOCOL".into(), "file:http".into());
+        assert!(run(&env).is_err(), "http without the loopback pairing");
+        for bad in [
+            "example.com:80",
+            "127.0.0.1:0",
+            "127.0.0.1:x",
+            "0.0.0.0:8080",
+        ] {
+            env.insert(LOOPBACK_HTTP_ENV.into(), bad.into());
+            assert!(run(&env).is_err(), "{bad} is not the test server");
+        }
+        env.insert(LOOPBACK_HTTP_ENV.into(), "127.0.0.1:47631".into());
+        assert!(run(&env).is_ok(), "the loopback pairing passes");
+        env.insert("GIT_ALLOW_PROTOCOL".into(), "file:http:https".into());
+        assert!(run(&env).is_err(), "no other protocol joins it");
     }
 
     #[test]

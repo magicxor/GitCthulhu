@@ -3,7 +3,9 @@
 //! The base is the runtime's captured process environment (plus the login shell's `PATH` on macOS/Linux), minus
 //! everything that would make the child operate on another repository or pick up foreign tooling. On top come the
 //! fixed variables (no prompts, English messages, no editor, no pager), the test isolation, and the per-kind
-//! additions. Askpass, the transport defaults of the harness and `GitCommand::extra_env` are added by the caller, in
+//! additions. The GUI's network settings (`RuntimeConfig::network_config`, which may carry a proxy password) travel
+//! in `GIT_CONFIG_COUNT/KEY_n/VALUE_n` (Git 2.31+, the minimum is 2.34.1), never on the command line where every
+//! local process can read them. Askpass, the transport defaults of the harness and `GitCommand::extra_env` are added by the caller, in
 //! that order, after this list.
 
 use std::{
@@ -112,6 +114,11 @@ pub(crate) fn child_env(
         set("USERPROFILE", isolation.home.clone().into());
         set("XDG_CONFIG_HOME", isolation.home.join(".config").into());
     }
+    if cmd.kind != CommandKind::Read {
+        for (name, value) in network_env(&rt.config().network_config) {
+            set(&name, value.into());
+        }
+    }
     if cmd.kind == CommandKind::Read {
         // No opportunistic index refresh by a read.
         set("GIT_OPTIONAL_LOCKS", "0".into());
@@ -122,10 +129,25 @@ pub(crate) fn child_env(
     env
 }
 
-/// The arguments before the subcommand: `--no-pager`, raw UTF-8 paths, no colours, and for Mutation/Network commands
-/// the GUI's network settings (`RuntimeConfig::network_config`).
-pub(crate) fn global_args(rt: &GitRuntime, kind: CommandKind) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
+/// `pairs` as `GIT_CONFIG_COUNT` plus `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` variables (empty for no pairs).
+/// Git reads them like `-c key=value` of the command, but they do not show up in any process's argument list.
+pub(crate) fn network_env(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut vars = Vec::with_capacity(1 + 2 * pairs.len());
+    vars.push(("GIT_CONFIG_COUNT".to_owned(), pairs.len().to_string()));
+    for (idx, (key, value)) in pairs.iter().enumerate() {
+        vars.push((format!("GIT_CONFIG_KEY_{idx}"), key.clone()));
+        vars.push((format!("GIT_CONFIG_VALUE_{idx}"), value.clone()));
+    }
+    vars
+}
+
+/// The arguments before the subcommand: `--no-pager`, raw UTF-8 paths and no colours. The GUI's network settings
+/// are not here (they may hold a secret): see [`network_env`].
+pub(crate) fn global_args() -> Vec<OsString> {
+    [
         "--no-pager",
         "-c",
         "core.quotepath=false",
@@ -134,14 +156,7 @@ pub(crate) fn global_args(rt: &GitRuntime, kind: CommandKind) -> Vec<OsString> {
     ]
     .into_iter()
     .map(OsString::from)
-    .collect();
-    if kind != CommandKind::Read {
-        for (key, value) in &rt.config().network_config {
-            args.push("-c".into());
-            args.push(format!("{key}={value}").into());
-        }
-    }
-    args
+    .collect()
 }
 
 /// `path` as a single-quoted `sh` word, with forward slashes on Windows; `'` becomes `'\''`.
@@ -199,6 +214,32 @@ mod tests {
             sh_quote(Path::new(r"C:\Program Files\app\gitcthulhu-editor.exe")),
             OsString::from("'C:/Program Files/app/gitcthulhu-editor.exe'"),
             "sh would eat backslashes"
+        );
+    }
+
+    #[test]
+    fn network_settings_become_config_environment_variables() {
+        assert!(network_env(&[]).is_empty());
+        let vars = network_env(&[
+            ("http.proxy".into(), "http://u:secret@proxy:3128".into()),
+            ("http.sslVerify".into(), "false".into()),
+        ]);
+        assert_eq!(
+            vars,
+            [
+                ("GIT_CONFIG_COUNT", "2"),
+                ("GIT_CONFIG_KEY_0", "http.proxy"),
+                ("GIT_CONFIG_VALUE_0", "http://u:secret@proxy:3128"),
+                ("GIT_CONFIG_KEY_1", "http.sslVerify"),
+                ("GIT_CONFIG_VALUE_1", "false"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        );
+        let args = global_args();
+        assert!(
+            args.iter()
+                .all(|arg| !arg.to_string_lossy().contains("proxy")),
+            "global arguments carry no network settings: {args:?}"
         );
     }
 

@@ -1,7 +1,7 @@
 //! The diff view (owned by G7a; 09 §1, spec 21 §4.1): one entity per tab that loads the selected file's diff and
 //! renders it with `list(ListState)` (uniform height hint, `scroll_to` jumps, wrapping lines). The interface to
 //! G7b (selection, highlighting) is fixed by `selection.rs` and `highlight.rs`: every text cell goes through
-//! [`DiffSelection::text_cell`], and [`model::build_doc`] calls `Highlighter::highlight` in the background.
+//! [`DiffSelection::text_cell`], and [`model::build_doc`] runs the first highlighting pass in the background; the second pass follows in place.
 //!
 //! Data flow: `RepoUi::diff_target` (or a fixed target for file history) -> background load (`backend::diff::load`,
 //! then `build_doc`) through a [`ReadSlot`] -> [`DiffDoc`] -> rows. Status reloads re-read uncommitted diffs and keep
@@ -210,6 +210,8 @@ pub struct DiffView {
     show_loading: bool,
     load_slot: ReadSlot,
     build_slot: ReadSlot,
+    /// The second highlighting pass of the shown document (it fills the document's `SyntaxCell` in place).
+    syntax_slot: ReadSlot,
     loading_timer: Option<Task<()>>,
     generation: u64,
     list: ListState,
@@ -317,6 +319,7 @@ impl DiffView {
             show_loading: false,
             load_slot: ReadSlot::default(),
             build_slot: ReadSlot::default(),
+            syntax_slot: ReadSlot::default(),
             loading_timer: None,
             generation: 0,
             list: ListState::new(0, ListAlignment::Top, px(m::LIST_OVERDRAW))
@@ -410,6 +413,7 @@ impl DiffView {
         if self.wanted.is_none() {
             self.load_slot.cancel();
             self.build_slot.cancel();
+            self.syntax_slot.cancel();
             self.loaded = None;
             self.loading = false;
             self.show_loading = false;
@@ -560,11 +564,36 @@ impl DiffView {
                     anchor,
                     cx,
                 );
+                self.start_full_highlight(cx);
                 self.ensure_mode(cx);
             }
             LoadResult::Failed(err) => self.load_failed(&wanted, err, cx),
         }
         cx.notify();
+    }
+
+    /// Starts the second highlighting pass for the shown document when the first one stopped at its limit. The
+    /// result is stored in the document's shared syntax cell, so the document, its rows and the text selection stay
+    /// as they are; only the view repaints. A newer document cancels the pass.
+    fn start_full_highlight(&mut self, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        if loaded.doc.syntax.is_complete() {
+            self.syntax_slot.cancel();
+            return;
+        }
+        let doc = loaded.doc.clone();
+        self.syntax_slot.start(
+            cx,
+            |v: &mut Self| &mut v.syntax_slot,
+            move |cancel| doc.highlight_full(cancel),
+            |_: &mut Self, changed, cx| {
+                if changed {
+                    cx.notify();
+                }
+            },
+        );
     }
 
     fn load_failed(&mut self, wanted: &Wanted, err: GitError, cx: &mut Context<Self>) {
@@ -577,6 +606,7 @@ impl DiffView {
             {
                 tracing::debug!("diff target vanished: {err}");
                 self.loaded = None;
+                self.syntax_slot.cancel();
                 self.stale = false;
                 self.selection.clear(cx);
                 self.ctx.ui.update(cx, |ui, cx| ui.clear_files(cx));
@@ -584,6 +614,7 @@ impl DiffView {
             _ => {
                 tracing::warn!("diff load failed: {err}");
                 self.loaded = None;
+                self.syntax_slot.cancel();
                 self.stale = false;
                 self.selection.clear(cx);
                 self.list.reset(0);

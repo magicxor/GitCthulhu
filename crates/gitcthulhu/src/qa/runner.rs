@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::{App, AsyncWindowContext, Global, Task, Window};
 use parking_lot::Mutex;
 
@@ -269,6 +270,24 @@ async fn execute(
                 Err(busy) => (Status::Fail, busy),
             }
         }
+        Action::Runner(RunnerVerb::WaitDialog) => {
+            let want_open = match args.text(0, "open or closed") {
+                Ok(word) => match word.to_lowercase().as_str() {
+                    "open" => true,
+                    "closed" => false,
+                    other => return (Status::Fail, format!("'{other}' is not open or closed")),
+                },
+                Err(message) => return (Status::Fail, message),
+            };
+            let timeout = args
+                .opt(1)
+                .and_then(|ms| ms.parse::<u64>().ok())
+                .map_or(WAIT_IDLE_TIMEOUT, Duration::from_millis);
+            match wait_dialog(cx, want_open, timeout).await {
+                Ok(()) => (Status::Pass, String::new()),
+                Err(message) => (Status::Fail, message),
+            }
+        }
         Action::Runner(RunnerVerb::Wait) => match args.number::<u64>(0, "milliseconds") {
             Ok(ms) => {
                 sleep(cx, Duration::from_millis(ms)).await;
@@ -281,6 +300,36 @@ async fn execute(
     }
 }
 
+/// Waits until a dialog is open (or closed), then until two frames were drawn.
+async fn wait_dialog(
+    cx: &mut AsyncWindowContext,
+    want_open: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let open = cx
+            .update(|window, cx| window.has_active_dialog(cx))
+            .map_err(|_| "the window is gone".to_owned())?;
+        if open == want_open {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no dialog {} after {timeout:?}",
+                if want_open { "opened" } else { "closed" }
+            ));
+        }
+        sleep(cx, POLL).await;
+    }
+    if !want_open {
+        // The prompts `begin action` expected are over.
+        let _ = cx.update(|_, cx| monitor::expect_prompts(cx, false));
+    }
+    draw_frames(cx, 2).await;
+    Ok(())
+}
+
 /// Waits until the app is idle (no probe reports work) for [`QUIET`], then until two frames were drawn.
 async fn wait_idle(cx: &mut AsyncWindowContext, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
@@ -288,7 +337,7 @@ async fn wait_idle(cx: &mut AsyncWindowContext, timeout: Duration) -> Result<(),
     let mut last_reason = String::new();
     loop {
         let busy = cx
-            .update(|window, cx| idle::busy_reason(window, cx))
+            .update(idle::busy_reason)
             .map_err(|_| "the window is gone".to_owned())?;
         match busy {
             None => {

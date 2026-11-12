@@ -29,6 +29,10 @@ const LOCK_FILES: &[&str] = &[
     "packed-refs.lock",
     "config.lock",
     "shallow.lock",
+    // `git commit-graph write` (the background write of large repositories can be cancelled by closing the tab):
+    // a leftover lock makes every later commit-graph write, `git gc` and `git maintenance` fail.
+    "objects/info/commit-graph.lock",
+    "objects/info/commit-graphs/commit-graph-chain.lock",
 ];
 /// A lock counts as created by the command if its mtime is at most this much older than the command's start.
 /// Covers file systems with coarse timestamps (FAT: 2 s) and kernels whose cached clock lags behind the wall clock.
@@ -492,6 +496,20 @@ mod tests {
             "the untouched lock is deleted"
         );
         assert!(!lock.exists(), "and gone from disk");
+    }
+
+    #[test]
+    fn commit_graph_lock_of_a_killed_write_is_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let info = dir.path().join("objects").join("info");
+        std::fs::create_dir_all(&info).expect("objects/info");
+        let started = SystemTime::now();
+        let lock = info.join("commit-graph.lock");
+        std::fs::write(&lock, b"partial graph").expect("lock can be written");
+        let observed = observe_locks(&[dir.path().to_owned()], started, &[]);
+        assert_eq!(observed.len(), 1, "the commit-graph lock is observed");
+        assert_eq!(remove_stale_locks(&observed).len(), 1);
+        assert!(!lock.exists(), "a killed commit-graph write leaves no lock");
     }
 
     #[test]

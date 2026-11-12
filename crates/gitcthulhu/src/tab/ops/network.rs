@@ -263,6 +263,7 @@ impl RepoTab {
             ),
             None => (format!("Pull {head}"), None, "Pull".to_owned()),
         };
+        let overlay = self.pull_overlay_text(&request, cx);
         let descriptor = OperationDescriptor {
             kind: OperationKind::Pull,
             title,
@@ -270,7 +271,7 @@ impl RepoTab {
             scope: Scope::Full,
             untracked: UntrackedCapture::None,
         };
-        let spec = OpSpec::new(OpKind::Pull, move |env| {
+        let mut spec = OpSpec::new(OpKind::Pull, move |env| {
             let (repo, ctx) = (env.repo, env.ctx);
             let mut outcome = git::network::pull(repo, env.perm(), ctx, &options)?;
             // Like a merge: the runner shows ONE Warning toast (with "Show output") instead of the success toast.
@@ -291,7 +292,38 @@ impl RepoTab {
         .label(label)
         .base_refresh(RefreshSet::OPERATION_STATE | RefreshSet::REMOTES)
         .on_error(move |tab, failure, window, cx| tab.pull_failed(request, failure, window, cx));
+        if let Some(text) = overlay {
+            spec = spec.detail(text);
+        }
         self.run_op(spec, window, cx)
+    }
+
+    /// The overlay subtitle of a pull that names its source: the requested remote branch, else the current
+    /// branch's upstream, in Gitnuro's words (07 §12.6: "Pulling changes from origin/main to the current");
+    /// `None` while neither is known (the generic subtitle then says "remote branch").
+    fn pull_overlay_text(&self, request: &PullRequest, cx: &Context<Self>) -> Option<String> {
+        let source = match &request.target {
+            Some((remote, branch)) => format!("{remote}/{branch}"),
+            None => {
+                let model = self.ctx.model.read(cx);
+                let refs = model.refs.value.as_ref()?;
+                let HeadState::Branch { name, .. } = &refs.head else {
+                    return None;
+                };
+                let upstream = refs
+                    .local
+                    .iter()
+                    .find(|b| &b.full == name)?
+                    .upstream
+                    .as_ref()?;
+                format!(
+                    "{}/{}",
+                    upstream.remote,
+                    upstream.merge.as_ref().shorten().to_str_lossy()
+                )
+            }
+        };
+        Some(format!("Pulling changes from {source} to the current"))
     }
 
     /// The recovery flows of a failed pull (21 §2.9).
@@ -401,8 +433,8 @@ impl RepoTab {
     }
 
     /// The Change-upstream flow of a pull or push of a branch without an upstream (21 §2.9): opens the dialog for
-    /// the current branch and runs `after` once an upstream was set. The wait ends when another operation starts
-    /// first (the dialog was cancelled).
+    /// the current branch and runs `after` once an upstream was set. The wait ends when the dialog is closed
+    /// without a choice or when another operation starts first.
     fn ask_upstream(
         &mut self,
         window: &mut Window,
@@ -462,9 +494,22 @@ impl RepoTab {
             )
         };
         *waiting.borrow_mut() = Some(subscription);
+        let waiting_for_dialog = waiting;
         let ctx = self.ctx.clone();
         window.defer(cx, move |window, cx| {
-            crate::dialogs::branch::open_change_upstream(window, cx, ctx, branch);
+            crate::dialogs::branch::open_change_upstream_then(
+                window,
+                cx,
+                ctx,
+                branch,
+                // A cancelled dialog ends the wait: a later, unrelated upstream change must not retry the pull
+                // or push.
+                Box::new(move |accepted| {
+                    if !accepted {
+                        waiting_for_dialog.borrow_mut().take();
+                    }
+                }),
+            );
         });
         Handled::Yes
     }

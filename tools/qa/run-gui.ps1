@@ -36,6 +36,13 @@
 .PARAMETER KeepState
   Do not reset the sandbox's app data before the run.
 
+.PARAMETER HttpServer
+  Starts the local credential-checking Git test server (tools\qa\git-http-server.ps1) on a free loopback port for
+  the run: repos\cred-remote.git is served over http, the "origin" of repos\cred points at it, and the qa gate lets
+  the http protocol through for that port only (no real network). The user name is qa-user and the password
+  qa-secret (synthetic). The remote and the clone's tracking ref are reset to "one commit behind" first, so every
+  run pushes again. The server's request log is copied to <Out>\http-server.txt. Needs a sandbox with repos\cred.
+
 .PARAMETER TimeoutSec
   Wall-clock limit of the run: the app's own watchdog ends it then (writing a partial report); this script kills
   the process 15 s later if it is still running.
@@ -50,6 +57,7 @@ param(
     [string]$Exe,
     [switch]$NoBuild,
     [switch]$KeepState,
+    [switch]$HttpServer,
     [int]$TimeoutSec = 90
 )
 $ErrorActionPreference = 'Stop'
@@ -99,24 +107,81 @@ Get-ChildItem -LiteralPath $Out -File -ErrorAction SilentlyContinue |
 
 $stdout = Join-Path $Out 'stdout.txt'
 $stderr = Join-Path $Out 'stderr.txt'
-$environment = Get-QaEnvironment -Sandbox $Sandbox
+$httpPort = 0
+$serverProcess = $null
+$serverDir = Join-Path $Sandbox 'http'
+$stopFile = Join-Path $serverDir 'stop'
+$serverLog = Join-Path $serverDir 'requests.log'
+if ($HttpServer) {
+    $credRepo = Join-Path $Sandbox 'repos\cred'
+    $credRemote = Join-Path $Sandbox 'repos\cred-remote.git'
+    if (-not ((Test-Path -LiteralPath $credRepo) -and (Test-Path -LiteralPath $credRemote))) {
+        throw "the sandbox has no repos\cred / repos\cred-remote.git: recreate it with new-sandbox.ps1 -Force"
+    }
+    $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $probe.Start()
+    $httpPort = $probe.LocalEndpoint.Port
+    $probe.Stop()
+    if (Test-Path -LiteralPath $serverDir) { Remove-Item -LiteralPath $serverDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $serverDir | Out-Null
+    $httpEnvironment = Get-QaEnvironment -Sandbox $Sandbox -HttpPort $httpPort
+    Invoke-WithEnvironment -Variables $httpEnvironment -Script {
+        $url = "http://127.0.0.1:$httpPort/cred-remote.git"
+        & git -C $credRepo remote set-url origin $url
+        # Back to "one commit behind": the remote and the clone's tracking ref go to the parent of HEAD.
+        $parent = (& git -C $credRepo rev-parse 'HEAD~1').Trim()
+        & git -C $credRemote update-ref refs/heads/main $parent
+        & git -C $credRepo update-ref refs/remotes/origin/main $parent
+    }
+    $readyFile = Join-Path $serverDir 'ready'
+    $serverArgs = @(
+        '-NoProfile', '-File', (Join-Path $PSScriptRoot 'git-http-server.ps1'),
+        '-Root', (Join-Path $Sandbox 'repos'), '-Port', [string]$httpPort,
+        '-User', 'qa-user', '-Password', 'qa-secret', '-Log', $serverLog,
+        '-ReadyFile', $readyFile, '-StopFile', $stopFile, '-TimeoutSec', [string]($TimeoutSec + 30)
+    )
+    $serverProcess = Invoke-WithEnvironment -Variables $httpEnvironment -Script {
+        Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $serverArgs -PassThru -WindowStyle Hidden
+    }
+    $ready = $false
+    for ($i = 0; $i -lt 150 -and -not $ready; $i++) {
+        if (Test-Path -LiteralPath $readyFile) { $ready = $true } else { Start-Sleep -Milliseconds 100 }
+        if ($serverProcess.HasExited) { break }
+    }
+    if (-not $ready) {
+        if (-not $serverProcess.HasExited) { Stop-Process -Id $serverProcess.Id -Force }
+        throw "the Git test server did not start (see $serverLog)"
+    }
+    Write-Host "git http server: 127.0.0.1:$httpPort (user qa-user)"
+}
+$environment = Get-QaEnvironment -Sandbox $Sandbox -HttpPort $httpPort
 $environment['RUST_BACKTRACE'] = '1'
 $arguments = @('--qa-scenario', "`"$Scenario`"", '--qa-out', "`"$Out`"", '--qa-timeout', [string]$TimeoutSec)
 $killAfterSec = $TimeoutSec + 15
 
 Write-Host "scenario: $Scenario"
 Write-Host "out:      $Out"
-$exitCode = Invoke-WithEnvironment -Variables $environment -Script {
-    $process = Start-Process -FilePath $Exe -ArgumentList $arguments -PassThru -NoNewWindow `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WorkingDirectory $Sandbox
-    $null = $process.Handle   # keeps the handle so ExitCode is readable after WaitForExit
-    if (-not $process.WaitForExit($killAfterSec * 1000)) {
-        Write-Warning "no exit after $killAfterSec s: stopping process $($process.Id) (started by this script)"
-        Stop-Process -Id $process.Id -Force
-        $process.WaitForExit(5000) | Out-Null
-        124
+try {
+    $exitCode = Invoke-WithEnvironment -Variables $environment -Script {
+        $process = Start-Process -FilePath $Exe -ArgumentList $arguments -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WorkingDirectory $Sandbox
+        $null = $process.Handle   # keeps the handle so ExitCode is readable after WaitForExit
+        if (-not $process.WaitForExit($killAfterSec * 1000)) {
+            Write-Warning "no exit after $killAfterSec s: stopping process $($process.Id) (started by this script)"
+            Stop-Process -Id $process.Id -Force
+            $process.WaitForExit(5000) | Out-Null
+            124
+        }
+        else { $process.ExitCode }
     }
-    else { $process.ExitCode }
+}
+finally {
+    if ($serverProcess) {
+        # Only the server this script started is ever stopped: ask it to end, then stop it if it does not.
+        Set-Content -LiteralPath $stopFile -Value 'stop' -Encoding ascii
+        if (-not $serverProcess.WaitForExit(5000)) { Stop-Process -Id $serverProcess.Id -Force }
+        if (Test-Path -LiteralPath $serverLog) { Copy-Item -LiteralPath $serverLog -Destination (Join-Path $Out 'http-server.txt') -Force }
+    }
 }
 
 $reportPath = Join-Path $Out 'report.txt'

@@ -194,20 +194,23 @@ pub(super) fn register(cx: &mut App) {
             "action",
             "action <Name>",
             "Dispatches a registered action (Refresh, Pull, CreateBranch, OpenSettings, ...) to the focused element",
-            |window, cx, args| {
-                let name = args.text(0, "action name")?;
-                let full = if name.contains("::") {
-                    name
-                } else {
-                    format!("gitcthulhu::{name}")
-                };
-                let action = cx
-                    .build_action(&full, None)
-                    .map_err(|e| format!("unknown action '{full}': {e}"))?;
-                window.dispatch_action(action, cx);
-                Ok(full)
-            },
+            dispatch_action,
         ),
+    );
+    register_verb(
+        cx,
+        Verb::new(
+            "begin action",
+            "begin action <Name>",
+            "Like `action`, but does not wait for the app to settle: for an operation that waits for a prompt \
+             (use `wait dialog open` next)",
+            |window, cx, args| {
+                // Its prompts (credential dialogs) are the scenario's own doing, not an unexpected dialog.
+                monitor::expect_prompts(cx, true);
+                dispatch_action(window, cx, args)
+            },
+        )
+        .without_settle(),
     );
     register_verb(
         cx,
@@ -234,6 +237,21 @@ pub(super) fn register(cx: &mut App) {
             },
         ),
     );
+}
+
+/// `action` and `begin action`.
+fn dispatch_action(window: &mut Window, cx: &mut App, args: &Args) -> Result<String, String> {
+    let name = args.text(0, "action name")?;
+    let full = if name.contains("::") {
+        name
+    } else {
+        format!("gitcthulhu::{name}")
+    };
+    let action = cx
+        .build_action(&full, None)
+        .map_err(|e| format!("unknown action '{full}': {e}"))?;
+    window.dispatch_action(action, cx);
+    Ok(full)
 }
 
 /// `open repository`.

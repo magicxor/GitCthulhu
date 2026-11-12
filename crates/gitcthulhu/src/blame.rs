@@ -34,7 +34,6 @@ mod rows;
 mod selection;
 
 pub(crate) use header::view_header;
-pub(crate) use rows::token_color;
 
 #[cfg(test)]
 mod tests;

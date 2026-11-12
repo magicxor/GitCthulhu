@@ -197,6 +197,7 @@ fn public_functions_have_the_documented_signatures() {
     let _ = config::commit_graph_present as fn(&Repo) -> bool;
     let _ = config::write_commit_graph
         as fn(&Repo, &mut RepoExclusive, &OpContext) -> Result<OpOutcome<()>>;
+    let _ = config::write_commit_graph_if_large as fn(&Repo, usize, &OpContext) -> Result<bool>;
     let _ = remote::add_remote
         as fn(
             &Repo,

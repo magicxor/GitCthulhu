@@ -17,6 +17,7 @@ use gpui_kit::{
     div,
 };
 
+use super::tabs::{self, TabLines};
 use crate::app::AppState;
 use crate::backend::{CommitOptions, InProgress, ObjectId, RepoState, bg, status};
 use crate::dialogs::author::{IdentityChoice, open_commit_identity};
@@ -256,6 +257,8 @@ pub struct CommitBox {
     /// The AI controller streams into the field.
     api_read_only: bool,
     seen: Option<AdoptKey>,
+    /// The tab lines of the loaded message (the field shows them expanded, see `tabs`).
+    tabs: TabLines,
     save_task: Option<Task<()>>,
     fill_generation: u64,
     _subscriptions: Vec<Subscription>,
@@ -317,6 +320,7 @@ impl CommitBox {
             input,
             api_read_only: false,
             seen: None,
+            tabs: TabLines::default(),
             save_task: None,
             fill_generation: 0,
             _subscriptions: subscriptions,
@@ -330,8 +334,14 @@ impl CommitBox {
         &self.ctx
     }
 
-    /// The current message text.
+    /// The current message text (lines that still hold tabs as loaded get their tabs back).
     pub fn message(&self, cx: &App) -> String {
+        tabs::restore(&self.input.read(cx).value(), &self.tabs)
+    }
+
+    /// The text as the field shows it (tabs expanded).
+    #[cfg(test)]
+    pub(super) fn shown_text(&self, cx: &App) -> String {
         self.input.read(cx).value().to_string()
     }
 
@@ -376,8 +386,10 @@ impl CommitBox {
     }
 
     fn apply_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (shown, tab_lines) = tabs::expand(&text);
+        self.tabs = tab_lines;
         self.input
-            .update(cx, |input, cx| input.set_value(text, window, cx));
+            .update(cx, |input, cx| input.set_value(shown, window, cx));
         cx.notify();
     }
 
@@ -605,14 +617,13 @@ impl CommitBox {
             .as_ref()
             .is_some_and(|i| i.effective.is_none());
         let ctx = self.ctx.clone();
-        let run = move |mut opts: CommitOptions, window: &mut Window, cx: &mut App| {
-            apply_signoff(&signoff, &mut opts, &ctx, cx);
+        let run = move |opts: CommitOptions,
+                        chosen: Option<crate::backend::Identity>,
+                        window: &mut Window,
+                        cx: &mut App| {
+            let signoff = signoff.clone();
             ctx.with_tab(window, cx, move |tab, window, cx| {
-                if continue_after {
-                    tab.amend_then_continue(opts, window, cx);
-                } else {
-                    tab.commit(opts, window, cx);
-                }
+                tab.commit_signed(opts, signoff, chosen, continue_after, window, cx);
             });
         };
         if identity_missing && opts.identity_override.is_none() {
@@ -621,18 +632,19 @@ impl CommitBox {
                 cx,
                 self.ctx.clone(),
                 std::rc::Rc::new(move |choice, window, cx| {
+                    let chosen = choice.identity().clone();
                     let next = match choice {
                         IdentityChoice::Override(identity) => CommitOptions {
                             identity_override: Some(identity),
                             ..opts.clone()
                         },
-                        IdentityChoice::Saved => opts.clone(),
+                        IdentityChoice::Saved(_) => opts.clone(),
                     };
-                    run(next, window, cx);
+                    run(next, Some(chosen), window, cx);
                 }),
             );
         } else {
-            run(opts, window, cx);
+            run(opts, None, window, cx);
         }
     }
 
@@ -782,38 +794,6 @@ impl CommitBox {
             )
             .test_support()
             .into_any_element()
-    }
-}
-
-/// Applies the repository's sign-off setting `pref`: Git's own `--signoff` for the default text, otherwise the
-/// configured text (with `%user` and `%email` replaced by the override or the configured identity) as a trailer.
-fn apply_signoff(pref: &Signoff, opts: &mut CommitOptions, ctx: &TabCtx, cx: &App) {
-    if !pref.enabled {
-        return;
-    }
-    let text = pref.text.trim();
-    if text.is_empty() {
-        opts.signoff = true;
-        return;
-    }
-    let identity = opts.identity_override.clone().or_else(|| {
-        ctx.model
-            .read(cx)
-            .identity
-            .value
-            .as_ref()
-            .and_then(|i| i.effective.clone())
-    });
-    let (name, email) = identity.map(|i| (i.name, i.email)).unwrap_or_default();
-    let text = text.replace("%user", &name).replace("%email", &email);
-    match text.split_once(':') {
-        Some((key, value)) => opts
-            .trailers
-            .push((key.trim().to_owned(), value.trim().to_owned())),
-        None => {
-            opts.message.push_str("\n\n");
-            opts.message.push_str(&text);
-        }
     }
 }
 

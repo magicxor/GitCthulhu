@@ -181,7 +181,21 @@ struct UpstreamDialog {
     branch_sel: Option<usize>,
     /// The current tracking remote and branch (indices), restored when its remote is chosen again.
     tracking: (Option<usize>, Option<usize>),
+    /// The caller's completion callback; taken by Accept (`true`) or by the drop of the dialog (`false`: Cancel,
+    /// Escape, any other way of closing it).
+    on_done: Option<OnDone>,
     _subscriptions: [Subscription; 2],
+}
+
+/// Receives whether the dialog was accepted. Runs without a window: it only records the answer.
+pub type OnDone = Box<dyn FnOnce(bool)>;
+
+impl Drop for UpstreamDialog {
+    fn drop(&mut self) {
+        if let Some(done) = self.on_done.take() {
+            done(false);
+        }
+    }
 }
 
 impl UpstreamDialog {
@@ -205,6 +219,9 @@ impl UpstreamDialog {
             return;
         };
         window.close_dialog(cx);
+        if let Some(done) = self.on_done.take() {
+            done(true);
+        }
         let branch = self.branch.clone();
         self.tab.with_tab(window, cx, move |t, window, cx| {
             t.set_upstream(branch, Some(upstream), window, cx);
@@ -246,6 +263,18 @@ impl Render for UpstreamDialog {
 
 /// Opens the Change upstream dialog of `branch`.
 pub fn open_change_upstream(window: &mut Window, cx: &mut App, tab: TabCtx, branch: FullName) {
+    open_change_upstream_then(window, cx, tab, branch, Box::new(|_| {}));
+}
+
+/// Opens the Change upstream dialog of `branch`; `on_done` learns exactly once whether it was accepted (the
+/// upstream operation is then started) or closed without a choice (Cancel, Escape).
+pub fn open_change_upstream_then(
+    window: &mut Window,
+    cx: &mut App,
+    tab: TabCtx,
+    branch: FullName,
+    on_done: OnDone,
+) {
     let refs = tab.model.read(cx).refs.value.clone();
     let (remotes, remote_sel, branch_sel) = match refs.as_deref() {
         Some(refs) => {
@@ -310,6 +339,7 @@ pub fn open_change_upstream(window: &mut Window, cx: &mut App, tab: TabCtx, bran
             remote_sel,
             branch_sel,
             tracking: (remote_sel, branch_sel),
+            on_done: Some(on_done),
             _subscriptions: [on_remote, on_branch],
         }
     });

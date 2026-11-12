@@ -17,6 +17,9 @@
                          and a merge in progress with staged, unstaged, untracked and conflicted files
     repos\rich-remote.git the bare remote of "rich"
     repos\rebase         a rebase stopped by a conflict (step 1 of 3)
+    repos\cred           a clone that is one commit ahead of repos\cred-remote.git; run-gui.ps1 -HttpServer points
+                         its "origin" at the local credential-checking Git test server (tools\qa\git-http-server.ps1)
+    repos\cred-remote.git the bare repository that server serves
     out\                 default output of run-gui.ps1
 
   All names, e-mail addresses and file contents are synthetic. Commit dates are fixed, so the history and the
@@ -272,6 +275,18 @@ Invoke-WithEnvironment -Variables $environment -Script {
     Invoke-Git $rebase @('checkout', '-q', 'topic') | Out-Null
     Set-Actor 1 -AdvanceClock
     Invoke-Git $rebase @('rebase', 'main') -AllowFailure | Out-Null
+
+    # --- cred: pushes to it need credentials (run-gui.ps1 -HttpServer serves the bare repository over local HTTP) ---
+    $credRemote = Join-Path $repos 'cred-remote.git'
+    Invoke-Git $repos @('init', '-q', '--bare', '-b', 'main', $credRemote) | Out-Null
+    Invoke-Git $credRemote @('config', 'http.receivepack', 'true') | Out-Null
+    $cred = New-Repo 'cred'
+    Write-Text $cred 'README.md' @('# Cred', '', 'A repository whose remote asks for credentials.')
+    New-Commit $cred 'Initial commit' 0
+    Invoke-Git $cred @('remote', 'add', 'origin', $credRemote) | Out-Null
+    Invoke-Git $cred @('push', '-q', '-u', 'origin', 'main') | Out-Null
+    Write-Text $cred 'src/pending.txt' (Get-Source 'pending' 12)
+    New-Commit $cred 'Add work that waits to be pushed' 1
 }
 
 # The marker goes in last: a sandbox without it was not finished and the gate refuses it.
@@ -279,7 +294,7 @@ Invoke-WithEnvironment -Variables $environment -Script {
 [IO.File]::WriteAllText((Join-Path $Dest 'README.txt'), "QA sandbox of GitCthulhu (tools/qa). Synthetic data only. Recreate with new-sandbox.ps1 -Force.`n", [Text.UTF8Encoding]::new($false))
 
 Write-Host "Sandbox ready: $Dest"
-foreach ($name in 'linear', 'rich', 'rebase') {
+foreach ($name in 'linear', 'rich', 'rebase', 'cred') {
     $path = Join-Path $repos $name
     $state = (Invoke-WithEnvironment -Variables $environment -Script { Invoke-Git $path @('status', '--short', '--branch') | Select-Object -First 1 })
     Write-Host ("  repos\{0,-8} {1}" -f $name, $state)

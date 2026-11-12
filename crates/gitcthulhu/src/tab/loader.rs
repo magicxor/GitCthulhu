@@ -19,7 +19,7 @@ use super::read::ReadSlot;
 use super::{RepoModelEvent, RepoTab, RepoTabEvent};
 use crate::backend::handle::TabBackend;
 use crate::backend::log::LogPager;
-use crate::backend::{CancelToken, GitError, ObjectId, RefreshSet, loaders};
+use crate::backend::{CancelToken, GitError, ObjectId, OpContext, RefreshSet, git, loaders};
 use crate::notifications::ToastKind;
 
 /// The first log load reads at least this many commits.
@@ -45,6 +45,10 @@ pub struct Loader {
     log_dirty: bool,
     log_generation: u64,
     index_refresh: Option<Task<()>>,
+    /// The commit-graph check of this session has been started (it runs once per tab).
+    commit_graph_checked: bool,
+    commit_graph_task: Option<Task<()>>,
+    commit_graph_cancel: Option<CancelToken>,
     last_index_refresh: Option<crate::backend::FileStamp>,
     /// Watcher-driven requests waiting for the window to become active.
     pub(crate) deferred: RefreshSet,
@@ -61,6 +65,11 @@ impl Loader {
     /// A LOG request arrived while a LOG load was running.
     pub fn log_dirty(&self) -> bool {
         self.log_dirty
+    }
+
+    /// The once-per-session commit-graph check has run or is running.
+    pub fn commit_graph_checked(&self) -> bool {
+        self.commit_graph_checked
     }
 
     /// The generation of the newest log load.
@@ -85,6 +94,10 @@ impl Loader {
         if let Some(cancel) = self.log_cancel.take() {
             cancel.cancel();
         }
+        if let Some(cancel) = self.commit_graph_cancel.take() {
+            cancel.cancel();
+        }
+        self.commit_graph_task = None;
         self.log_task = None;
         self.log_dirty = false;
         self.index_refresh = None;
@@ -488,6 +501,7 @@ impl RepoTab {
                     m.set_log(Arc::new(snapshot), cx);
                 });
                 self.emit(RepoTabEvent::LogReloaded { generation }, cx);
+                self.start_commit_graph(exhausted, git::config::COMMIT_GRAPH_THRESHOLD, cx);
             }
             Err(err) => {
                 let text = err.to_string();
@@ -502,6 +516,45 @@ impl RepoTab {
         if std::mem::take(&mut self.loader.log_dirty) {
             self.start_log(cx);
         }
+    }
+
+    /// After the first LOG load that did not reach the end of the history: once per tab, writes the commit-graph
+    /// in the background when the repository has none and more than `threshold` reachable commits, so that the
+    /// next log, ahead/behind and file-history reads are fast. It takes no operation guard and shows nothing;
+    /// closing the tab cancels it.
+    pub(crate) fn start_commit_graph(
+        &mut self,
+        exhausted: bool,
+        threshold: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if exhausted || self.loader.commit_graph_checked {
+            return;
+        }
+        let Some(handle) = self.ctx.backend.handle().cloned() else {
+            return;
+        };
+        self.loader.commit_graph_checked = true;
+        let cancel = CancelToken::new();
+        self.loader.commit_graph_cancel = Some(cancel.clone());
+        let bg = cx.background_spawn(async move {
+            let ctx = OpContext::silent(cancel);
+            git::config::write_commit_graph_if_large(&handle.repo, threshold, &ctx)
+        });
+        self.loader.commit_graph_task = Some(cx.spawn(async move |this, cx| {
+            let result = bg.await;
+            this.update(cx, |tab, _| {
+                tab.loader.commit_graph_task = None;
+                tab.loader.commit_graph_cancel = None;
+            })
+            .ok();
+            match result {
+                Ok(true) => tracing::info!("wrote the commit-graph of a large repository"),
+                Ok(false) => {}
+                Err(err) if err.kind() == crate::backend::GitErrorKind::Cancelled => {}
+                Err(err) => tracing::warn!("cannot write the commit-graph: {err}"),
+            }
+        }));
     }
 
     fn load_failed(&mut self, what: RefreshSet, error: Option<String>, cx: &mut Context<Self>) {

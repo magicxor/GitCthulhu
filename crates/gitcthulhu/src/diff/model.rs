@@ -8,7 +8,7 @@ use gpui_kit::SharedString;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-use super::highlight::{Highlighter, LineTokens};
+use super::highlight::{Highlighted, Highlighter, LineTokens, Pass};
 use crate::backend::{
     ByteSlice as _, CancelToken, ChangeKind, DiffContent, DiffLine, DiffTarget, FileDiff,
     HunkHeader, LineKind, LineRef, LineSelection, PartialAvailability, SelectionRequest, TextDiff,
@@ -68,6 +68,48 @@ impl NumberCache {
 /// Intra-line change ranges of one display line (byte ranges into its display text).
 pub type InlineSpans = SmallVec<[Range<u32>; 2]>;
 
+/// The syntax tokens of a document, shared between its copies (mode switches) and replaceable in place: the first
+/// highlighting pass fills it while the document is built, the second pass swaps in the full result later without
+/// creating a new [`DiffDoc`] (which would clear the text selection).
+#[derive(Clone)]
+pub struct SyntaxCell {
+    state: Arc<Mutex<SyntaxState>>,
+}
+
+struct SyntaxState {
+    tokens: Arc<Vec<LineTokens>>,
+    complete: bool,
+}
+
+impl SyntaxCell {
+    /// A cell holding the result of a pass (`complete`: no further pass adds tokens).
+    pub fn new(tokens: Vec<LineTokens>, complete: bool) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SyntaxState {
+                tokens: Arc::new(tokens),
+                complete,
+            })),
+        }
+    }
+
+    /// The current tokens per `DiffLine` (a cheap handle; later passes do not change what it points to).
+    pub fn tokens(&self) -> Arc<Vec<LineTokens>> {
+        self.state.lock().tokens.clone()
+    }
+
+    /// No further pass would add tokens.
+    pub fn is_complete(&self) -> bool {
+        self.state.lock().complete
+    }
+
+    /// Replaces the tokens with the result of a later pass.
+    pub fn set(&self, highlighted: Highlighted) {
+        let mut state = self.state.lock();
+        state.tokens = Arc::new(highlighted.tokens);
+        state.complete = highlighted.complete;
+    }
+}
+
 /// A diff prepared for rendering.
 pub struct DiffDoc {
     pub diff: Arc<FileDiff>,
@@ -77,8 +119,8 @@ pub struct DiffDoc {
     pub gutter_digits: Arc<Vec<u8>>,
     /// Display text per `DiffLine`: tabs as 4 spaces, cut at 2,000 bytes around the change.
     pub texts: Arc<Vec<SharedString>>,
-    /// Syntax tokens per `DiffLine` (empty beyond the highlighter's limits).
-    pub syntax: Arc<Vec<LineTokens>>,
+    /// Syntax tokens per `DiffLine` (empty beyond the highlighter's limits); see [`SyntaxCell`].
+    pub syntax: SyntaxCell,
     /// Intra-line change ranges per `DiffLine`, mapped onto the display text (empty when the whole line changed).
     pub inline: Arc<Vec<InlineSpans>>,
     /// Header text per hunk (`@@ -a,b +c,d @@`, 09 §1.1 count rules).
@@ -88,6 +130,23 @@ pub struct DiffDoc {
 }
 
 impl DiffDoc {
+    /// Blocking (background). Runs the second highlighting pass when the first one stopped at its limit and stores the
+    /// result in the shared [`SyntaxCell`]; returns whether tokens were added. A cancelled run changes nothing.
+    pub fn highlight_full(&self, cancel: &CancelToken) -> bool {
+        if self.syntax.is_complete() {
+            return false;
+        }
+        let Some(text) = self.text() else {
+            return false;
+        };
+        let highlighted = highlight_pass(&self.diff, text, &self.texts, Pass::Full, cancel);
+        if cancel.is_cancelled() {
+            return false;
+        }
+        self.syntax.set(highlighted);
+        true
+    }
+
     /// The text diff, if the content is text.
     pub fn text(&self) -> Option<&Arc<TextDiff>> {
         match &self.diff.content {
@@ -308,7 +367,7 @@ pub fn build_doc(
                 texts.push(t);
                 inline.push(spans);
             }
-            let syntax = highlight_sides(&diff, text, &texts, cancel);
+            let syntax = highlight_pass(&diff, text, &texts, Pass::First, cancel);
             let headers = text
                 .hunks
                 .iter()
@@ -330,7 +389,16 @@ pub fn build_doc(
                 .collect();
             (texts, inline, syntax, headers, gutter)
         }
-        _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        _ => (
+            Vec::new(),
+            Vec::new(),
+            Highlighted {
+                tokens: Vec::new(),
+                complete: true,
+            },
+            Vec::new(),
+            Vec::new(),
+        ),
     };
     let rows = match &diff.content {
         DiffContent::Text(text) => build_rows(text, mode),
@@ -342,7 +410,7 @@ pub fn build_doc(
         rows: Arc::new(rows),
         gutter_digits: Arc::new(gutter_digits),
         texts: Arc::new(texts),
-        syntax: Arc::new(syntax),
+        syntax: SyntaxCell::new(syntax.tokens, syntax.complete),
         inline: Arc::new(inline),
         headers: Arc::new(headers),
         numbers: Arc::new(NumberCache::default()),
@@ -350,51 +418,25 @@ pub fn build_doc(
     }
 }
 
-/// Syntax tokens per `DiffLine`, highlighted per side (spec 21 §4.1): the old side (context + removed lines, old
-/// path) and the new side (context + added lines, new path), each in file order so the highlighter's state follows
-/// one file instead of interleaved removed and added lines. Context lines take the new side's tokens; a side
-/// without changed lines is not highlighted on its own. Entries missing from a cancelled run stay empty.
-fn highlight_sides(
+/// Syntax tokens per `DiffLine` for one highlighting pass (spec 21 §4.1): the lines go to
+/// [`Highlighter::highlight_diff`] in file order with their kinds, which keeps one state per side (old: context and
+/// removed lines, new: context and added lines; context lines take the new side's tokens). The syntax follows the
+/// new path. Entries beyond the pass's limits, and those of a cancelled run, stay empty.
+fn highlight_pass(
     diff: &FileDiff,
     text: &TextDiff,
     texts: &[SharedString],
+    pass: Pass,
     cancel: &CancelToken,
-) -> Vec<LineTokens> {
-    let mut out = vec![LineTokens::new(); text.lines.len()];
-    let has_removed = text.lines.iter().any(|l| l.kind == LineKind::Removed);
-    let has_added = text.lines.iter().any(|l| l.kind == LineKind::Added);
-    let new_path = diff.path.to_str_lossy();
-    let old_path = diff
-        .previous_path
-        .as_ref()
-        .map_or_else(|| new_path.clone(), |p| p.to_str_lossy());
-    let mut side = |changed: LineKind, path: &str, take_context: bool| {
-        let ix: Vec<usize> = text
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.kind == changed || l.kind == LineKind::Context)
-            .map(|(i, _)| i)
-            .collect();
-        let lines: Vec<&str> = ix
-            .iter()
-            .map(|&i| texts.get(i).map_or("", |t| t.as_ref()))
-            .collect();
-        let tokens = Highlighter::global().highlight(path, &lines, cancel);
-        for (i, t) in ix.into_iter().zip(tokens) {
-            if take_context || text.lines[i].kind == changed {
-                out[i] = t;
-            }
-        }
-    };
-    let new_side = has_added || !has_removed;
-    if new_side {
-        side(LineKind::Added, &new_path, true);
-    }
-    if has_removed && !cancel.is_cancelled() {
-        side(LineKind::Removed, &old_path, !new_side);
-    }
-    out
+) -> Highlighted {
+    let path = diff.path.to_str_lossy();
+    let lines: Vec<(&str, LineKind)> = text
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (texts.get(i).map_or("", |t| t.as_ref()), l.kind))
+        .collect();
+    Highlighter::global().highlight_diff(&path, &lines, pass, cancel)
 }
 
 /// The same document in another mode: only the rows are rebuilt; texts, tokens and number strings are shared.

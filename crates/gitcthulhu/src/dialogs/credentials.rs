@@ -11,15 +11,14 @@ use std::rc::Rc;
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
     Styled as _, Subscription, Task, Window, div,
 };
 
-use super::IconBasedDialog;
 use super::register::common::{self, FocusOnce};
+use super::{IconBasedDialog, LayerId, close_layer_or_top};
 use crate::backend::{CredentialRequest, CredentialResponse, PromptKind, Sensitive};
 use crate::icons::AppIcon;
 use crate::metrics::dialogs::{CREDENTIAL_W, HOST_KEY_W};
@@ -93,8 +92,8 @@ pub fn prompt_texts(request: &CredentialRequest) -> PromptTexts {
             icon: AppIcon::Lock,
             title: "Introduce your remote server credentials".into(),
             subtitle: with_operation(match username {
-                Some(user) => format!("Password for {user} at {url}"),
-                None => format!("Password for {url}"),
+                Some(user) => format!("Password for {user} at {}", without_userinfo(url)),
+                None => format!("Password for {}", without_userinfo(url)),
             }),
             hint: Some("Password"),
             masked: true,
@@ -175,6 +174,20 @@ pub fn prompt_texts(request: &CredentialRequest) -> PromptTexts {
     }
 }
 
+/// `url` without the `user@` part of its authority (Git's prompt repeats the user name in the URL).
+fn without_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://").map(|at| at + 3) else {
+        return url.to_owned();
+    };
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map_or(url.len(), |at| scheme_end + at);
+    match url[scheme_end..authority_end].rfind('@') {
+        Some(at) => format!("{}{}", &url[..scheme_end], &url[scheme_end + at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
 /// Asks for the credential `request` describes; the answer goes to `reply` (dropped = Cancel).
 pub fn open(
     window: &mut Window,
@@ -221,6 +234,7 @@ pub fn open(
             typed: false,
             shown: false,
             focus: FocusOnce::default(),
+            layer: None,
             _subscription: subscription,
             _poll: None,
         }
@@ -250,7 +264,8 @@ pub fn open(
     } else {
         HOST_KEY_W
     };
-    common::open_view(window, cx, width, 360., view);
+    let layer = common::open_view(window, cx, width, 360., view.clone());
+    view.update(cx, |this, _| this.layer = Some(layer));
 }
 
 /// The content of an open credential dialog.
@@ -264,6 +279,8 @@ pub struct CredentialDialog {
     /// A masked field currently shows its text.
     shown: bool,
     focus: FocusOnce,
+    /// The layer of this dialog: it closes by id, so that another dialog opened above it stays open.
+    layer: Option<LayerId>,
     _subscription: Option<Subscription>,
     _poll: Option<Task<()>>,
 }
@@ -276,7 +293,7 @@ impl CredentialDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.close_dialog(cx);
+        close_layer_or_top(window, cx, self.layer);
         if let Some(reply) = self.reply.borrow_mut().take() {
             let _ = reply.send(response);
         }

@@ -15,7 +15,7 @@ use gpui_kit::{
 
 use super::ids;
 use crate::metrics::{self, dp};
-use crate::shell::recent_repos::{OnOpen, RecentRepos};
+use crate::shell::recent_repos::{OnOpen, RecentOptions, RecentRepos};
 use crate::tab::TabCtx;
 use crate::theme::ActiveTokens as _;
 use crate::widgets::{ObservedExt as _, PrimaryButton};
@@ -62,7 +62,12 @@ impl OpenPopup {
             popup.update(cx, |popup, cx| popup.dismiss(cx)).ok();
             open_replacing(&tab, path, window, cx);
         });
-        let recent = cx.new(|cx| RecentRepos::new(on_open, window, cx));
+        // 07 §5.2: the recent repositories without the current one, and no remove buttons.
+        let options = RecentOptions {
+            exclude: ctx.backend.handle().and_then(|handle| handle.workdir()),
+            removable: false,
+        };
+        let recent = cx.new(|cx| RecentRepos::with_options(on_open, options, window, cx));
         Self {
             ctx,
             recent,
@@ -75,9 +80,14 @@ impl OpenPopup {
         &self.recent
     }
 
-    /// Moves the keyboard focus into the popup.
+    /// Moves the keyboard focus into the popup: into the search field when there are repositories to search
+    /// (07 §5.2), else onto the popup itself so that Escape still closes it.
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         window.focus(&self.focus, cx);
+        let recent = self.recent.clone();
+        if recent.read(cx).has_entries() {
+            recent.update(cx, |recent, cx| recent.focus_search(window, cx));
+        }
     }
 
     /// Asks the toolbar to remove the popup.

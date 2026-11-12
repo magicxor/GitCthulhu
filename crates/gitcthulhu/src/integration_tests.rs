@@ -702,6 +702,121 @@ fn branch_create_checkout_merge_conflict_resolve_commit(cx: &mut TestAppContext)
     );
 }
 
+// ───────────────────────────── dialogs against a real repository ─────────────────────────────
+
+/// Types `text` into the field with element id `id` of the open dialog, replacing what it holds.
+fn type_into(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str, text: &str) {
+    with_window(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+        window.render_frame(cx);
+        window.press("ctrl-a", cx);
+        window.input(text, cx);
+    });
+}
+
+#[gpui_kit::test]
+fn rename_branch_dialog_renames_the_branch(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    fx.write("a.txt", "base\n");
+    fx.commit_all("base");
+    fx.git(&["branch", "topic"]);
+    let (handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let ctx = ctx_of(&tab, cx);
+    with_window(cx, handle, |window, cx| {
+        crate::dialogs::branch::open_rename_branch(
+            window,
+            cx,
+            ctx.clone(),
+            crate::test_support::seed::full("refs/heads/topic"),
+        )
+    });
+    draw(cx, handle);
+    type_into(cx, handle, "single-field-input", "renamed");
+    with_window(cx, handle, |window, cx| window.press("enter", cx));
+    wait_until(cx, "the rename", |cx| {
+        local_branches(&tab, cx).iter().any(|(n, _)| n == "renamed")
+    });
+    let branches = fx.git(&["branch", "--format=%(refname:short)"]);
+    assert!(
+        branches.lines().any(|b| b == "renamed") && !branches.lines().any(|b| b == "topic"),
+        "git has the new name only: {branches}"
+    );
+    assert!(!dialog_open(cx, handle), "the dialog closed");
+}
+
+#[gpui_kit::test]
+fn reset_dialog_moves_head_with_the_chosen_mode(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one\n");
+    fx.commit_all("first");
+    let first = oid(&fx, "HEAD");
+    fx.write("a.txt", "two\n");
+    fx.commit_all("second");
+    let (handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let ctx = ctx_of(&tab, cx);
+    with_window(cx, handle, |window, cx| {
+        crate::dialogs::reset::open(window, cx, ctx.clone(), first)
+    });
+    draw(cx, handle);
+    assert!(present(
+        cx,
+        handle,
+        crate::dialogs::reset::ids::RESET_DIALOG
+    ));
+    click(cx, handle, "dialog-primary");
+    wait_until(cx, "the reset", |cx| {
+        !busy(&tab, cx) && !dialog_open(cx, handle)
+    });
+    assert_eq!(
+        fx.git(&["rev-parse", "HEAD"]).trim(),
+        first.to_string(),
+        "HEAD moved to the first commit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.path().join("a.txt")).expect("a.txt"),
+        "two\n",
+        "the default mode (mixed) keeps the working tree"
+    );
+    assert!(
+        fx.git(&["status", "--porcelain"]).contains("a.txt"),
+        "the change is unstaged now"
+    );
+}
+
+#[gpui_kit::test]
+fn new_remote_dialog_adds_the_remote(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    fx.write("a.txt", "base\n");
+    fx.commit_all("base");
+    let (handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let ctx = ctx_of(&tab, cx);
+    with_window(cx, handle, |window, cx| {
+        crate::dialogs::remote::open_new_remote(window, cx, ctx.clone())
+    });
+    draw(cx, handle);
+    type_into(
+        cx,
+        handle,
+        crate::dialogs::remote::ids::REMOTE_NAME,
+        "mirror",
+    );
+    type_into(
+        cx,
+        handle,
+        crate::dialogs::remote::ids::REMOTE_FETCH,
+        "https://example.invalid/mirror.git",
+    );
+    click(cx, handle, "dialog-primary");
+    wait_until(cx, "the new remote", |cx| {
+        !busy(&tab, cx) && !dialog_open(cx, handle)
+    });
+    assert_eq!(
+        fx.git(&["remote", "get-url", "mirror"]).trim(),
+        "https://example.invalid/mirror.git"
+    );
+}
+
 // ───────────────────────────── interactive rebase ─────────────────────────────
 
 /// Open the editor from HEAD~3, reword one step, squash one and drop one, complete: Git runs the plan through the
@@ -1185,10 +1300,7 @@ fn failed_snapshot_fails_closed_for_untracked_deletes(cx: &mut TestAppContext) {
     fx.commit_all("init");
     fx.write("keep.txt", "keep me\n");
     let (handle, app, tab) = mount_fixture_with(cx, &fx, DEFAULT_SIZE, true);
-    fx.write(
-        "a.txt", "two
-",
-    );
+    fx.write("a.txt", "two\n");
     crate::backend::oplog::FAIL_PREPARE.with(|f| f.set(true));
     run_on(cx, handle, &tab, |t, w, cx| {
         t.delete_untracked(vec!["keep.txt".into()], w, cx)
@@ -1204,11 +1316,8 @@ fn failed_snapshot_fails_closed_for_untracked_deletes(cx: &mut TestAppContext) {
         "the refusal is an error dialog"
     );
     assert!(
-        cx.update(|cx| app.read(cx).error_texts.join(
-            "
-"
-        ))
-        .contains("was not run"),
+        cx.update(|cx| app.read(cx).error_texts.join("\n"))
+            .contains("was not run"),
         "{:?}",
         cx.update(|cx| app.read(cx).error_texts.clone())
     );

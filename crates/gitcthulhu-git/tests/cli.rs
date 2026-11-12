@@ -284,6 +284,49 @@ fn env_has_language_and_no_git_dir() {
     );
 }
 
+/// The proxy password lives in the configured `http.proxy` URL. It must reach git (so the proxy works) without ever
+/// appearing in an argument list, which every local process can read.
+#[test]
+fn network_secrets_are_applied_without_appearing_on_any_command_line() {
+    const SECRET: &str = "s3cr3t-proxy-pass";
+    let env = TestEnv::new();
+    let fixture = repo_with_commit(&env);
+    let proxy = format!("http://alice:{SECRET}@proxy.invalid:3128");
+    let rt = env
+        .runtime_with(|config| config.network_config = vec![("http.proxy".into(), proxy.clone())])
+        .expect("runtime with network settings");
+    let repo = Repo::open(&rt, &fixture.path).expect("repo opens");
+
+    // `GIT_TRACE` records the argument list of every git process the command starts.
+    let trace = env.path("argv-trace.txt");
+    let mut cmd =
+        GitCommand::new(&repo, CommandKind::Network).args(["config", "--get", "http.proxy"]);
+    cmd.extra_env
+        .push(("GIT_TRACE".into(), trace.clone().into_os_string()));
+    let out = cli::run(&rt, cmd, &silent()).expect("git can be run");
+    assert_eq!(out.exit_code, Some(0), "config can be run: {}", out.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        proxy,
+        "git sees the configured proxy through the environment"
+    );
+
+    let traced = std::fs::read_to_string(&trace).expect("the trace file exists");
+    assert!(
+        traced.contains("config --get http.proxy"),
+        "the trace shows the command line:\n{traced}"
+    );
+    assert!(
+        !traced.contains(SECRET) && !traced.contains("proxy.invalid"),
+        "no argument list carries the proxy settings:\n{traced}"
+    );
+    assert!(
+        !out.record.args.contains(SECRET),
+        "the recorded command line has no secret: {}",
+        out.record.args
+    );
+}
+
 #[test]
 fn env_and_arguments_depend_on_command_kind() {
     let env = TestEnv::new();

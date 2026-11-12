@@ -15,10 +15,11 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, BoxShadow, Context, Entity, Global, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels, Render, RenderOnce,
-    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    TestSupportExt as _, WeakEntity, Window, anchored, deferred, div, point, px, transparent_black,
+    AnyElement, App, AppContext as _, BoxShadow, Context, ElementId, Entity, Global,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
+    Render, RenderOnce, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, TestSupportExt as _, WeakEntity, Window, anchored, deferred, div, point,
+    px, transparent_black,
 };
 
 use crate::icons::{AppIcon, icon};
@@ -305,28 +306,32 @@ pub fn open(window: &mut Window, cx: &mut App, page: Option<SettingsPage>) {
     }
     let view = cx.new(|cx| SettingsView::new(page.unwrap_or(SettingsPage::Appearance), window, cx));
     cx.set_global(OpenSettingsView(view.downgrade()));
-    window.open_dialog(cx, move |dialog, window, _| {
-        let (w, h) = frame_size(window);
-        let viewport_h = window.viewport_size().height.as_f32();
-        let view = view.clone();
-        let closing = view.downgrade();
-        dialog
-            .entrance(DialogEntrance::None)
-            .close_button(false)
-            .overlay_closable(false)
-            // Enter belongs to the fields; the kit's default OK must not close the dialog.
-            .on_ok(|_, _, _| false)
-            .p_0()
-            .border_0()
-            .bg(transparent_black())
-            .shadow_none()
-            .w(px(w))
-            .margin_top(px(((viewport_h - h) / 2.).max(KIT_EDGE_MARGIN)))
-            .on_close(move |_, _, cx| {
-                closing.update(cx, |view, cx| view.flush_pending(cx)).ok();
-            })
-            .content(move |content, _, _| content.child(view.clone()))
-    });
+    super::open_layer(
+        window,
+        cx,
+        Rc::new(move |dialog, window, _| {
+            let (w, h) = frame_size(window);
+            let viewport_h = window.viewport_size().height.as_f32();
+            let view = view.clone();
+            let closing = view.downgrade();
+            dialog
+                .entrance(DialogEntrance::None)
+                .close_button(false)
+                .overlay_closable(false)
+                // Enter belongs to the fields; the kit's default OK must not close the dialog.
+                .on_ok(|_, _, _| false)
+                .p_0()
+                .border_0()
+                .bg(transparent_black())
+                .shadow_none()
+                .w(px(w))
+                .margin_top(px(((viewport_h - h) / 2.).max(KIT_EDGE_MARGIN)))
+                .on_close(move |_, _, cx| {
+                    closing.update(cx, |view, cx| view.flush_pending(cx)).ok();
+                })
+                .content(move |content, _, _| content.child(view.clone()))
+        }),
+    );
 }
 
 /// The kit keeps this much of the window clear around a dialog (`spacing_tokens().lg`).
@@ -592,6 +597,9 @@ impl SettingsView {
         }
         if self.password_task.take().is_some() {
             let text = self.fields.proxy_password.read(cx).text(cx).to_string();
+            if text.is_empty() {
+                return;
+            }
             let store = runtime::secret_store(cx);
             cx.spawn(async move |cx| {
                 let result = cx
@@ -728,6 +736,11 @@ impl SettingsView {
     }
 
     fn password_changed(&mut self, cx: &mut Context<Self>) {
+        // An empty field never deletes the stored secret: only the Remove link does.
+        if self.fields.proxy_password.read(cx).text(cx).is_empty() {
+            self.password_task = None;
+            return;
+        }
         self.password_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(sm::PASSWORD_DEBOUNCE_MS))
@@ -740,7 +753,6 @@ impl SettingsView {
             }) else {
                 return;
             };
-            let stored = !text.is_empty();
             let result = cx
                 .background_executor()
                 .spawn(async move { (store.store)(&text) })
@@ -749,7 +761,7 @@ impl SettingsView {
                 this.password_task = None;
                 match result {
                     Ok(()) => {
-                        this.password = PasswordState::Stored(stored);
+                        this.password = PasswordState::Stored(true);
                         rebuild_now(cx);
                     }
                     Err(err) => {
@@ -768,6 +780,40 @@ impl SettingsView {
             })
             .ok();
         }));
+    }
+
+    /// Deletes the stored proxy password (the Remove link) and empties the field.
+    fn remove_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.password_task = None;
+        self.fields
+            .proxy_password
+            .update(cx, |f, cx| f.set_text("", window, cx));
+        let store = runtime::secret_store(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { (store.remove)() })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.password = PasswordState::Stored(false);
+                        rebuild_now(cx);
+                    }
+                    Err(err) => crate::app_view::show_toast(
+                        cx,
+                        None,
+                        crate::notifications::ToastKind::Error,
+                        format!("Cannot remove the proxy password: {err}"),
+                        None,
+                    ),
+                }
+                this.sync_fields(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn probe_password(&mut self, cx: &mut Context<Self>) {
@@ -1122,6 +1168,7 @@ pub(crate) struct SettingRow {
     title: SharedString,
     subtitle: Option<SharedString>,
     notes: Vec<(SharedString, bool)>,
+    actions: Vec<AnyElement>,
     control: Option<AnyElement>,
     disabled: bool,
     top_aligned: bool,
@@ -1135,6 +1182,7 @@ impl SettingRow {
             title: title.into(),
             subtitle: None,
             notes: Vec::new(),
+            actions: Vec::new(),
             control: None,
             disabled: false,
             top_aligned: false,
@@ -1150,6 +1198,12 @@ impl SettingRow {
     /// Adds a further line under the subtitle; `error` draws it in the error colour.
     pub(crate) fn note(mut self, text: impl Into<SharedString>, error: bool) -> Self {
         self.notes.push((text.into(), error));
+        self
+    }
+
+    /// Adds a clickable line (see [`text_link`]) under the notes.
+    pub(crate) fn action(mut self, link: impl IntoElement) -> Self {
+        self.actions.push(link.into_any_element());
         self
     }
 
@@ -1220,10 +1274,37 @@ impl RenderOnce for SettingRow {
                                 tokens.on_background_secondary
                             })
                             .child(text)
-                    })),
+                    }))
+                    .children(
+                        self.actions.into_iter().map(|link| {
+                            div().pt(dp(sm::SUBTITLE_GAP)).flex().flex_row().child(link)
+                        }),
+                    ),
             )
             .children(self.control.map(|control| div().flex_none().child(control)))
     }
+}
+
+/// A text link inside a settings row: `primary` text, `primary_variant` on hover.
+pub(crate) fn text_link(
+    id: impl Into<ElementId>,
+    text: &'static str,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let tokens = cx.tokens();
+    let hover = tokens.primary_variant;
+    div()
+        .id(id)
+        .flex_none()
+        .whitespace_nowrap()
+        .text_body2()
+        .text_color(tokens.primary)
+        .cursor_pointer()
+        .hover(move |s| s.text_color(hover))
+        .on_click(move |_, window, cx| on_click(window, cx))
+        .child(text)
+        .test_support()
 }
 
 #[cfg(test)]

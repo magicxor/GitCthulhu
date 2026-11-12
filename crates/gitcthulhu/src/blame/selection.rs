@@ -4,7 +4,8 @@
 //! its laid-out run and paints the selected part; the [`CodeColumn`] around the list registers the participant's
 //! geometry once per frame. Because the list is virtualised, the copy text is assembled from the painted
 //! projections plus the full text of the lines between the endpoints that are scrolled out (the endpoints carry a
-//! stable line key resolved from the pointer position).
+//! stable line key resolved from the pointer position). The byte offset of an endpoint is remembered while its line
+//! is painted, so an endpoint that scrolled out still cuts its line where the selection starts or ends.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -39,6 +40,17 @@ struct Inner {
     doc: RefCell<Option<BlameDoc>>,
     /// Row height of the last frame, in pixels (maps content points to line keys).
     row_h: Cell<Pixels>,
+    /// Where the selection's endpoints sit inside their lines, as last painted (see [`Endpoint`]).
+    endpoints: RefCell<BTreeMap<u64, Endpoint>>,
+}
+
+/// The part of an endpoint line that the selection covers, remembered while the line was painted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Endpoint {
+    /// The line holds one endpoint: its byte offset in the display text.
+    Offset(usize),
+    /// The line holds both endpoints: the selected byte range.
+    Range(Range<usize>),
 }
 
 impl SelectionBridge {
@@ -52,6 +64,7 @@ impl SelectionBridge {
             all: Cell::new(false),
             doc: RefCell::default(),
             row_h: Cell::new(px(0.)),
+            endpoints: RefCell::default(),
         }));
         let weak = Rc::downgrade(&bridge.0);
         bridge.0.handle.copy_with(
@@ -90,8 +103,42 @@ impl SelectionBridge {
     /// Whether any text is selected.
     pub(crate) fn has_selection(&self, cx: &App) -> bool {
         self.0.handle.has_local_selection(cx)
-            || self.0.handle.snapshot(cx).is_some() && !self.0.selected.borrow().is_empty()
+            || !self.0.selected.borrow().is_empty()
+            // The whole selection may have scrolled out of the list: its endpoints still differ.
+            || self.0.handle.snapshot(cx).is_some_and(|s| {
+                s.anchor().content_point() != s.cursor().content_point()
+            })
     }
+}
+
+/// The line keys of the selection's anchor and cursor.
+fn endpoint_lines(inner: &Inner, cx: &App) -> Option<(u64, u64)> {
+    let snapshot = inner.handle.snapshot(cx)?;
+    Some((
+        snapshot.anchor().content_key()?.value(),
+        snapshot.cursor().content_key()?.value(),
+    ))
+}
+
+/// Remembers where the painted `line` holds an endpoint of the selection (`range` is what is selected on it).
+fn remember_endpoint(inner: &Inner, line: u64, range: &Range<usize>, cx: &App) {
+    let Some((anchor, cursor)) = endpoint_lines(inner, cx) else {
+        return;
+    };
+    if line != anchor && line != cursor {
+        return;
+    }
+    let (first, last) = (anchor.min(cursor), anchor.max(cursor));
+    let endpoint = if first == last {
+        Endpoint::Range(range.clone())
+    } else if line == first {
+        // The selection runs from here to the end of the line.
+        Endpoint::Offset(range.start)
+    } else {
+        // The selection runs from the start of the line to here.
+        Endpoint::Offset(range.end)
+    };
+    inner.endpoints.borrow_mut().insert(line, endpoint);
 }
 
 fn line_key(inner: &Weak<Inner>, point: Point<Pixels>) -> Option<TextSelectionContentKey> {
@@ -138,14 +185,29 @@ fn copy_text(inner: &Inner, cx: &App) -> String {
             _ => return String::new(),
         },
     };
+    let endpoints = inner.endpoints.borrow();
     let last = doc.line_count().saturating_sub(1) as u64;
     let mut out = Vec::new();
     for line in lo..=hi.min(last) {
-        match selected.get(&line) {
-            Some(range) => out.push(slice_of(doc, line, range)),
-            // Scrolled out between the endpoints; a lone endpoint line that is not painted adds nothing.
-            None if lo < hi => out.push(doc.line_text(line as usize).to_owned()),
-            None => {}
+        if let Some(range) = selected.get(&line) {
+            out.push(slice_of(doc, line, range));
+            continue;
+        }
+        // Not painted: scrolled out. An endpoint line is cut at the offset remembered from when it was painted,
+        // every line between the endpoints is whole; a lone endpoint line without memory adds nothing.
+        let shown_len = doc.display(line as usize).len();
+        match (endpoints.get(&line), lo < hi) {
+            (Some(Endpoint::Range(range)), _) if lo == hi => {
+                out.push(slice_of(doc, line, range));
+            }
+            (Some(Endpoint::Offset(at)), true) if line == lo => {
+                out.push(slice_of(doc, line, &(*at.min(&shown_len)..shown_len)));
+            }
+            (Some(Endpoint::Offset(at)), true) if line == hi => {
+                out.push(slice_of(doc, line, &(0..*at.min(&shown_len))));
+            }
+            (_, true) => out.push(doc.line_text(line as usize).to_owned()),
+            _ => {}
         }
     }
     out.join("\n")
@@ -269,6 +331,9 @@ impl Element for CodeLine {
         };
         if let Some(range) = range.filter(|r| !r.is_empty()) {
             self.paint_selection(range.clone(), window);
+            if !inner.all.get() {
+                remember_endpoint(inner, self.line, &range, cx);
+            }
             inner.selected.borrow_mut().insert(self.line, range);
         }
         inner.runs.borrow_mut().push(run);
@@ -382,6 +447,9 @@ impl Element for CodeColumn {
         inner.runs.borrow_mut().clear();
         inner.selected.borrow_mut().clear();
         inner.all.set(inner.handle.has_local_selection(cx));
+        if inner.handle.snapshot(cx).is_none() {
+            inner.endpoints.borrow_mut().clear();
+        }
         self.child.paint(window, cx);
         let runs = std::mem::take(&mut *inner.runs.borrow_mut());
         inner.handle.update_runs(&runs, cx);

@@ -28,9 +28,13 @@ function Get-QaEnvironment {
     .SYNOPSIS
       The environment variables a process needs to run against the sandbox.
     #>
-    param([Parameter(Mandatory)][string]$Sandbox)
+    param(
+        [Parameter(Mandatory)][string]$Sandbox,
+        # The loopback port of the local Git test server (credential scenario): allows the http protocol for it.
+        [int]$HttpPort = 0
+    )
     $profileDir = Join-Path $Sandbox 'profile'
-    [ordered]@{
+    $environment = [ordered]@{
         GITCTHULHU_QA_SANDBOX = $Sandbox
         GITCTHULHU_HOME       = Join-Path $Sandbox 'app'
         USERPROFILE           = $profileDir
@@ -45,6 +49,18 @@ function Get-QaEnvironment {
         GIT_ALLOW_PROTOCOL    = 'file'
         GIT_TERMINAL_PROMPT   = '0'
     }
+    if ($HttpPort -gt 0) {
+        # Only the gate's pairing passes (qa/gate.rs): http for the loopback test server, nothing else, and no
+        # proxy in between.
+        $environment['GIT_ALLOW_PROTOCOL'] = 'file:http'
+        $environment['GITCTHULHU_QA_LOOPBACK_HTTP'] = "127.0.0.1:$HttpPort"
+        $environment['NO_PROXY'] = '127.0.0.1,localhost'
+        $environment['no_proxy'] = '127.0.0.1,localhost'
+        foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy') {
+            $environment[$name] = ''
+        }
+    }
+    $environment
 }
 
 function Invoke-WithEnvironment {

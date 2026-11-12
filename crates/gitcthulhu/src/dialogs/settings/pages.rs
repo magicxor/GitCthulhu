@@ -476,7 +476,7 @@ impl SettingsView {
                 Some(format!("The system keychain is not available: {reason}"))
             }
             super::PasswordState::Stored(true) => Some(
-                "A password is saved in the system keychain. Type a new one to replace it."
+                "A password is saved in the system keychain. Type a new one to replace it; an empty field keeps it."
                     .to_owned(),
             ),
             _ => None,
@@ -491,6 +491,18 @@ impl SettingsView {
             );
         if let Some(note) = password_note {
             password = password.note(note, false);
+        }
+        if matches!(self.password, super::PasswordState::Stored(true)) {
+            let this = cx.entity().downgrade();
+            password = password.action(super::text_link(
+                "settings-proxy-password-remove",
+                "Remove the saved password",
+                move |window, cx| {
+                    this.update(cx, |view, cx| view.remove_password(window, cx))
+                        .ok();
+                },
+                cx,
+            ));
         }
         vec![
             switch_row(

@@ -168,8 +168,10 @@ fn has_open_repository(cx: &App) -> bool {
 pub struct SecretStore {
     /// Whether a password is stored.
     pub exists: Arc<dyn Fn() -> Result<bool, Unavailable> + Send + Sync>,
-    /// Stores a password; empty removes it.
+    /// Stores a password; an empty one changes nothing.
     pub store: Arc<dyn Fn(&str) -> Result<(), Unavailable> + Send + Sync>,
+    /// Deletes the stored password (the explicit Remove link).
+    pub remove: Arc<dyn Fn() -> Result<(), Unavailable> + Send + Sync>,
 }
 
 impl SecretStore {
@@ -178,18 +180,27 @@ impl SecretStore {
         Self {
             exists: Arc::new(proxy_secret::exists),
             store: Arc::new(proxy_secret::store),
+            remove: Arc::new(proxy_secret::remove),
         }
     }
 
     /// A store that keeps the password in memory; the returned cell shows what was stored.
     pub fn in_memory() -> (Self, Arc<Mutex<Option<String>>>) {
         let cell: Arc<Mutex<Option<String>>> = Arc::default();
-        let (read, write) = (cell.clone(), cell.clone());
+        let (read, write, clear) = (cell.clone(), cell.clone(), cell.clone());
         let store = Self {
             exists: Arc::new(move || Ok(read.lock().map(|c| c.is_some()).unwrap_or_default())),
             store: Arc::new(move |password| {
-                if let Ok(mut cell) = write.lock() {
-                    *cell = (!password.is_empty()).then(|| password.to_owned());
+                if let Ok(mut cell) = write.lock()
+                    && !password.is_empty()
+                {
+                    *cell = Some(password.to_owned());
+                }
+                Ok(())
+            }),
+            remove: Arc::new(move || {
+                if let Ok(mut cell) = clear.lock() {
+                    *cell = None;
                 }
                 Ok(())
             }),

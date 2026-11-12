@@ -7,8 +7,8 @@ use std::rc::Rc;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, TestSupportExt as _, WeakEntity, Window, div,
-    relative,
+    MouseButton, ParentElement as _, Render, Styled as _, TestSupportExt as _, WeakEntity, Window,
+    div, relative,
 };
 
 use super::bottom_bar::BottomBarView;
@@ -216,6 +216,9 @@ impl Render for WelcomeView {
             .bg(tokens.surface)
             .key_context(WELCOME_CONTEXT)
             .track_focus(&self.focus)
+            // A press on an empty area must not take the focus from the search field (the page was focused
+            // by `focus_page` already when there is nothing to search).
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .child(
                 div()
                     .flex_1()

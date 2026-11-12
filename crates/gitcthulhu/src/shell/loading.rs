@@ -75,9 +75,11 @@ pub fn processing_overlay(
         )
         .child(
             div().pb(dp(dims::PROCESSING_SUBTITLE_PAD_BOTTOM)).child(
-                observed(ids::PROCESSING_SUBTITLE)
-                    .text_body1()
-                    .child(processing_subtitle(busy.kind)),
+                observed(ids::PROCESSING_SUBTITLE).text_body1().child(
+                    busy.detail
+                        .clone()
+                        .unwrap_or_else(|| processing_subtitle(busy.kind).into()),
+                ),
             ),
         )
         .child(

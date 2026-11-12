@@ -43,17 +43,9 @@ fn ops(tab: &Entity<RepoTab>, cx: &mut TestAppContext) -> Vec<OpKind> {
     })
 }
 
-/// The Stash operation belongs to G3: until it is implemented it answers with a "Not implemented yet" toast.
-fn stash_requested(
-    tab: &Entity<RepoTab>,
-    app: &Entity<crate::app_view::AppView>,
-    cx: &mut TestAppContext,
-) -> bool {
+/// The Stash button or Ctrl+S ran the Stash operation (a "Not implemented yet" toast no longer stands in for it).
+fn stash_requested(tab: &Entity<RepoTab>, cx: &mut TestAppContext) -> bool {
     ops(tab, cx).contains(&OpKind::Stash)
-        || cx
-            .update(|cx| toast_texts(app, cx))
-            .iter()
-            .any(|t| t.contains("Stash"))
 }
 
 fn with_changes() -> RepoSeed {
@@ -216,7 +208,7 @@ fn buttons_run_their_operation(cx: &mut TestAppContext) {
     assert!(ran.contains(&OpKind::Push), "Push: {ran:?}");
     assert!(ran.contains(&OpKind::PopStash), "Pop stash: {ran:?}");
     assert!(
-        stash_requested(&tab, &app, cx),
+        stash_requested(&tab, cx),
         "Stash: {ran:?} {:?}",
         cx.update(|cx| toast_texts(&app, cx))
     );
@@ -334,13 +326,13 @@ fn pull_menu_offers_the_opposite_of_the_default(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn shortcuts_dispatch_actions(cx: &mut TestAppContext) {
-    let (handle, app, tab) = mount_seeded(cx, with_changes(), DEFAULT_SIZE);
+    let (handle, _app, tab) = mount_seeded(cx, with_changes(), DEFAULT_SIZE);
     // A press inside the frame gives it the focus; the keys are bound in its `RepoView` context.
     frame(cx, handle, |window, cx| {
         window.click(crate::side_panel::ids::SIDE_PANEL, cx)
     });
     frame(cx, handle, |window, cx| window.press("ctrl-s", cx));
-    assert!(stash_requested(&tab, &app, cx), "Ctrl+S stashes");
+    assert!(stash_requested(&tab, cx), "Ctrl+S stashes");
     for (key, kind) in [
         ("ctrl-u", OpKind::Pull),
         ("ctrl-p", OpKind::Push),
@@ -507,6 +499,52 @@ fn recent_list_choice_replaces_the_current_tab(cx: &mut TestAppContext) {
         assert_eq!(view.tabs().len(), 1);
         let path = view.tabs()[0].path(cx).expect("path");
         assert_eq!(path.canonicalize().ok(), second.path().canonicalize().ok());
+    });
+}
+
+#[gpui_kit::test]
+fn popup_recent_list_leaves_out_the_current_repository_and_cannot_remove(cx: &mut TestAppContext) {
+    let first = Fixture::new();
+    first.write("a.txt", "one\n");
+    first.commit_all("first");
+    let second = Fixture::new();
+    second.write("b.txt", "two\n");
+    second.commit_all("second");
+    let (handle, _app, tab) = mount_fixture(cx, &first, DEFAULT_SIZE);
+    let ctx = ctx_of(&tab, cx);
+    let (first_dir, second_dir) = (PathBuf::from(first.path()), PathBuf::from(second.path()));
+    cx.update(|cx| {
+        crate::settings::state::update(cx, |s| {
+            s.push_recent(&second_dir);
+            s.push_recent(&first_dir);
+        })
+    });
+    frame(cx, handle, |window, cx| open_popup::open(&ctx, window, cx));
+    frame(cx, handle, |window, cx| {
+        let toolbar = toolbar_of(ctx.id, cx).expect("the tab has a toolbar");
+        let popup = toolbar.read(cx).popup.clone().expect("the popup is open");
+        let recent = popup.read(cx).recent().clone();
+        assert_eq!(
+            recent.read(cx).shown(),
+            std::slice::from_ref(&second_dir),
+            "the current repository is not offered (07 section 5.2)"
+        );
+        assert!(
+            recent.read(cx).search_focused(window, cx),
+            "the search field has the focus when the popup opens"
+        );
+        assert!(
+            window
+                .try_find((crate::shell::ids::RECENT_ROW, 0usize))
+                .is_some(),
+            "the row is drawn"
+        );
+        assert!(
+            window
+                .try_find((crate::shell::ids::RECENT_REMOVE, 0usize))
+                .is_none(),
+            "rows of the popup have no remove button"
+        );
     });
 }
 

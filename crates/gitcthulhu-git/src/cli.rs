@@ -27,7 +27,7 @@ use crate::{
 mod askpass;
 mod env;
 mod kill;
-mod porcelain;
+pub(crate) mod porcelain;
 mod progress;
 pub(crate) mod trace2;
 

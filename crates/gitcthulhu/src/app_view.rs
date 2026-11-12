@@ -313,6 +313,60 @@ impl AppView {
         self.start_open(ix, path, OpenKind::Open, None, window, cx);
     }
 
+    /// Opens `path` in the slot of the repository tab `id`, replacing that tab in place (07 §2.6: the toolbar's Open
+    /// popup; `open_repository` would add a tab). Asks first when the tab's terminal reports a working shell
+    /// (`terminal::confirm_close`), like closing the tab does. A no-op when the tab is gone.
+    pub fn replace_repository(
+        &mut self,
+        id: TabId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.tabs.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let confirm = self.tabs[ix]
+            .repo()
+            .and_then(|tab| crate::terminal::confirm_close(tab.read(cx).ctx(), cx));
+        match confirm {
+            Some(request) => {
+                let weak = cx.weak_entity();
+                crate::dialogs::confirm::open_with(
+                    window,
+                    cx,
+                    request,
+                    Box::new(move |yes, window, cx| {
+                        if yes {
+                            weak.update(cx, |view, cx| view.start_replace(id, path, window, cx))
+                                .ok();
+                        }
+                    }),
+                );
+            }
+            None => self.start_replace(id, path, window, cx),
+        }
+    }
+
+    fn start_replace(
+        &mut self,
+        id: TabId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.tabs.iter().position(|s| s.id == id) else {
+            return;
+        };
+        if let TabContent::Repo(tab) = &self.tabs[ix].content {
+            tab.update(cx, |tab, cx| tab.close(cx));
+        }
+        // The slot keeps its id: the old repository's toasts must not show over the new one.
+        self.toasts.update(cx, |t, cx| t.clear_tab(id, cx));
+        let path = crate::app::strip_git_dir(path);
+        self.start_open(ix, path, OpenKind::Open, None, window, cx);
+    }
+
     /// `git init` at `path` and opens it in a new selected tab.
     pub fn init_repository(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let ix = self.target_slot(true, window, cx);

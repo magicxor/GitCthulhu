@@ -1,0 +1,2 @@
+# Raw captures: keep the bytes (CR, padding, LF) exactly as Git wrote them.
+* -text

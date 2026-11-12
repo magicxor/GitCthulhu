@@ -1,0 +1,2 @@
+fatal: Unable to create '/tmp/gc/repo/.git/index.lock': File exists.
+Another git process seems to be running in this repository, or the lock file may be stale

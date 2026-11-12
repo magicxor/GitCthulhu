@@ -1,0 +1,2 @@
+error: src refspec nosuch does not match any
+error: failed to push some refs to '/tmp/gc\origin.git'

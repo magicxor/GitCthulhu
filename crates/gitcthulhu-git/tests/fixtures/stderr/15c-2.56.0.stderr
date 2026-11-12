@@ -1,0 +1,4 @@
+The previous cherry-pick is now empty, possibly due to conflict resolution.
+If you wish to commit it anyway, use:
+    git commit --allow-empty
+Otherwise, please use 'git cherry-pick --skip'

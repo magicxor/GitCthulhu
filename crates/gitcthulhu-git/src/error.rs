@@ -3,7 +3,13 @@
 
 use std::path::PathBuf;
 
-use crate::{GitVersion, InProgress, PushReport, RefreshSet, RelaPath, cli::GitOutput};
+use crate::{
+    GitVersion, InProgress, PushReport, RefreshSet, RelaPath,
+    cli::{
+        GitOutput,
+        trace2::{HookClass, hook_class},
+    },
+};
 
 /// One error type for every public function. It is not `Clone` (it can hold `io::Error`). It is
 /// `#[non_exhaustive]`; the GUI matches on [`GitError::kind()`].
@@ -655,26 +661,587 @@ pub struct PostState {
     pub pick_head: Option<gix::ObjectId>,
 }
 
+/// How much of stdout the classifier searches (Git prints `CONFLICT (…)`, `nothing to commit` on stdout).
+const CLASSIFY_STDOUT_TAIL: usize = 64 * 1024;
+/// How much of stdout `CommandFailed::stdout_tail` keeps.
+const COMMAND_FAILED_STDOUT_TAIL: usize = 4 * 1024;
+
 /// Pure: classify a failed command. Called by `cli::run_checked` only when `exit_code != 0` and the command did not
 /// succeed-with-post-hook-warning (§1.11). `post` is `PostState::default()` for commands without a repository (clone).
 ///
-/// Stub (WP-B0b implements the table of §1.9): every failure is a `CommandFailed` carrying the arguments, exit code,
-/// stderr and the last 4 KiB of stdout.
+/// The rules of §1.9 are tried in order and the first match wins. Matching is a case-insensitive substring search
+/// over `stderr + "\n" + <last 64 KiB of stdout>`; Git's messages are English because the executor sets
+/// `LANGUAGE=en` and `LC_MESSAGES=C`.
+///
+/// Rule 1 (cancelled) never reaches this function: `cli::run` returns `Err(Cancelled)` itself. Rules 11-13 (push
+/// rejections) are evaluated by `network.rs` from the porcelain output before it calls this function.
 pub fn classify(op: OpClass, out: &GitOutput, post: &PostState) -> GitError {
-    let _ = (op, post);
-    const TAIL: usize = 4 * 1024;
-    let start = out.stdout.len().saturating_sub(TAIL);
+    let text = format!(
+        "{}\n{}",
+        out.stderr,
+        lossy_tail(&out.stdout, CLASSIFY_STDOUT_TAIL)
+    );
+    let m = Matcher::new(&text);
+    let stderr = || out.stderr.clone();
+
+    // 2. A credential prompt was refused.
+    if let Some(prompt) = &out.prompt_refused {
+        return GitError::AuthCancelled {
+            prompt: prompt.clone(),
+        };
+    }
+    // 3. A pre hook failed (trace2).
+    if let Some(hook) = out
+        .hooks
+        .iter()
+        .find(|hook| hook.exit_code != Some(0) && hook_class(&hook.name) == HookClass::Pre)
+    {
+        return GitError::HookFailed {
+            hook: hook.name.clone(),
+            exit_code: hook.exit_code,
+            output: combined_output(out),
+        };
+    }
+    // 4. Git 2.36+, and the 2.34.2 backport (Ubuntu's 2.34.1): "unsafe repository ('<p>' is owned by someone else)".
+    if let Some(at) = m
+        .end_of("detected dubious ownership in repository at '")
+        .or_else(|| m.end_of("unsafe repository ('"))
+    {
+        return GitError::UnsafeRepository {
+            path: m.quoted_from(at).unwrap_or_default().into(),
+        };
+    }
+    // 5.
+    if let Some(at) = m.end_of("unable to create '")
+        && let Some(path) = m.quoted_from(at)
+        && m.lower[at + path.len()..].starts_with("': file exists")
+    {
+        return GitError::LockExists { path: path.into() };
+    }
+    // 6.
+    let changed = m.contains("remote host identification has changed");
+    if changed || m.contains("host key verification failed") {
+        return GitError::HostKeyVerificationFailed {
+            host: host_key_host(&m),
+            changed,
+            stderr: stderr(),
+        };
+    }
+    // 7.
+    if m.contains_any(&[
+        "authentication failed for",
+        "could not read username",
+        "could not read password",
+        "invalid username or password",
+        "http basic: access denied",
+        "permission denied (publickey",
+    ]) || m
+        .lines()
+        .any(|(_, lower)| lower.contains("remote: permission to") && lower.contains("denied"))
+    {
+        let url = [
+            "authentication failed for '",
+            "could not read username for '",
+            "could not read password for '",
+        ]
+        .iter()
+        .find_map(|pat| m.quoted_from(m.end_of(pat)?))
+        .map(str::to_owned);
+        return GitError::AuthFailed {
+            url,
+            stderr: stderr(),
+        };
+    }
+    // 8. and 9. `'<x>' does not appear to be a git repository`: a URL or path => 8, a bare remote name => 9.
+    let not_a_repo_target = m
+        .end_of("does not appear to be a git repository")
+        .and_then(|end| {
+            let (line, _) = m.line_at(end - 1);
+            let quoted = line.split('\'').nth(1)?;
+            Some(quoted.to_owned())
+        });
+    let looks_like_url = |s: &str| s.contains(['/', '\\', ':', '@']);
+    if let Some(url) = m.end_of("repository '").and_then(|at| {
+        let url = m.quoted_from(at)?;
+        m.lower[at + url.len()..]
+            .starts_with("' not found")
+            .then(|| url.to_owned())
+    }) {
+        return GitError::RemoteRepositoryNotFound {
+            url: Some(url),
+            stderr: stderr(),
+        };
+    }
+    if m.contains("repository not found")
+        || not_a_repo_target.as_deref().is_some_and(looks_like_url)
+    {
+        return GitError::RemoteRepositoryNotFound {
+            url: not_a_repo_target.filter(|t| looks_like_url(t)),
+            stderr: stderr(),
+        };
+    }
+    if let Some(at) = m.end_of("no such remote") {
+        let (line, offset) = m.line_at(at);
+        let rest = &line[at - offset..];
+        let name = rest
+            .split('\'')
+            .nth(1)
+            .unwrap_or_else(|| rest.trim_start_matches([':', ' ']).trim_end_matches('.'));
+        return GitError::NoSuchRemote {
+            name: name.to_owned(),
+        };
+    }
+    if let Some(name) = not_a_repo_target {
+        return GitError::NoSuchRemote { name };
+    }
+    // 10.
+    const NETWORK: &[&str] = &[
+        "could not resolve host",
+        "could not resolve hostname",
+        "connection timed out",
+        "connection refused",
+        "failed to connect to",
+        "network is unreachable",
+        "operation too slow",
+        "early eof",
+        "the remote end hung up unexpectedly",
+    ];
+    if let Some((line, _)) = m.lines().find(|(_, lower)| {
+        NETWORK.iter().any(|pat| lower.contains(pat))
+            || (lower.contains("unable to access")
+                && ["ssl", "schannel", "openssl", "certificate"]
+                    .iter()
+                    .any(|pat| lower.contains(pat)))
+    }) {
+        return GitError::Network {
+            reason: line.trim().to_owned(),
+            stderr: stderr(),
+        };
+    }
+    // 14.
+    if let Some(at) = m.end_of("couldn't find remote ref ") {
+        let (line, offset) = m.line_at(at);
+        return GitError::RefNotFound {
+            name: line[at - offset..].trim().to_owned(),
+            stderr: stderr(),
+        };
+    }
+    if let Some(at) = m.end_of("src refspec ")
+        && let Some(len) = m.lower[at..].find(" does not match any")
+    {
+        return GitError::RefNotFound {
+            name: m.text[at..at + len].to_owned(),
+            stderr: stderr(),
+        };
+    }
+    // 15.
+    if let Some(err) = branch_checked_out_elsewhere(&m) {
+        return err;
+    }
+    // 15a.
+    if m.contains("need to specify how to reconcile divergent branches") {
+        return GitError::PullStrategyRequired { stderr: stderr() };
+    }
+    // 15b.
+    if m.contains_any(&[
+        "there is no tracking information for the current branch",
+        "has no upstream branch",
+    ]) {
+        return GitError::NoUpstream {
+            branch: post.head_branch.clone(),
+            stderr: stderr(),
+        };
+    }
+    // 15c.
+    let picking = matches!(
+        post.in_progress,
+        Some(
+            InProgress::CherryPick
+                | InProgress::CherryPickSequence
+                | InProgress::Revert
+                | InProgress::RevertSequence
+        )
+    );
+    if matches!(op, OpClass::CherryPick | OpClass::Revert)
+        && (m.contains("the previous cherry-pick is now empty")
+            || (m.contains("nothing to commit") && picking))
+    {
+        return GitError::EmptyPick {
+            commit: post.pick_head,
+            stderr: stderr(),
+        };
+    }
+    // 16. and 17.
+    for (header, kind) in [
+        (
+            "your local changes to the following files would be overwritten by",
+            OverwriteKind::LocalChanges,
+        ),
+        (
+            "the following untracked working tree files would be overwritten by",
+            OverwriteKind::Untracked,
+        ),
+    ] {
+        if let Some(at) = m.end_of(header) {
+            return GitError::WouldOverwrite {
+                kind,
+                paths: m.indented_lines_after(at),
+                stderr: stderr(),
+            };
+        }
+    }
+    // 18.
+    if m.contains_any(&[
+        "you have unstaged changes",
+        "your index contains uncommitted changes",
+        "cannot rebase:",
+        "please commit or stash them",
+    ]) {
+        return GitError::UncommittedChanges { stderr: stderr() };
+    }
+    // 19.
+    if let Some(named) = operation_in_progress_message(&m)
+        && let Some(kind) = post.in_progress.or(named)
+    {
+        return GitError::OperationInProgress {
+            kind,
+            stderr: stderr(),
+        };
+    }
+    // 20. ("Merging/Cherry-picking/Committing is not possible because you have unmerged files" is how Git refuses
+    // to start anything while conflicts are unresolved.)
+    if !post.conflicted.is_empty()
+        && m.contains_any(&[
+            "conflict (",
+            "merge conflict in",
+            "could not apply",
+            "you need to resolve your current index first",
+            "is not possible because you have unmerged files",
+        ])
+    {
+        return GitError::Conflicts {
+            operation: post.in_progress,
+            paths: post.conflicted.clone(),
+            stderr: stderr(),
+        };
+    }
+    // 21.
+    if m.contains("refusing to merge unrelated histories") {
+        return GitError::UnrelatedHistories { stderr: stderr() };
+    }
+    // 22.
+    if m.contains("not possible to fast-forward") {
+        return GitError::NotFastForwardable { stderr: stderr() };
+    }
+    // 23.
+    if let Some(err) = already_exists(&m) {
+        return err;
+    }
+    // 24.
+    for (pat, what) in [
+        ("is not a valid branch name", "branch"),
+        ("is not a valid tag name", "tag"),
+        ("is not a valid remote name", "remote"),
+    ] {
+        if let Some(at) = m.end_of(pat) {
+            return GitError::InvalidName {
+                what,
+                name: m.first_quoted_on_line(at).unwrap_or_default().to_owned(),
+            };
+        }
+    }
+    // 25.
+    if let Some(at) = m.end_of("is not fully merged") {
+        return GitError::NotFullyMerged {
+            branch: m.first_quoted_on_line(at).unwrap_or_default().to_owned(),
+        };
+    }
+    // 26.
+    if m.contains_any(&[
+        "gpg failed to sign the data",
+        "cannot run gpg",
+        "error: couldn't load public key",
+        "signing failed",
+    ]) || (m.contains("ssh-keygen") && m.contains("failed"))
+    {
+        return GitError::SigningFailed { stderr: stderr() };
+    }
+    // 27.
+    if m.contains_any(&[
+        "author identity unknown",
+        "please tell me who you are",
+        "empty ident name",
+    ]) {
+        return GitError::IdentityUnknown { stderr: stderr() };
+    }
+    // 28.
+    if m.contains_any(&[
+        "nothing to commit",
+        "nothing added to commit",
+        "no changes added to commit",
+    ]) {
+        return GitError::NothingToCommit { stderr: stderr() };
+    }
+    // 29.
+    if m.contains("aborting commit due to empty commit message") {
+        return GitError::EmptyMessage;
+    }
+    // 30.
+    if let Some(at) = m.end_of("not a git repository") {
+        let (line, offset) = m.line_at(at);
+        let rest = &line[at - offset..];
+        let path = rest
+            .split('\'')
+            .nth(1)
+            .or_else(|| rest.rsplit_once(": ").map(|(_, path)| path.trim()))
+            .unwrap_or_default();
+        return GitError::NotARepository { path: path.into() };
+    }
+    // 31.
+    command_failed(out)
+}
+
+/// `CommandFailed` for `out`: arguments, exit code, stderr and the last 4 KiB of stdout.
+pub(crate) fn command_failed(out: &GitOutput) -> GitError {
     GitError::CommandFailed {
         args: out.record.args.clone(),
         exit_code: out.exit_code,
         stderr: out.stderr.clone(),
-        stdout_tail: String::from_utf8_lossy(&out.stdout[start..]).into_owned(),
+        stdout_tail: lossy_tail(&out.stdout, COMMAND_FAILED_STDOUT_TAIL).into_owned(),
     }
+}
+
+/// stderr plus (the last 64 KiB of) stdout: the output of hooks, which cannot be separated from Git's own.
+pub(crate) fn combined_output(out: &GitOutput) -> String {
+    let stdout = lossy_tail(&out.stdout, CLASSIFY_STDOUT_TAIL);
+    let mut combined = out.stderr.clone();
+    if !combined.is_empty() && !stdout.is_empty() && !combined.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str(&stdout);
+    combined
+}
+
+/// The last `max` bytes of `bytes` as lossy UTF-8.
+fn lossy_tail(bytes: &[u8], max: usize) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(max)..])
+}
+
+/// Case-insensitive search over a text that keeps byte offsets valid for the original (ASCII lowercasing never
+/// changes lengths).
+struct Matcher<'a> {
+    text: &'a str,
+    lower: String,
+}
+
+impl<'a> Matcher<'a> {
+    fn new(text: &'a str) -> Self {
+        Matcher {
+            text,
+            lower: text.to_ascii_lowercase(),
+        }
+    }
+
+    /// `pat` must be lowercase.
+    fn contains(&self, pat: &str) -> bool {
+        self.lower.contains(pat)
+    }
+
+    fn contains_any(&self, pats: &[&str]) -> bool {
+        pats.iter().any(|pat| self.contains(pat))
+    }
+
+    /// The offset right after the first occurrence of `pat` (lowercase).
+    fn end_of(&self, pat: &str) -> Option<usize> {
+        self.lower.find(pat).map(|start| start + pat.len())
+    }
+
+    /// The original text from `at` up to the next `'` on the same line.
+    fn quoted_from(&self, at: usize) -> Option<&'a str> {
+        let rest = &self.text[at..];
+        let end = rest.find(['\'', '\n'])?;
+        (rest.as_bytes()[end] == b'\'').then(|| &rest[..end])
+    }
+
+    /// The original line containing offset `at` and the offset of its start.
+    fn line_at(&self, at: usize) -> (&'a str, usize) {
+        let start = self.text[..at].rfind('\n').map_or(0, |idx| idx + 1);
+        let end = self.text[at..]
+            .find('\n')
+            .map_or(self.text.len(), |idx| at + idx);
+        (&self.text[start..end], start)
+    }
+
+    /// The first `'...'` on the line containing `at`.
+    fn first_quoted_on_line(&self, at: usize) -> Option<&'a str> {
+        let (line, _) = self.line_at(at);
+        line.split('\'').nth(1)
+    }
+
+    /// Every line as (original, lowercase).
+    fn lines(&self) -> impl Iterator<Item = (&'a str, &str)> {
+        self.text.split('\n').zip(self.lower.split('\n'))
+    }
+
+    /// The tab-indented lines right after the line containing `at` (Git's path lists), unquoted.
+    fn indented_lines_after(&self, at: usize) -> Vec<RelaPath> {
+        let Some(nl) = self.text[at..].find('\n') else {
+            return Vec::new();
+        };
+        self.text[at + nl + 1..]
+            .split('\n')
+            .map_while(|line| line.strip_prefix('\t'))
+            .map(|path| unquote_c_style(path.trim_end_matches('\r')))
+            .collect()
+    }
+}
+
+/// Undo Git's C-style quoting of a path (`"a\tb"`, octal escapes for bytes); unquoted paths are returned as-is.
+fn unquote_c_style(path: &str) -> RelaPath {
+    let Some(inner) = path
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return path.into();
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        idx += 1;
+        if b != b'\\' || idx == bytes.len() {
+            out.push(b);
+            continue;
+        }
+        let escaped = bytes[idx];
+        idx += 1;
+        match escaped {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b't' => out.push(b'\t'),
+            b'n' => out.push(b'\n'),
+            b'v' => out.push(0x0b),
+            b'f' => out.push(0x0c),
+            b'r' => out.push(b'\r'),
+            b'0'..=b'3'
+                if idx + 1 < bytes.len()
+                    && bytes[idx].is_ascii_digit()
+                    && bytes[idx + 1].is_ascii_digit() =>
+            {
+                let value =
+                    (escaped - b'0') * 64 + (bytes[idx] - b'0') * 8 + (bytes[idx + 1] - b'0');
+                out.push(value);
+                idx += 2;
+            }
+            other => out.push(other),
+        }
+    }
+    out.into()
+}
+
+/// The host named by OpenSSH's host key messages.
+fn host_key_host(m: &Matcher<'_>) -> Option<String> {
+    for (start, end) in [
+        ("host key for ", " has changed"),
+        ("host key is known for ", " and "),
+    ] {
+        if let Some(at) = m.end_of(start)
+            && let Some(len) = m.lower[at..].find(end)
+        {
+            return Some(m.text[at..at + len].to_owned());
+        }
+    }
+    None
+}
+
+/// Rule 15: the branch is checked out in (used by) another worktree.
+fn branch_checked_out_elsewhere(m: &Matcher<'_>) -> Option<GitError> {
+    const PATTERNS: &[&str] = &[
+        "is already checked out at '",
+        "is already used by worktree at '",
+        "used by worktree at '",
+        "checked out at '",
+    ];
+    let at = PATTERNS.iter().find_map(|pat| m.end_of(pat))?;
+    let worktree = m.quoted_from(at)?;
+    Some(GitError::BranchCheckedOutElsewhere {
+        branch: m.first_quoted_on_line(at).unwrap_or_default().to_owned(),
+        worktree: worktree.into(),
+    })
+}
+
+/// Rule 19: `Some(kind named by the message)` if the message says an operation is in progress; the inner `None`
+/// means the message did not name one Git operation.
+fn operation_in_progress_message(m: &Matcher<'_>) -> Option<Option<InProgress>> {
+    let named = |rest: &str| -> Option<InProgress> {
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix("an ")
+            .or_else(|| rest.strip_prefix("a "))
+            .unwrap_or(rest);
+        [
+            ("cherry-pick", InProgress::CherryPick),
+            ("revert", InProgress::Revert),
+            ("rebase", InProgress::Rebase),
+            ("merge", InProgress::Merge),
+            ("am ", InProgress::ApplyMailbox),
+            ("bisect", InProgress::Bisect),
+        ]
+        .into_iter()
+        .find_map(|(word, kind)| rest.starts_with(word).then_some(kind))
+    };
+    for pat in ["you have not concluded your ", "you are in the middle of "] {
+        if let Some(at) = m.end_of(pat) {
+            return Some(named(&m.lower[at..]));
+        }
+    }
+    for (pat, kind) in [
+        ("cherry-pick is already in progress", InProgress::CherryPick),
+        ("revert is already in progress", InProgress::Revert),
+        (
+            "it seems that there is already a rebase-merge directory",
+            InProgress::Rebase,
+        ),
+        ("rebase-apply directory", InProgress::Rebase),
+    ] {
+        if m.contains(pat) {
+            return Some(Some(kind));
+        }
+    }
+    None
+}
+
+/// Rule 23: a branch, tag, remote or clone target of that name exists.
+fn already_exists(m: &Matcher<'_>) -> Option<GitError> {
+    for (line, lower) in m.lines() {
+        if !lower.contains("already exists") {
+            continue;
+        }
+        let quoted = || line.split('\'').nth(1).map(str::to_owned);
+        let (what, name) = if lower.contains("a branch named '") {
+            ("branch", quoted()?)
+        } else if lower.contains("tag '") {
+            ("tag", quoted()?)
+        } else if lower.contains("already exists and is not an empty directory") {
+            ("directory", quoted()?)
+        } else if let Some(idx) = lower.find("remote ") {
+            let rest = &line[idx + "remote ".len()..];
+            let name = rest.split_whitespace().next()?;
+            ("remote", name.trim_matches('\'').to_owned())
+        } else {
+            continue;
+        };
+        return Some(GitError::AlreadyExists { what, name });
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
     use crate::{PushRefStatus, PushedRefUpdate};
 
     fn report(status: PushRefStatus) -> PushReport {
@@ -756,12 +1323,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stub_classifier_reports_command_failed_with_stdout_tail() {
-        let out = GitOutput {
+    fn output(stderr: &str, stdout: &str) -> GitOutput {
+        GitOutput {
             exit_code: Some(1),
-            stdout: vec![b'a'; 5000],
-            stderr: "fatal: x".into(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.into(),
             hooks: vec![],
             record: crate::CommandRecord {
                 args: "status".into(),
@@ -772,7 +1338,254 @@ mod tests {
             prompt_refused: None,
             removed_stale_locks: vec![],
             warnings: vec![],
+        }
+    }
+
+    fn hook(name: &str, exit_code: i32) -> crate::HookRun {
+        crate::HookRun {
+            name: name.into(),
+            exit_code: Some(exit_code),
+            duration_ms: 1,
+        }
+    }
+
+    fn generic(stderr: &str) -> GitError {
+        classify(OpClass::Generic, &output(stderr, ""), &PostState::default())
+    }
+
+    #[test]
+    fn pre_push_hook_failure_wins_over_push_failure_text() {
+        let mut out = output(
+            "lint failed\nerror: failed to push some refs to 'origin'\n",
+            "",
+        );
+        out.hooks = vec![hook("pre-push", 1)];
+        match classify(OpClass::Push, &out, &PostState::default()) {
+            GitError::HookFailed {
+                hook,
+                exit_code,
+                output,
+            } => {
+                assert_eq!(hook, "pre-push", "the failing hook is named");
+                assert_eq!(exit_code, Some(1), "with its exit code");
+                assert!(output.contains("lint failed"), "and the output: {output}");
+            }
+            other => panic!("rule 3 comes before any text rule: {other:?}"),
+        }
+
+        out.hooks = vec![hook("post-checkout", 1)];
+        assert_ne!(
+            classify(OpClass::Push, &out, &PostState::default()).kind(),
+            GitErrorKind::HookFailed,
+            "a failing post hook is not a HookFailed error"
+        );
+    }
+
+    #[test]
+    fn conflict_text_on_stdout_only_is_found() {
+        let post = PostState {
+            in_progress: Some(InProgress::Merge),
+            conflicted: vec!["f.txt".into()],
+            head_branch: Some("main".into()),
+            pick_head: None,
         };
+        let out = output(
+            "",
+            "Auto-merging f.txt\nCONFLICT (content): Merge conflict in f.txt\nAutomatic merge failed; fix conflicts and then commit the result.\n",
+        );
+        match classify(OpClass::Merge, &out, &post) {
+            GitError::Conflicts {
+                operation, paths, ..
+            } => {
+                assert_eq!(operation, Some(InProgress::Merge), "from the post state");
+                assert_eq!(paths, ["f.txt"], "conflicted paths from the index");
+            }
+            other => panic!("expected conflicts: {other:?}"),
+        }
+        assert_eq!(
+            classify(OpClass::Merge, &out, &PostState::default()).kind(),
+            GitErrorKind::CommandFailed,
+            "conflict texts without unmerged entries are not Conflicts"
+        );
+    }
+
+    #[test]
+    fn branch_delete_of_checked_out_branch_on_both_versions() {
+        for stderr in [
+            "error: Cannot delete branch 'main' checked out at '/tmp/repo'\n",
+            "error: cannot delete branch 'main' used by worktree at '/tmp/repo'\n",
+        ] {
+            match generic(stderr) {
+                GitError::BranchCheckedOutElsewhere { branch, worktree } => {
+                    assert_eq!(branch, "main", "branch from {stderr:?}");
+                    assert_eq!(worktree, Path::new("/tmp/repo"), "worktree from {stderr:?}");
+                }
+                other => panic!("{stderr:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn extracted_fields() {
+        match generic(
+            "fatal: Unable to create '/r/.git/index.lock': File exists.\n\nAnother git process seems to be running",
+        ) {
+            GitError::LockExists { path } => {
+                assert_eq!(
+                    path,
+                    Path::new("/r/.git/index.lock"),
+                    "the lock path keeps its case"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic(
+            "error: Your local changes to the following files would be overwritten by checkout:\n\ta.txt\n\t\"t\\303\\266\\tb.txt\"\nPlease commit your changes or stash them before you switch branches.\nAborting\n",
+        ) {
+            GitError::WouldOverwrite { kind, paths, .. } => {
+                assert_eq!(kind, OverwriteKind::LocalChanges, "local changes");
+                assert_eq!(
+                    paths,
+                    [RelaPath::from("a.txt"), RelaPath::from("tö\tb.txt")],
+                    "quoted paths are unquoted to their bytes"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n",
+        ) {
+            GitError::AuthFailed { url, .. } => {
+                assert_eq!(
+                    url.as_deref(),
+                    Some("https://github.com"),
+                    "url from the message"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic(
+            "fatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.\n",
+        ) {
+            GitError::NoSuchRemote { name } => {
+                assert_eq!(name, "origin", "a bare name is a remote")
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic("fatal: '/no/such/path' does not appear to be a git repository\n") {
+            GitError::RemoteRepositoryNotFound { url, .. } => {
+                assert_eq!(
+                    url.as_deref(),
+                    Some("/no/such/path"),
+                    "a path is a repository URL"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic(
+            "No ED25519 host key is known for github.com and you have requested strict checking.\nHost key verification failed.\n",
+        ) {
+            GitError::HostKeyVerificationFailed { host, changed, .. } => {
+                assert_eq!(host.as_deref(), Some("github.com"), "host from the message");
+                assert!(!changed, "an unknown key did not change");
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic("fatal: a branch named 'main' already exists\n") {
+            GitError::AlreadyExists { what, name } => {
+                assert_eq!((what, name.as_str()), ("branch", "main"), "branch and name")
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic("error: remote origin already exists.\n") {
+            GitError::AlreadyExists { what, name } => {
+                assert_eq!(
+                    (what, name.as_str()),
+                    ("remote", "origin"),
+                    "remote and name"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic(
+            "error: src refspec nosuch does not match any\nerror: failed to push some refs to 'x'\n",
+        ) {
+            GitError::RefNotFound { name, .. } => assert_eq!(name, "nosuch", "refspec name"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn operation_in_progress_kind_falls_back_to_message() {
+        match generic("fatal: You have not concluded your cherry-pick (CHERRY_PICK_HEAD exists).\n")
+        {
+            GitError::OperationInProgress { kind, .. } => {
+                assert_eq!(kind, InProgress::CherryPick, "named by the message")
+            }
+            other => panic!("{other:?}"),
+        }
+        match generic(
+            "error: cherry-pick is already in progress
+hint: try \"git cherry-pick (--continue | --abort | --quit)\"
+fatal: cherry-pick failed
+",
+        ) {
+            GitError::OperationInProgress { kind, .. } => {
+                assert_eq!(
+                    kind,
+                    InProgress::CherryPick,
+                    "a running cherry-pick sequence"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        let post = PostState {
+            in_progress: Some(InProgress::RebaseInteractive),
+            ..PostState::default()
+        };
+        match classify(
+            OpClass::Merge,
+            &output("You are in the middle of a rebase -- cannot amend.\n", ""),
+            &post,
+        ) {
+            GitError::OperationInProgress { kind, .. } => assert_eq!(
+                kind,
+                InProgress::RebaseInteractive,
+                "the post state is more precise than the message"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn refused_prompt_is_auth_cancelled() {
+        let mut out = output("fatal: Authentication failed for 'https://x'\n", "");
+        out.prompt_refused = Some("Password for 'https://x': ".into());
+        assert_eq!(
+            classify(OpClass::Fetch, &out, &PostState::default()).kind(),
+            GitErrorKind::AuthCancelled,
+            "rule 2 comes before rule 7"
+        );
+    }
+
+    #[test]
+    fn unquote_handles_escapes() {
+        assert_eq!(unquote_c_style("plain"), "plain", "unquoted stays");
+        assert_eq!(
+            unquote_c_style(r#""a\"b\\c\n""#),
+            "a\"b\\c\n",
+            "quote, backslash and newline escapes"
+        );
+        assert_eq!(
+            unquote_c_style(r#""\377""#),
+            RelaPath::from(vec![0xff]),
+            "octal escapes are raw bytes"
+        );
+    }
+
+    #[test]
+    fn unmatched_failure_reports_command_failed_with_stdout_tail() {
+        let out = output("fatal: x", &"a".repeat(5000));
         match classify(OpClass::Generic, &out, &PostState::default()) {
             GitError::CommandFailed {
                 args,

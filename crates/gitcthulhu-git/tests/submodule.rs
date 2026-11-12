@@ -139,7 +139,6 @@ fn add_validates_input() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_and_list() {
     let env = TestEnv::new();
     let lib = env.repo("lib");
@@ -192,7 +191,6 @@ fn add_and_list() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn init_update_checks_out() {
     let env = TestEnv::new();
     let (_lib, sup, lib_head) = superproject(&env);
@@ -225,7 +223,6 @@ fn init_update_checks_out() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn sync_updates_url() {
     let env = TestEnv::new();
     let (_lib, sup, _) = superproject(&env);
@@ -254,7 +251,6 @@ fn sync_updates_url() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn deinit_then_list_uninitialized() {
     let env = TestEnv::new();
     let (_lib, sup, _) = superproject(&env);
@@ -278,7 +274,6 @@ fn deinit_then_list_uninitialized() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn remove_cleans_modules_dir() {
     let env = TestEnv::new();
     let (_lib, sup, _) = superproject(&env);

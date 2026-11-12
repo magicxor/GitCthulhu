@@ -346,7 +346,6 @@ fn commit_graph_present_detects_file() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn write_commit_graph_creates_file() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = TestEnv::new();
@@ -368,7 +367,6 @@ fn write_commit_graph_creates_file() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_safe_directory_writes_global_config() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = TestEnv::new();

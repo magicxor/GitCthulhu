@@ -204,31 +204,26 @@ impl GitRuntime {
     }
 
     /// The path of the askpass helper, existing or not.
-    #[allow(dead_code)] // Used by the executor (WP-B0b).
     pub(crate) fn askpass_exe(&self) -> &Path {
         &self.askpass_path
     }
 
     /// The path of the editor helper, existing or not.
-    #[allow(dead_code)] // Used by the executor (WP-B0b).
     pub(crate) fn editor_exe(&self) -> &Path {
         &self.editor_path
     }
 
     /// The configuration this runtime was created with.
-    #[allow(dead_code)] // Used by the executor (WP-B0b).
     pub(crate) fn config(&self) -> &RuntimeConfig {
         &self.config
     }
 
     /// The process environment (plus the login shell's `PATH` on macOS/Linux) captured at startup.
-    #[allow(dead_code)] // Used by the executor (WP-B0b).
     pub(crate) fn base_env(&self) -> &[(OsString, OsString)] {
         &self.base_env
     }
 
     /// The private tokio runtime that drives child processes and askpass servers.
-    #[allow(dead_code)] // Used by the executor (WP-B0b).
     pub(crate) fn tokio(&self) -> &tokio::runtime::Runtime {
         self.tokio
             .as_ref()

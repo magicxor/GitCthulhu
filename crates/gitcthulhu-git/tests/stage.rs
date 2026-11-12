@@ -4,8 +4,7 @@
 //! bytes with a hand-written expectation. The base ids of each request come from Git itself (`git ls-files -s`,
 //! `git ls-tree`, `git hash-object`), so they double as an oracle for the ids the diff would report.
 //!
-//! Tests of the whole-file functions spawn `git` through `cli::run_checked`, which WP-B0b implements; until it is
-//! merged they are ignored with the reason "needs WP-B0b".
+//! Tests of the whole-file functions spawn `git` through `cli::run_checked`.
 
 mod support;
 
@@ -931,7 +930,6 @@ fn cancelled_context_does_nothing() {
 // ───────────────────────────── paths (whole-file functions) ─────────────────────────────
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn stage_paths_glob_chars_literal() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -952,7 +950,6 @@ fn stage_paths_glob_chars_literal() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn discard_paths_glob_chars_literal() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -987,7 +984,6 @@ fn discard_paths_glob_chars_literal() {
 
 #[test]
 #[cfg(unix)]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn colon_prefixed_name_literal() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1006,7 +1002,6 @@ fn colon_prefixed_name_literal() {
 
 #[test]
 #[cfg(unix)]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn star_in_name_literal() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1039,7 +1034,6 @@ fn unmerged(t: &TestRepo) -> String {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn discard_conflicted_path_unstaged_mode() {
     let env = TestEnv::new();
     let t = conflicted_repo(&env);
@@ -1069,7 +1063,6 @@ fn discard_conflicted_path_unstaged_mode() {
 // ───────────────────────────── other whole-file behaviour ─────────────────────────────
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn stage_all_and_unstage_all() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1099,7 +1092,6 @@ fn stage_all_and_unstage_all() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn unstage_paths_born_and_unborn() {
     let env = TestEnv::new();
     let unborn = env.repo("unborn");
@@ -1147,7 +1139,6 @@ fn unstage_paths_born_and_unborn() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn unstage_all_keeps_the_merge_in_progress() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1199,7 +1190,6 @@ fn unstage_all_refuses_conflicts() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn discard_paths_staged_and_unstaged_removes_added_file() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1228,7 +1218,6 @@ fn discard_paths_staged_and_unstaged_removes_added_file() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn discard_paths_unborn_staged_and_unstaged() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1254,7 +1243,6 @@ fn discard_paths_unborn_staged_and_unstaged() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn resolve_conflict_ours_theirs_mark_and_delete() {
     for (how, expected) in [
         (Resolution::Ours, Some(&b"ours\n"[..])),
@@ -1312,7 +1300,6 @@ fn resolve_conflict_ours_theirs_mark_and_delete() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn resolve_conflict_ours_keeps_an_already_resolved_path() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1364,7 +1351,6 @@ fn resolve_conflict_ours_keeps_an_already_resolved_path() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn resolve_conflict_ours_on_deleted_by_us_removes() {
     let env = TestEnv::new();
     let t = env.repo("r");
@@ -1393,7 +1379,6 @@ fn resolve_conflict_ours_on_deleted_by_us_removes() {
 
 #[test]
 #[cfg(unix)]
-#[ignore = "needs WP-B0b (cli::run_checked)"]
 fn whole_content_with_exec_bit_change_stages_whole_file() {
     let env = TestEnv::new();
     let t = modified(&env, b"a\n", b"a\nb\n");

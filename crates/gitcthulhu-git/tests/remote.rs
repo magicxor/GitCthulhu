@@ -26,7 +26,6 @@ fn remote_ref(name: &str, url: &str) -> Option<RemoteRef> {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_with_distinct_push_url() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -123,7 +122,6 @@ fn blank_url_rejected() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn set_urls_and_clear_push_url() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -205,7 +203,6 @@ fn pushed_fixture(env: &TestEnv) -> TestRepo {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn rename_moves_refs_and_upstreams() {
     let env = TestEnv::new();
     let fixture = pushed_fixture(&env);
@@ -240,7 +237,6 @@ fn rename_moves_refs_and_upstreams() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn remove_cleans_refs_and_upstreams() {
     let env = TestEnv::new();
     let fixture = pushed_fixture(&env);

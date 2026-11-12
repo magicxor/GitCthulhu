@@ -717,6 +717,9 @@ fn touch_all(repo: &TestRepo, count: usize) {
         let content = repo.read(&rela);
         repo.write(&rela, content);
     }
+    // An entry whose mtime falls into the same second as the index write stays "racily clean" for gix (it compares
+    // whole seconds), so a refresh would not make it clean. Let the touch fall into an earlier second.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
 }
 
 fn touched_repo(env: &TestEnv, count: usize) -> TestRepo {
@@ -750,7 +753,6 @@ fn status_never_writes_index() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run)"]
 fn touched_files_report_needs_refresh_then_refresh_clears_it() {
     let env = TestEnv::new();
     let fixture = touched_repo(&env, 20);
@@ -777,7 +779,6 @@ fn touched_files_report_needs_refresh_then_refresh_clears_it() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run)"]
 fn refresh_index_keeps_concurrent_staging() {
     let env = TestEnv::new();
     let fixture = touched_repo(&env, 200);
@@ -798,7 +799,6 @@ fn refresh_index_keeps_concurrent_staging() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (cli::run)"]
 fn refresh_index_with_conflicts_succeeds() {
     let env = TestEnv::new();
     let fixture = conflict_repo(

@@ -588,7 +588,6 @@ fn ssh_signing_with_unencrypted_key() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b/B0c (askpass session answering ssh-keygen's passphrase prompt)"]
 fn ssh_signing_passphrase_prompts_via_askpass() {
     if !ssh_keygen_available() {
         eprintln!("skipped: ssh-keygen is not installed");

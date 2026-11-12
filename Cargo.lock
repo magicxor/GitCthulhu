@@ -3084,7 +3084,7 @@ dependencies = [
  "serde_json",
  "snapbox",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -3107,7 +3107,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
 ]
 

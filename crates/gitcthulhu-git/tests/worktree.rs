@@ -109,7 +109,6 @@ fn list_main_and_linked() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_existing_branch() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -142,7 +141,6 @@ fn add_existing_branch() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_new_branch_from_commit() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -213,7 +211,6 @@ fn add_new_branch_from_commit() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_detached() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -239,7 +236,6 @@ fn add_detached() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_head_branch_of_bare_main_repository() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -269,7 +265,6 @@ fn add_head_branch_of_bare_main_repository() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_refuses_existing_path_before_branch_creation() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -307,7 +302,6 @@ fn add_refuses_existing_path_before_branch_creation() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_into_existing_empty_dir() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -329,7 +323,6 @@ fn add_into_existing_empty_dir() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn add_branch_checked_out_elsewhere() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -378,7 +371,6 @@ fn add_branch_checked_out_elsewhere() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn remove_dirty_requires_force() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -402,7 +394,6 @@ fn remove_dirty_requires_force() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn remove_locked_needs_double_force() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -464,7 +455,6 @@ fn remove_main_or_current_is_unsupported() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn remove_returns_worktree_id() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -492,7 +482,6 @@ fn remove_returns_worktree_id() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn prune_gone_worktree_returns_id() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
@@ -517,7 +506,6 @@ fn prune_gone_worktree_returns_id() {
 }
 
 #[test]
-#[ignore = "needs WP-B0b (executor)"]
 fn lock_unlock_with_reason() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");

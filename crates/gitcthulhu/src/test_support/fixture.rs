@@ -127,6 +127,23 @@ impl Fixture {
 
     /// A Git runtime isolated like the fixture's own git calls.
     pub fn runtime(&self) -> Arc<GitRuntime> {
+        self.runtime_with(RuntimeConfig::default())
+    }
+
+    /// [`Fixture::runtime`] with this package's helper programs (`gitcthulhu-askpass`, `gitcthulhu-editor`), or
+    /// `None` when this test run did not build them (`cargo test --lib` builds no binaries; a full
+    /// `cargo test -p gitcthulhu` does, for the `tests/helpers.rs` integration test).
+    pub fn runtime_with_helpers(&self) -> Option<Arc<GitRuntime>> {
+        let askpass = helper_exe("gitcthulhu-askpass")?;
+        let editor = helper_exe("gitcthulhu-editor")?;
+        Some(self.runtime_with(RuntimeConfig {
+            askpass_exe: Some(askpass),
+            editor_exe: Some(editor),
+            ..RuntimeConfig::default()
+        }))
+    }
+
+    fn runtime_with(&self, config: RuntimeConfig) -> Arc<GitRuntime> {
         GitRuntime::new(RuntimeConfig {
             login_shell_env: false,
             test_isolation: Some(TestIsolation {
@@ -138,8 +155,17 @@ impl Fixture {
                     .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                     .collect(),
             }),
-            ..RuntimeConfig::default()
+            ..config
         })
         .expect("git is installed and recent enough for the tests")
     }
+}
+
+/// A binary of this package in the target directory of the running test (`target/<profile>/<name>[.exe]`; the
+/// test binary itself lives in `target/<profile>/deps`).
+pub fn helper_exe(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let path = profile_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    path.is_file().then_some(path)
 }

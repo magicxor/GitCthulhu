@@ -21,6 +21,8 @@ pub struct Monitor {
     dialogs: Vec<String>,
     /// When the scenario last opened a dialog itself (such a dialog is not unexpected).
     scenario_dialog: Option<Instant>,
+    /// The scenario opened an error dialog itself (`open dialog error`).
+    scenario_error: bool,
 }
 
 impl Global for Monitor {}
@@ -59,6 +61,13 @@ pub fn scenario_dialog(cx: &mut App, open: bool) {
     cx.default_global::<Monitor>().scenario_dialog = open.then(Instant::now);
 }
 
+/// Tells the monitor that the scenario queued an error dialog itself (`open dialog error`).
+pub fn scenario_error(cx: &mut App) {
+    let monitor = cx.default_global::<Monitor>();
+    monitor.scenario_dialog = Some(Instant::now());
+    monitor.scenario_error = true;
+}
+
 /// A dialog takes a frame or two to appear: the scenario's flag is kept at least this long.
 const DIALOG_GRACE: Duration = Duration::from_millis(1500);
 
@@ -67,17 +76,20 @@ pub fn sample(window: &mut Window, cx: &mut App) {
     let mut fresh: Vec<(u64, ToastKind, String)> = Vec::new();
     if let Some(host) = cx.try_global::<ToastHostGlobal>() {
         let seen = cx.try_global::<Monitor>().map(|m| &m.seen);
-        // `visible()` follows the active tab; toasts of other tabs are not rendered either.
-        for toast in host.0.read(cx).visible() {
+        // Every tab's toasts: an operation of a background tab can fail while another tab is shown.
+        for toast in host.0.read(cx).all() {
             if !seen.is_some_and(|seen| seen.contains(&toast.id)) {
                 fresh.push((toast.id, toast.kind, toast.text.to_string()));
             }
         }
     }
-    let queued = cx
+    let (queued, error_open) = cx
         .try_global::<AppViewGlobal>()
         .and_then(|g| g.0.upgrade())
-        .map_or(0, |view| view.read(cx).pending_errors());
+        .map_or((0, false), |view| {
+            let view = view.read(cx);
+            (view.pending_errors(), view.error_dialog_open())
+        });
     let dialog_open = window.has_active_dialog(cx);
     let monitor = cx.default_global::<Monitor>();
     for (id, kind, text) in fresh {
@@ -87,6 +99,10 @@ pub fn sample(window: &mut Window, cx: &mut App) {
     if queued > 0 {
         note_dialog(monitor, format!("{queued} error dialog(s) queued"));
     }
+    // An error dialog counts even while a dialog of the scenario's own is flagged (an action inside it failed).
+    if error_open && !monitor.scenario_error {
+        note_dialog(monitor, "an error dialog is showing".into());
+    }
     if !dialog_open {
         // Closed (Escape, a button): the next dialog is not the scenario's unless it opens it.
         if monitor
@@ -94,6 +110,7 @@ pub fn sample(window: &mut Window, cx: &mut App) {
             .is_some_and(|at| at.elapsed() > DIALOG_GRACE)
         {
             monitor.scenario_dialog = None;
+            monitor.scenario_error = false;
         }
     } else if monitor.scenario_dialog.is_none() {
         note_dialog(

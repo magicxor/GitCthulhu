@@ -460,6 +460,11 @@ impl LogView {
                         .children(chips),
                 )
             })
+            // Deviation from 08 §2.7.2: a stash row keeps the (empty) chip container's start padding, so its message
+            // lines up with every other row at graphWidth + 24 instead of 16 dp further left.
+            .when(is_stash, |area| {
+                area.child(div().flex_none().pl(dp(m::CHIPS_PAD_START)))
+            })
             .child(
                 div()
                     .id((ids::MESSAGE, ix))

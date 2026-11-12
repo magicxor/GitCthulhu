@@ -175,9 +175,7 @@ pub(super) fn render(view: &DiffView, cx: &mut Context<DiffView>) -> AnyElement 
     let weak = cx.entity().downgrade();
     let close = IconButton::new(ids::CLOSE, AppIcon::Close)
         .icon_size(m::CLOSE_ICON)
-        .on_click(move |_, cx| {
-            let _ = weak.update(cx, |view, cx| view.close(cx));
-        });
+        .on_click(move |window, cx| super::close_and_refocus(&weak, window, cx));
     div()
         .id(ids::HEADER)
         .flex_none()
@@ -268,9 +266,7 @@ pub(super) fn loading_header(path: String, cx: &mut Context<DiffView>) -> AnyEle
         .child(
             IconButton::new(ids::CLOSE, AppIcon::Close)
                 .icon_size(m::CLOSE_ICON)
-                .on_click(move |_, cx| {
-                    let _ = weak.update(cx, |view, cx| view.close(cx));
-                }),
+                .on_click(move |window, cx| super::close_and_refocus(&weak, window, cx)),
         )
         .test_support()
         .into_any_element()

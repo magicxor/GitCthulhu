@@ -8,8 +8,7 @@ use super::{MenuItem, MenuSlot, MenuTarget, extend};
 use crate::backend::{BlameRev, ObjectId, RelaPath};
 use crate::commit_changes::platform;
 use crate::icons::AppIcon;
-use crate::tab::ui::{BlameTarget, CloseableView};
-use crate::tab::{RepoUiEvent, TabCtx};
+use crate::tab::TabCtx;
 
 /// Menu item ids (the menu host registers them as `menu-item-<id>`).
 pub mod ids {
@@ -58,24 +57,12 @@ pub fn commit_file(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
 
 /// Opens the blame view for `path` at `commit` (G8 mounts the view while `ui.blame` is `Some`).
 pub fn open_blame(ctx: &TabCtx, path: RelaPath, commit: ObjectId, cx: &mut App) {
-    ctx.ui.update(cx, |ui, cx| {
-        ui.blame = Some(BlameTarget {
-            path,
-            rev: BlameRev::Commit(commit),
-            minimized: false,
-        });
-        ui.push_view(CloseableView::Blame, cx);
-        cx.emit(RepoUiEvent::CenterChanged);
-    });
+    crate::blame::open(ctx, path, BlameRev::Commit(commit), cx);
 }
 
 /// Opens the file history view for `path` (it replaces the repository view while `ui.history` is `Some`).
 pub fn open_history(ctx: &TabCtx, path: RelaPath, cx: &mut App) {
-    ctx.ui.update(cx, |ui, cx| {
-        ui.history = Some(path);
-        ui.push_view(CloseableView::FileHistory, cx);
-        cx.emit(RepoUiEvent::CenterChanged);
-    });
+    crate::file_history::open(ctx, path, cx);
 }
 
 fn open_in_folder(ctx: &TabCtx, path: &RelaPath, _window: &mut Window, cx: &mut App) {

@@ -547,6 +547,7 @@ fn apply_opened(
         ),
         Ok(plan) => {
             ui.update(cx, |ui, cx| {
+                ui.clear_files(cx);
                 ui.rebase_plan = Some(plan);
                 cx.emit(RepoUiEvent::CenterChanged);
                 cx.notify();

@@ -130,6 +130,11 @@ pub struct FileHistoryView {
 }
 
 impl FileHistoryView {
+    /// Whether a page of the history or the selected commit's diff is loading (the QA runner's idle check).
+    pub fn is_loading(&self) -> bool {
+        self.page.is_running() || self.diff_read.is_running()
+    }
+
     /// The history of `path` in the tab of `ctx`.
     pub fn new(ctx: TabCtx, path: RelaPath, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = settings::get_or_default(cx);

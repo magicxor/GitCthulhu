@@ -10,7 +10,7 @@ use crate::backend::present::{OpFailure, confirm_unrestorable};
 use crate::backend::prompt::Asker;
 use crate::backend::{
     ByteSlice as _, DiscardMode, OperationDescriptor, OperationKind, RefreshSet, RelaPath,
-    Resolution, Scope, SelectionRequest, SkipReason, SkippedFile, UntrackedCapture, git,
+    Resolution, Scope, SelectionRequest, UntrackedCapture, git,
 };
 use crate::tab::RepoTab;
 
@@ -283,10 +283,11 @@ impl RepoTab {
     }
 }
 
-/// The `prepare` step of every operation that deletes untracked files: asks first when the snapshot would not
-/// hold them. A repository without an oplog, or with undo history switched off, holds nothing: then every path is
-/// reported as unrestorable (32 review, T6).
-fn confirm_untracked_loss(
+/// The `prepare` step of every operation that deletes untracked files (discard, delete, `stash push -u`): asks
+/// first when the snapshot would not hold them. `preview_skipped` fails closed: a repository without an oplog,
+/// with undo history switched off, or whose probe failed holds nothing, so every path is reported as unrestorable
+/// (32 review, T6). The runner refuses to run such an operation when the snapshot itself then fails.
+pub(crate) fn confirm_untracked_loss(
     handle: &RepoHandle,
     asker: &Asker,
     title: &str,
@@ -295,18 +296,7 @@ fn confirm_untracked_loss(
     if untracked.is_empty() {
         return Ok(Prepared::Continue { untracked: None });
     }
-    let skipped = if handle.has_oplog() && handle.oplog_enabled() {
-        handle.preview_skipped(untracked)
-    } else {
-        untracked
-            .iter()
-            .map(|path| SkippedFile {
-                path: path.clone(),
-                size: 0,
-                reason: SkipReason::CaptureDisabled,
-            })
-            .collect()
-    };
+    let skipped = handle.preview_skipped(untracked);
     if skipped.is_empty() || asker.confirm(confirm_unrestorable(title, &skipped)) {
         Ok(Prepared::Continue { untracked: None })
     } else {

@@ -22,8 +22,8 @@ use crate::notifications::ToastKind;
 use crate::tab::RepoTab;
 use crate::tab::ui::RepoUiEvent;
 
-/// Shown with the Warning toast of a merge whose autostash could not be re-applied cleanly.
-const AUTOSTASH_DETAIL: &str = "Your local changes were stashed before the merge. Re-applying them after the \
+/// Shown with the Warning toast of a merge (or merge pull) whose autostash could not be re-applied cleanly.
+pub(crate) const AUTOSTASH_DETAIL: &str = "Your local changes were stashed before the merge. Re-applying them after the \
 merge produced conflicts: resolve the conflict markers in the working tree. The changes are kept in the stash list.";
 
 /// `refs/heads/x`, `refs/remotes/o/x`, `refs/tags/x` without the namespace.

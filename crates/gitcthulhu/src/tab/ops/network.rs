@@ -272,26 +272,24 @@ impl RepoTab {
         };
         let spec = OpSpec::new(OpKind::Pull, move |env| {
             let (repo, ctx) = (env.repo, env.ctx);
-            git::network::pull(repo, env.perm(), ctx, &options)
+            let mut outcome = git::network::pull(repo, env.perm(), ctx, &options)?;
+            // Like a merge: the runner shows ONE Warning toast (with "Show output") instead of the success toast.
+            if matches!(
+                outcome.value,
+                MergeOutcomeOrRebase::Merge(MergeOutcome::AutostashConflict { .. })
+            ) {
+                outcome
+                    .warnings
+                    .push(crate::backend::OpWarning::AutostashConflict {
+                        output: super::history::AUTOSTASH_DETAIL.to_owned(),
+                    });
+            }
+            Ok(outcome)
         })
         .record(descriptor)
         .cancellable(Cancellable::Yes)
         .label(label)
         .base_refresh(RefreshSet::OPERATION_STATE | RefreshSet::REMOTES)
-        .then(|tab, outcome: &MergeOutcomeOrRebase, _, cx| {
-            if matches!(
-                outcome,
-                MergeOutcomeOrRebase::Merge(MergeOutcome::AutostashConflict { .. })
-            ) {
-                crate::app_view::show_toast(
-                    cx,
-                    Some(tab.ctx.id),
-                    ToastKind::Warning,
-                    "Your local changes conflicted when re-applied",
-                    None,
-                );
-            }
-        })
         .on_error(move |tab, failure, window, cx| tab.pull_failed(request, failure, window, cx));
         self.run_op(spec, window, cx)
     }

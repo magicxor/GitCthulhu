@@ -8,8 +8,14 @@ use super::{
     EntryId, InterruptedRestore, NetworkMarker, OperationDescriptor, OperationKind,
     OperationResult, Oplog, OplogError, OplogPage, OplogRecovery, PageRequest, PendingOperation,
     PushRefStatus, PushReport, PushedRef, RelaPath, RepoExclusive, RestoreOptions, RestoreTarget,
-    SkippedFile, UndoOutcome, UndoRedoState,
+    SkipReason, SkippedFile, UndoOutcome, UndoRedoState,
 };
+
+#[cfg(test)]
+thread_local! {
+    /// Makes `oplog_prepare` fail on this thread (GPUI tests run operations' background halves on the test thread).
+    pub(crate) static FAIL_PREPARE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// What `oplog_prepare` produced (one short-lived value per operation, so the large variant is not boxed).
 #[allow(clippy::large_enum_variant)]
@@ -91,19 +97,34 @@ impl RepoHandle {
     }
 
     /// `Oplog::preview_skipped` for untracked paths (stat probe, no lock): which of them a snapshot would not
-    /// hold. Empty when the oplog is unavailable or the probe fails (logged).
+    /// hold. Fails closed (T6): without an oplog, with recording or untracked capture switched off, or when the
+    /// probe fails (logged), every path counts as unrestorable, so callers ask before deleting anything.
     pub fn preview_skipped(&self, untracked: &[RelaPath]) -> Vec<SkippedFile> {
-        let Some(oplog) = &self.oplog else {
-            return Vec::new();
-        };
         if untracked.is_empty() {
             return Vec::new();
         }
-        match oplog.read().preview_skipped(&self.repo.local(), untracked) {
+        let all = |reason: SkipReason| {
+            untracked
+                .iter()
+                .map(|path| SkippedFile {
+                    path: path.clone(),
+                    size: 0,
+                    reason,
+                })
+                .collect()
+        };
+        let Some(oplog) = &self.oplog else {
+            return all(SkipReason::CaptureDisabled);
+        };
+        let oplog = oplog.read();
+        if !oplog.options().enabled {
+            return all(SkipReason::CaptureDisabled);
+        }
+        match oplog.preview_skipped(&self.repo.local(), untracked) {
             Ok(skipped) => skipped,
             Err(err) => {
                 tracing::warn!("cannot preview the untracked capture: {err}");
-                Vec::new()
+                all(SkipReason::Unreadable)
             }
         }
     }
@@ -114,6 +135,10 @@ impl RepoHandle {
         op: OperationDescriptor,
         perm: &mut RepoExclusive,
     ) -> PrepareResult {
+        #[cfg(test)]
+        if FAIL_PREPARE.with(std::cell::Cell::get) {
+            return PrepareResult::Failed("the snapshot could not be written (test)".into());
+        }
         let Some(oplog) = &self.oplog else {
             return PrepareResult::Disabled;
         };

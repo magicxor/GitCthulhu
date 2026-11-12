@@ -142,6 +142,11 @@ pub struct BlameView {
 }
 
 impl BlameView {
+    /// Whether the blame or its highlighting is loading (the QA runner's idle check).
+    pub fn is_loading(&self) -> bool {
+        self.load.is_running() || self.highlight.is_running()
+    }
+
     /// The blame view of the tab of `ctx`.
     pub fn new(ctx: TabCtx, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![

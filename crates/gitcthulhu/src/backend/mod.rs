@@ -257,7 +257,8 @@ pub fn runtime_config(settings: &Settings) -> RuntimeConfig {
             ProxyType::Socks => "socks5",
         };
         let user = if settings.proxy_auth && !settings.proxy_user.is_empty() {
-            format!("{}@", settings.proxy_user)
+            // Percent-encoded: a user with '@' or ':' (e.g. "DOMAIN\user@corp") must not break the URL.
+            format!("{}@", proxy_secret::encode_userinfo(&settings.proxy_user))
         } else {
             String::new()
         };

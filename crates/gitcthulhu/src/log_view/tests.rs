@@ -639,8 +639,8 @@ fn chips_order_and_grouping(cx: &mut TestAppContext) {
         let msg = bounds(window, (ids::MESSAGE, 4usize));
         assert_eq!(
             msg.origin.x.as_f32(),
-            o.origin.x.as_f32() + 120.,
-            "stash rows omit the chip row"
+            o.origin.x.as_f32() + 120. + 16.,
+            "stash rows keep the chip row's start padding (deviation: aligned with the other rows)"
         );
     });
 }

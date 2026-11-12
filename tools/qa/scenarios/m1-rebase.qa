@@ -1,0 +1,11 @@
+# Milestone 1 (G12): the interactive rebase editor on the linear fixture (five commits above the first), dark,
+# 1280x720.
+resize 1280x720
+set theme dark
+open repository linear
+wait idle
+open rebase editor Initial commit
+wait 500
+wait idle
+shot m1-13-rebase-editor
+assert no error

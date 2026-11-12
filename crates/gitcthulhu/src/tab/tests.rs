@@ -1085,6 +1085,7 @@ fn clone_reports_its_outcome_to_the_caller(cx: &mut TestAppContext) {
         );
     });
 
+    let tabs_before = cx.update(|cx| app.read(cx).tabs().len());
     let (done, _job) = start(cx, opts);
     assert!(
         matches!(&*done.borrow(), Some(Err(_))),
@@ -1096,9 +1097,15 @@ fn clone_reports_its_outcome_to_the_caller(cx: &mut TestAppContext) {
             app.errors_opened.is_empty() && app.pending_errors() == 0,
             "the dialog shows the failure; nothing is queued as an error dialog"
         );
+        assert_eq!(
+            app.tabs().len(),
+            tabs_before,
+            "the slot the failed clone added next to a repository tab is removed again (no extra 'New tab')"
+        );
         assert!(
-            app.active_tab().is_none(),
-            "the slot went back to the welcome page"
+            app.active_tab()
+                .is_some_and(|tab| tab.read(cx).path().ends_with("clone")),
+            "the repository tab it was started from is selected again"
         );
     });
 }

@@ -121,6 +121,8 @@ pub type OpThen<T> = Box<dyn FnOnce(&mut RepoTab, &T, &mut Window, &mut Context<
 /// Runs on the UI thread after a failure; `Handled::Yes` suppresses the standard presentation.
 pub type OpOnError =
     Box<dyn FnOnce(&mut RepoTab, &OpFailure, &mut Window, &mut Context<RepoTab>) -> Handled>;
+/// Picks the result toast from the operation's value on the UI thread; `None` keeps the standard success toast.
+pub type OpToastWith<T> = Box<dyn FnOnce(&T) -> Option<(ToastKind, SharedString)>>;
 /// A retry offered by the error dialog ("Retry without hooks").
 pub type OpRetry = Box<dyn FnOnce(&mut RepoTab, &mut Window, &mut Context<RepoTab>)>;
 
@@ -148,6 +150,8 @@ pub struct OpSpec<T: Send + 'static> {
     pub label: String,
     /// Overrides the `OpKind` text; `Some("")` = no toast.
     pub success_toast: Option<SharedString>,
+    /// Replaces the success toast depending on the value (it keeps the undo action of a recorded run).
+    pub toast_with: Option<OpToastWith<T>>,
     pub then: Option<OpThen<T>>,
     pub on_error: Option<OpOnError>,
     /// Offered by the HookFailed error dialog (commit, merge, push family, rebase only).
@@ -173,6 +177,7 @@ impl<T: Send + 'static> OpSpec<T> {
             extra_refresh: RefreshSet::empty(),
             label: kind.processing_title().to_owned(),
             success_toast: None,
+            toast_with: None,
             then: None,
             on_error: None,
             retry_without_hooks: None,
@@ -249,6 +254,16 @@ impl<T: Send + 'static> OpSpec<T> {
         self
     }
 
+    /// Lets the value pick the result toast (e.g. a Warning for a stash that applied with conflicts) instead of
+    /// showing the success toast and a second one; `None` from `f` keeps the success toast.
+    pub fn toast_with(
+        mut self,
+        f: impl FnOnce(&T) -> Option<(ToastKind, SharedString)> + 'static,
+    ) -> Self {
+        self.toast_with = Some(Box::new(f));
+        self
+    }
+
     /// Runs `f` on the UI thread after success.
     pub fn then(
         mut self,
@@ -314,6 +329,7 @@ struct BgParts<T: Send + 'static> {
 struct Completion<T: Send + 'static> {
     kind: OpKind,
     success_toast: Option<SharedString>,
+    toast_with: Option<OpToastWith<T>>,
     then: Option<OpThen<T>>,
     on_error: Option<OpOnError>,
     retry_without_hooks: Option<OpRetry>,
@@ -379,81 +395,97 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
         }
     }
     let (mut warning, mut recorded) = (None, false);
-    let result =
-        match p.guard {
-            Guard::Exclusive => {
-                let Some(mut guard) = h.try_lock(LOCK_TIMEOUT) else {
-                    return BgResult::failed(OpFailure::RepoBusy, RefreshSet::empty());
-                };
-                let _suppress = h.suppress_watcher();
-                let pending = match record {
-                    Record::Snapshot(desc) => {
-                        let title = desc.title.clone();
-                        match h.oplog_prepare(desc, guard.write_permission()) {
-                            PrepareResult::Recording(pending) => Some((pending, title)),
-                            PrepareResult::Disabled => None,
-                            PrepareResult::Interrupted => {
-                                return BgResult::failed(
-                                    OpFailure::InterruptedRestore,
-                                    RefreshSet::UNDO,
+    let result = match p.guard {
+        Guard::Exclusive => {
+            let Some(mut guard) = h.try_lock(LOCK_TIMEOUT) else {
+                return BgResult::failed(OpFailure::RepoBusy, RefreshSet::empty());
+            };
+            let _suppress = h.suppress_watcher();
+            let pending = match record {
+                Record::Snapshot(desc) => {
+                    let title = desc.title.clone();
+                    // Operations that delete untracked files (discard, delete, `stash push -u`) fail closed
+                    // when their snapshot cannot be taken: the files would be gone with no way back (T6).
+                    let captures_untracked = desc.untracked != UntrackedCapture::None;
+                    match h.oplog_prepare(desc, guard.write_permission()) {
+                        PrepareResult::Recording(pending) => Some((pending, title)),
+                        PrepareResult::Disabled => None,
+                        PrepareResult::Interrupted => {
+                            return BgResult::failed(
+                                OpFailure::InterruptedRestore,
+                                RefreshSet::UNDO,
+                            );
+                        }
+                        PrepareResult::Failed(err) if captures_untracked => {
+                            return BgResult::failed(
+                                    OpFailure::Other(
+                                        format!(
+                                            "{title} was not run: the undo snapshot failed, so the files it \
+                                             would delete could not be restored. {err}"
+                                        )
+                                        .into(),
+                                    ),
+                                    RefreshSet::empty(),
                                 );
-                            }
-                            PrepareResult::Failed(err) => {
-                                warning = Some(format!("{title} can't be undone: {err}"));
-                                None
-                            }
+                        }
+                        PrepareResult::Failed(err) => {
+                            warning = Some(format!("{title} can't be undone: {err}"));
+                            None
                         }
                     }
-                    Record::None | Record::Marker => None,
+                }
+                Record::None | Record::Marker => None,
+            };
+            let r = (p.run)(&mut OpEnv {
+                repo: &h.repo,
+                perm: Some(guard.write_permission()),
+                ctx: &ctx,
+            });
+            if let Some((pending, title)) = pending {
+                let outcome = match &r {
+                    Ok(_) => OperationResult::Succeeded,
+                    Err(e) if e.kind() == GitErrorKind::Cancelled => OperationResult::Cancelled,
+                    Err(e) => OperationResult::Failed {
+                        message: e.to_string(),
+                    },
                 };
-                let r = (p.run)(&mut OpEnv {
-                    repo: &h.repo,
-                    perm: Some(guard.write_permission()),
-                    ctx: &ctx,
-                });
-                if let Some((pending, title)) = pending {
-                    let outcome = match &r {
-                        Ok(_) => OperationResult::Succeeded,
-                        Err(e) if e.kind() == GitErrorKind::Cancelled => OperationResult::Cancelled,
-                        Err(e) => OperationResult::Failed {
-                            message: e.to_string(),
-                        },
-                    };
-                    match h.oplog_finish(pending, outcome, guard.write_permission()) {
-                        Ok(()) => recorded = true,
-                        Err(err) => warning = Some(format!("{title} can't be undone: {err}")),
-                    }
+                match h.oplog_finish(pending, outcome, guard.write_permission()) {
+                    Ok(()) => recorded = true,
+                    Err(err) => warning = Some(format!("{title} can't be undone: {err}")),
                 }
-                if let (Ok(outcome), Some(after)) = (&r, p.after) {
-                    after(h, guard.write_permission(), &outcome.value);
-                }
-                r
             }
-            Guard::None => {
-                let r = (p.run)(&mut OpEnv {
-                    repo: &h.repo,
-                    perm: None,
-                    ctx: &ctx,
-                });
-                if let Some(marker) = p.marker.and_then(|f| f(r.as_ref().map(|o| &o.value))) {
-                    match h.try_lock(LOCK_TIMEOUT) {
-                        Some(mut guard) => match h.oplog_marker(marker, guard.write_permission()) {
-                            Ok(()) => recorded = true,
-                            Err(err) => {
-                                warning = Some(format!(
-                                    "The push was not recorded in the undo history: {err}"
-                                ))
-                            }
-                        },
-                        None => warning = Some(
+            if let (Ok(outcome), Some(after)) = (&r, p.after) {
+                after(h, guard.write_permission(), &outcome.value);
+            }
+            r
+        }
+        Guard::None => {
+            let r = (p.run)(&mut OpEnv {
+                repo: &h.repo,
+                perm: None,
+                ctx: &ctx,
+            });
+            if let Some(marker) = p.marker.and_then(|f| f(r.as_ref().map(|o| &o.value))) {
+                match h.try_lock(LOCK_TIMEOUT) {
+                    Some(mut guard) => match h.oplog_marker(marker, guard.write_permission()) {
+                        Ok(()) => recorded = true,
+                        Err(err) => {
+                            warning = Some(format!(
+                                "The push was not recorded in the undo history: {err}"
+                            ))
+                        }
+                    },
+                    None => {
+                        warning = Some(
                             "The push was not recorded in the undo history: the repository is busy"
                                 .into(),
-                        ),
+                        )
                     }
                 }
-                r
             }
-        };
+            r
+        }
+    };
     let refresh = refresh_after(&result, p.base_refresh, p.extra_refresh, recorded);
     BgResult {
         result: result.map_err(|e| OpFailure::Git(Arc::new(e))),
@@ -461,6 +493,23 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
         warning,
         recorded,
     }
+}
+
+/// Runs the background half of an operation and turns a panic into an error text (T1): the guard is released by the
+/// unwind and the UI half still ends the busy state, so the tab stays usable.
+fn catch_panic<R>(kind: OpKind, f: impl FnOnce() -> R) -> Result<R, SharedString> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown error".to_owned());
+        tracing::error!("operation {kind:?} panicked: {what}");
+        format!(
+            "An internal error stopped the operation ({what}). Check the repository's state before you continue."
+        )
+        .into()
+    })
 }
 
 /// What a restore produced (UI side).
@@ -544,6 +593,7 @@ impl RepoTab {
             extra_refresh,
             label,
             success_toast,
+            toast_with,
             then,
             on_error,
             retry_without_hooks,
@@ -551,6 +601,7 @@ impl RepoTab {
         let completion = Completion {
             kind,
             success_toast,
+            toast_with,
             then,
             on_error,
             retry_without_hooks,
@@ -573,7 +624,11 @@ impl RepoTab {
                     base_refresh,
                     extra_refresh,
                 };
-                let bg = cx.background_spawn(async move { execute(&handle, parts, ctx, asker) });
+                let bg = cx.background_spawn(async move {
+                    catch_panic(kind, || execute(&handle, parts, ctx, asker)).unwrap_or_else(
+                        |text| BgResult::failed(OpFailure::Other(text), RefreshSet::ALL),
+                    )
+                });
                 self.op_task = Some(cx.spawn_in(window, async move |this, cx| {
                     let result = bg.await;
                     this.update_in(cx, |tab, window, cx| {
@@ -757,17 +812,24 @@ impl RepoTab {
                         Some(show_output_action(data)),
                     );
                 } else {
-                    let text = completion
-                        .success_toast
-                        .clone()
-                        .or_else(|| kind.success_toast().map(SharedString::from));
+                    let picked = completion.toast_with.and_then(|f| f(&outcome.value));
+                    let (toast_kind, text) = match picked {
+                        Some((toast_kind, text)) => (toast_kind, Some(text)),
+                        None => (
+                            ToastKind::Positive,
+                            completion
+                                .success_toast
+                                .clone()
+                                .or_else(|| kind.success_toast().map(SharedString::from)),
+                        ),
+                    };
                     if let Some(text) = text.filter(|t| !t.is_empty()) {
                         let action = if recorded {
                             undo_toast_action(self, crate::undo::ToastContext::Recorded { kind })
                         } else {
                             None
                         };
-                        crate::app_view::show_toast(cx, tab_id, ToastKind::Positive, text, action);
+                        crate::app_view::show_toast(cx, tab_id, toast_kind, text, action);
                     }
                 }
                 if let Some(then) = completion.then {
@@ -928,11 +990,14 @@ impl RepoTab {
             cx,
         );
         let bg = cx.background_spawn(async move {
-            let Some(mut guard) = handle.try_lock(LOCK_TIMEOUT) else {
-                return Err(SharedString::from(present::REPO_BUSY));
-            };
-            let _suppress = handle.suppress_watcher();
-            handle.oplog_recover(how, guard.write_permission())
+            catch_panic(OpKind::RecoverUndo, || {
+                let Some(mut guard) = handle.try_lock(LOCK_TIMEOUT) else {
+                    return Err(SharedString::from(present::REPO_BUSY));
+                };
+                let _suppress = handle.suppress_watcher();
+                handle.oplog_recover(how, guard.write_permission())
+            })
+            .unwrap_or_else(Err)
         });
         self.op_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = bg.await;
@@ -993,7 +1058,10 @@ impl RepoTab {
         match self.ctx.backend.clone() {
             TabBackend::Real(handle) => {
                 let asker = self.asker.clone();
-                let bg = cx.background_spawn(async move { execute_restore(&handle, kind, &asker) });
+                let bg = cx.background_spawn(async move {
+                    catch_panic(op_kind, || execute_restore(&handle, kind, &asker))
+                        .unwrap_or_else(|text| Err(OpFailure::Other(text)))
+                });
                 self.op_task = Some(cx.spawn_in(window, async move |this, cx| {
                     let result = bg.await;
                     this.update_in(cx, |tab, window, cx| {

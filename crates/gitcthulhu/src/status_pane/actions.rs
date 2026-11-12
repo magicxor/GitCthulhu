@@ -16,7 +16,7 @@ use crate::backend::{
 };
 use crate::dialogs::confirm;
 use crate::tab::TabCtx;
-use crate::tab::ui::{BlameTarget, CloseableView, FileList, RepoUiEvent};
+use crate::tab::ui::FileList;
 
 use super::platform;
 
@@ -250,24 +250,12 @@ pub fn resolve(
 
 /// Opens the blame view of the worktree file `path` (09 §2.1; the view reacts to `RepoUi::blame`).
 pub fn open_blame(ctx: &TabCtx, path: RelaPath, cx: &mut App) {
-    ctx.ui.update(cx, |ui, cx| {
-        ui.blame = Some(BlameTarget {
-            path,
-            rev: BlameRev::Worktree,
-            minimized: false,
-        });
-        ui.push_view(CloseableView::Blame, cx);
-        cx.emit(RepoUiEvent::CenterChanged);
-    });
+    crate::blame::open(ctx, path, BlameRev::Worktree, cx);
 }
 
 /// Opens the file history of `path` (09 §2.2; the view reacts to `RepoUi::history`).
 pub fn open_history(ctx: &TabCtx, path: RelaPath, cx: &mut App) {
-    ctx.ui.update(cx, |ui, cx| {
-        ui.history = Some(path);
-        ui.push_view(CloseableView::FileHistory, cx);
-        cx.emit(RepoUiEvent::CenterChanged);
-    });
+    crate::file_history::open(ctx, path, cx);
 }
 
 /// The text "Copy path" puts on the clipboard: the absolute path of each file, one per line.

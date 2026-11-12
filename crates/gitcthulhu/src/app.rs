@@ -106,6 +106,13 @@ pub fn start_git_runtime(cx: &mut App, settings: Settings) {
                 Ok(rt) => GitStatus::Ready(rt),
                 Err(err) => {
                     tracing::error!("git is unavailable: {err}");
+                    // 21 §2.9: besides the welcome banner, an error dialog that leads to the Git executable setting.
+                    let mut data = crate::backend::present::ErrorDialogData::new(
+                        "Git is not available",
+                        err.to_string(),
+                    );
+                    data.extra = Some(crate::backend::present::open_settings_action());
+                    crate::app_view::show_error(cx, data);
                     GitStatus::Failed(std::sync::Arc::new(err))
                 }
             };

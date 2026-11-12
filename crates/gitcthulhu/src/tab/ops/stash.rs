@@ -1,12 +1,12 @@
 //! Stash operations of the catalogue (spec 21 §2.11, §2.9; owned by G3): stash, apply, pop and drop. G0b wrote the
 //! reference method `pop_stash` (prepare reads the stash's untracked paths for the snapshot); apply shares its
-//! build. A conflicted or partial apply/pop is a successful run that keeps the stash entry and adds a Warning toast
-//! to the success toast (which must stay: it carries the undo action of a recorded run).
+//! build. A conflicted or partial apply/pop is a successful run that keeps the stash entry; its one toast is a
+//! Warning instead of the success toast (it keeps the undo action of a recorded run).
 
 use gpui_kit::{Context, Window};
 
 use super::{OpKind, OpSpec, Prepared};
-use crate::backend::present::{OpFailure, confirm_unrestorable};
+use crate::backend::present::OpFailure;
 use crate::backend::{
     ByteSlice as _, ChangeKind, ObjectId, OperationDescriptor, OperationKind, RefreshSet, RelaPath,
     Scope, StashApplyOptions, StashApplyResult, StashPushOptions, UntrackedCapture, git, loaders,
@@ -117,18 +117,10 @@ impl RepoTab {
         })
         .record(descriptor)
         .base_refresh(refresh)
-        // The runner's success toast stays (it carries the undo action of a recorded run, 17 §4.5); a result that
-        // did not apply cleanly adds the Warning.
-        .then(|tab, result, _, cx| {
-            if let Some(warning) = stash_result_warning(result) {
-                crate::app_view::show_toast(
-                    cx,
-                    Some(tab.ctx.id),
-                    ToastKind::Warning,
-                    warning,
-                    None,
-                );
-            }
+        // A result that did not apply cleanly replaces the success toast with one Warning (which keeps the undo
+        // action of a recorded run, 17 §4.5).
+        .toast_with(|result| {
+            stash_result_warning(result).map(|warning| (ToastKind::Warning, warning.into()))
         });
         self.run_op(spec, window, cx)
     }
@@ -207,12 +199,7 @@ impl RepoTab {
         });
         if include_untracked {
             spec = spec.prepare(move |handle, asker| {
-                let skipped = handle.preview_skipped(&untracked);
-                if skipped.is_empty() || asker.confirm(confirm_unrestorable(&title, &skipped)) {
-                    Ok(Prepared::Continue { untracked: None })
-                } else {
-                    Ok::<_, OpFailure>(Prepared::Cancelled)
-                }
+                super::files::confirm_untracked_loss(handle, asker, &title, &untracked)
             });
         }
         self.run_op(spec, window, cx)

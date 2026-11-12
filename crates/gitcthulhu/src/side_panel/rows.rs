@@ -242,6 +242,9 @@ impl SidePanelView {
             Section::Submodules => AppIcon::Submodule,
             Section::Worktrees => AppIcon::Worktree,
         };
+        // The count and the "+" swap by visibility, never by `display`: GPUI decides `display: none` separately in
+        // prepaint and paint, and a header that moves under a resting pointer (a refresh removed a row) flips its
+        // group hover in between, which paints children that were never prepainted (a panic).
         let count_text = div()
             .flex_none()
             .pr(dp(m::HEADER_TRAILING_PAD_END))
@@ -249,7 +252,7 @@ impl SidePanelView {
             .medium()
             .text_color(tokens.on_background_secondary)
             .when(section.has_add_button(), |c| {
-                c.group_hover("side-header", |s| s.hidden())
+                c.group_hover("side-header", |s| s.invisible())
             })
             .child(SharedString::from(count.to_string()));
         div()
@@ -303,25 +306,37 @@ impl SidePanelView {
                     .child(section.title())
                     .test_support(),
             )
-            .child(count_text)
-            .when(section.has_add_button(), |header| {
-                header.child(
-                    div()
-                        .id(ids::header_add(section))
-                        .hidden()
-                        .group_hover("side-header", |s| s.flex())
-                        .flex_none()
-                        .items_center()
-                        .pr(dp(m::HEADER_TRAILING_PAD_END))
-                        .cursor_pointer()
-                        .child(icon(AppIcon::Add, m::ICON, tokens.on_background))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.on_header_add(section, window, cx);
-                        }))
-                        .test_support(),
-                )
-            })
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(count_text)
+                    .when(section.has_add_button(), |trailing| {
+                        trailing.child(
+                            div()
+                                .id(ids::header_add(section))
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .pr(dp(m::HEADER_TRAILING_PAD_END))
+                                .invisible()
+                                .group_hover("side-header", |s| s.visible())
+                                .cursor_pointer()
+                                .child(icon(AppIcon::Add, m::ICON, tokens.on_background))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.on_header_add(section, window, cx);
+                                }))
+                                .test_support(),
+                        )
+                    }),
+            )
             .test_support()
             .into_any_element()
     }

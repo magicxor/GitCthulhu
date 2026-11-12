@@ -184,8 +184,18 @@ pub fn mount_fixture_with(
     size: Size<Pixels>,
     asker_answer: bool,
 ) -> (AnyWindowHandle, Entity<AppView>, Entity<RepoTab>) {
+    mount_fixture_on(cx, fixture, fixture.runtime(), size, asker_answer)
+}
+
+/// [`mount_fixture_with`] on a given runtime (e.g. `Fixture::runtime_with_helpers`).
+pub fn mount_fixture_on(
+    cx: &mut TestAppContext,
+    fixture: &Fixture,
+    rt: Arc<crate::backend::GitRuntime>,
+    size: Size<Pixels>,
+    asker_answer: bool,
+) -> (AnyWindowHandle, Entity<AppView>, Entity<RepoTab>) {
     init_app(cx);
-    let rt = fixture.runtime();
     cx.update(|cx| {
         if let Some(state) = crate::app::state_mut(cx) {
             state.git = GitStatus::Ready(rt.clone());

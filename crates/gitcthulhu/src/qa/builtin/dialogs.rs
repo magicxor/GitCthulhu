@@ -86,7 +86,7 @@ fn open_dialog(window: &mut Window, cx: &mut App, args: &Args) -> Result<String,
         "error" => {
             let mut data = ErrorDialogData::new(args.text(1, "title")?, args.text(2, "message")?);
             data.details = args.opt(3).map(Into::into);
-            monitor::scenario_dialog(cx, true);
+            monitor::scenario_error(cx);
             app_view::show_error(cx, data);
             return Ok(name);
         }

@@ -669,7 +669,21 @@ impl DiffView {
             self.ctx.ui.update(cx, |ui, cx| ui.clear_files(cx));
         }
     }
+}
 
+/// The header's close button: closes the diff and gives the keyboard back to the repository frame (the focused diff
+/// is gone, and focus would otherwise fall back to the window root).
+fn close_and_refocus(view: &gpui_kit::WeakEntity<DiffView>, window: &mut Window, cx: &mut App) {
+    let Ok(ctx) = view.update(cx, |view, cx| {
+        view.close(cx);
+        view.ctx.clone()
+    }) else {
+        return;
+    };
+    ctx.with_tab(window, cx, |tab, window, cx| tab.focus(window, cx));
+}
+
+impl DiffView {
     fn line_up(&mut self, _: &DiffLineUp, _: &mut Window, cx: &mut Context<Self>) {
         self.list.scroll_by(-self.frame.line_h);
         cx.notify();

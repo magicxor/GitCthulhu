@@ -67,7 +67,12 @@ impl LineHeights {
 
 /// Row heights for the current settings.
 pub fn line_heights(cx: &App) -> LineHeights {
-    LineHeights::of(crate::settings::get_or_default(cx).lines_height)
+    // Called per visible row per frame: read the setting in place instead of cloning `Settings`.
+    let lines_height = cx
+        .try_global::<crate::settings::SettingsGlobal>()
+        .map(|g| g.0.lines_height)
+        .unwrap_or_default();
+    LineHeights::of(lines_height)
 }
 
 // window & shell - 07 §1, §2, §5, §7

@@ -78,7 +78,7 @@ fn unavailable() -> Unavailable {
 }
 
 /// Percent-encodes `text` for the userinfo part of a URL (everything but unreserved characters).
-fn encode_userinfo(text: &str) -> String {
+pub(crate) fn encode_userinfo(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -90,9 +90,10 @@ fn encode_userinfo(text: &str) -> String {
     out
 }
 
-/// `proxy` (`scheme://user@host:port`) with `password` after the user, or `proxy` unchanged when it has no
-/// `user@` part for `user`.
+/// `proxy` (`scheme://user@host:port`, the user percent-encoded as `runtime_config` writes it) with `password`
+/// after the user, or `proxy` unchanged when it has no `user@` part for `user`.
 pub fn with_password(proxy: &str, user: &str, password: &str) -> String {
+    let user = encode_userinfo(user);
     let needle = format!("{user}@");
     match proxy.find("://") {
         Some(at) if proxy[at + 3..].starts_with(&needle) && !password.is_empty() => {
@@ -147,6 +148,34 @@ mod tests {
         assert_eq!(
             with_password("socks5://alice@proxy.local", "alice", "x"),
             "socks5://alice:x@proxy.local"
+        );
+    }
+
+    #[test]
+    fn users_with_url_delimiters_are_encoded_on_both_sides() {
+        let settings = Settings {
+            use_proxy: true,
+            proxy_host: "proxy.local".into(),
+            proxy_port: 3128,
+            proxy_auth: true,
+            proxy_user: r"corp\al@ice:x".into(),
+            ..Settings::default()
+        };
+        let config = crate::backend::runtime_config(&settings);
+        let proxy = config
+            .network_config
+            .iter()
+            .find(|(k, _)| k == "http.proxy")
+            .map(|(_, v)| v.clone())
+            .expect("an http.proxy entry");
+        assert!(
+            proxy.contains("://corp%5Cal%40ice%3Ax@proxy.local"),
+            "the user cannot break the URL: {proxy}"
+        );
+        assert!(
+            with_password(&proxy, &settings.proxy_user, "pw")
+                .contains("://corp%5Cal%40ice%3Ax:pw@"),
+            "the password goes after the encoded user"
         );
     }
 

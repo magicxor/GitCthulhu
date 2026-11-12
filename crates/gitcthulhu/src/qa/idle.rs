@@ -51,7 +51,33 @@ fn app_probe(cx: &App) -> Option<String> {
         return Some(format!("operation {:?} running", busy.kind));
     }
     let model = tab.ctx().model.read(cx);
-    model_busy(model)
+    model_busy(model).or_else(|| views_busy(tab.views(), cx))
+}
+
+/// The regions' own asynchronous loads (diff, commit details, blame, file history), so `shot` never catches a
+/// half-loaded view.
+fn views_busy(views: &crate::tab::RegionViews, cx: &App) -> Option<String> {
+    if views.diff.read(cx).is_loading() {
+        return Some("the diff is loading".into());
+    }
+    if views.commit_changes.read(cx).is_loading() {
+        return Some("the commit details are loading".into());
+    }
+    if views
+        .blame
+        .as_ref()
+        .is_some_and(|b| b.read(cx).is_loading())
+    {
+        return Some("the blame is loading".into());
+    }
+    if views
+        .history
+        .as_ref()
+        .is_some_and(|(_, h)| h.read(cx).is_loading())
+    {
+        return Some("the file history is loading".into());
+    }
+    None
 }
 
 /// A load that runs, or that has never finished (no value and no error yet).

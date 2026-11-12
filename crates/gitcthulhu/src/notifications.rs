@@ -124,6 +124,11 @@ impl ToastHost {
         cx.notify();
     }
 
+    /// Every live toast of every tab, oldest first (the QA monitor; tabs in the background included).
+    pub fn all(&self) -> impl Iterator<Item = &Toast> {
+        self.toasts.iter()
+    }
+
     /// The toasts rendered now, oldest first (07 §8: oldest at the top).
     pub fn visible(&self) -> impl Iterator<Item = &Toast> {
         self.toasts

@@ -779,33 +779,8 @@ pub fn register(cx: &mut App) {
     ]);
 }
 
-/// Starts editing an interactive rebase onto `base` (commit menu "Rebase interactive", 08 §2.13): the plan is read
-/// in the background and handed to the rebase editor through `RepoUi::rebase_plan`.
+/// Starts editing an interactive rebase onto `base` (commit menu "Rebase interactive", 08 §2.13): the rebase
+/// editor's entry point reads the plan in the background (newest request wins, empty ranges are a toast).
 pub fn start_rebase_interactive(ctx: &TabCtx, base: ObjectId, cx: &mut App) {
-    let Some(repo) = ctx.backend.repo().cloned() else {
-        return;
-    };
-    let task = crate::backend::bg(cx, move || {
-        crate::backend::rebase::plan_interactive(&repo, Some(base))
-    });
-    let ui = ctx.ui.clone();
-    cx.spawn(async move |cx| {
-        let result = task.await;
-        cx.update(|cx| match result {
-            Ok(plan) => ui.update(cx, |ui, cx| {
-                ui.clear_files(cx);
-                ui.rebase_plan = Some(plan);
-                cx.emit(RepoUiEvent::CenterChanged);
-                cx.notify();
-            }),
-            Err(err) => crate::app_view::show_error(
-                cx,
-                crate::backend::present::ErrorDialogData::new(
-                    "Rebase interactive failed",
-                    err.to_string(),
-                ),
-            ),
-        });
-    })
-    .detach();
+    crate::rebase_interactive::open(ctx, Some(base), cx);
 }

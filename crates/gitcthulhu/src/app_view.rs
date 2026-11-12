@@ -140,6 +140,8 @@ pub struct AppView {
     tab_strip: Entity<TabStripView>,
     error_queue: VecDeque<ErrorDialogData>,
     error_slot: ErrorSlot,
+    /// Slots a clone added next to a repository tab: removed again when the clone fails.
+    clone_slots: Vec<TabId>,
     focus: FocusHandle,
     _request_pump: Task<()>,
     _bounds_save: Option<Task<()>>,
@@ -147,6 +149,9 @@ pub struct AppView {
     /// Titles of the error dialogs opened so far (tests).
     #[cfg(test)]
     pub(crate) errors_opened: Vec<SharedString>,
+    /// Message, details and hook output of the error dialogs opened so far (tests).
+    #[cfg(test)]
+    pub(crate) error_texts: Vec<String>,
 }
 
 impl AppView {
@@ -188,12 +193,15 @@ impl AppView {
             tab_strip,
             error_queue: VecDeque::new(),
             error_slot: ErrorSlot::Idle,
+            clone_slots: Vec::new(),
             focus: cx.focus_handle(),
             _request_pump: request_pump,
             _bounds_save: None,
             _subscriptions: subscriptions,
             #[cfg(test)]
             errors_opened: Vec::new(),
+            #[cfg(test)]
+            error_texts: Vec::new(),
         };
         let restore = cx
             .try_global::<state::UiStateGlobal>()
@@ -242,6 +250,11 @@ impl AppView {
     /// Error dialogs waiting to be shown.
     pub fn pending_errors(&self) -> usize {
         self.error_queue.len()
+    }
+
+    /// Whether an error dialog of the queue is open (or opening) now.
+    pub fn error_dialog_open(&self) -> bool {
+        self.error_slot != ErrorSlot::Idle
     }
 
     /// The title of a tab (07 §2.2): the repository's last path segment, `.git` removed, or "New tab".
@@ -387,7 +400,16 @@ impl AppView {
     ) -> CloneJob {
         let cancel = CancelToken::new();
         let (pump, progress) = crate::backend::prompt::ProgressPump::channel();
+        let reuses_welcome = matches!(
+            self.tabs.get(self.active).map(|s| &s.content),
+            Some(TabContent::Welcome(_))
+        );
         let ix = self.target_slot(true, window, cx);
+        // A clone started from a repository tab got a new slot: a failed or cancelled clone removes it again
+        // instead of leaving an extra "New tab" behind.
+        if !reuses_welcome {
+            self.clone_slots.push(self.tabs[ix].id);
+        }
         let path = opts.directory.clone();
         self.start_open(
             ix,
@@ -419,6 +441,10 @@ impl AppView {
             .ok();
         });
         self.tabs[ix].content = TabContent::Opening { path, task };
+        // The welcome page that had the focus is gone: keep the keyboard on the window (tab shortcuts) meanwhile.
+        if ix == self.active {
+            window.focus(&self.focus, cx);
+        }
         self.after_tabs_changed(window, cx);
     }
 
@@ -439,10 +465,16 @@ impl AppView {
         };
         if let Some(on_done) = on_done {
             // Clone: the dialog reports the outcome (error banner, 09 §3.1).
+            let created = self.clone_slots.contains(&id);
+            self.clone_slots.retain(|slot| *slot != id);
             let done = match result {
                 Ok(handle) => {
                     self.install_repo(ix, id, path, handle, window, cx);
                     Ok(())
+                }
+                Err(err) if created => {
+                    self.remove_tab(id, window, cx);
+                    Err(err)
                 }
                 Err(err) => {
                     self.tabs[ix].content = self.welcome_content(window, cx);
@@ -498,6 +530,9 @@ impl AppView {
         tab.update(cx, |tab, cx| {
             tab.reload(crate::backend::RefreshSet::ALL, cx)
         });
+        if ix == self.active {
+            tab.update(cx, |tab, cx| tab.focus(window, cx));
+        }
         self.tabs[ix].content = TabContent::Repo(tab);
         state::update(cx, |s| s.push_recent(&workdir));
     }
@@ -723,7 +758,22 @@ impl AppView {
         };
         self.error_slot = ErrorSlot::Opening;
         #[cfg(test)]
-        self.errors_opened.push(data.title.clone());
+        {
+            self.errors_opened.push(data.title.clone());
+            let hook = data
+                .hook
+                .as_ref()
+                .map(|h| format!("{} ({:?}): {}", h.hook, h.exit_code, h.output))
+                .unwrap_or_default();
+            self.error_texts.push(format!(
+                "{}
+{}
+{}",
+                data.message,
+                data.details.clone().unwrap_or_default(),
+                hook
+            ));
+        }
         let weak = cx.weak_entity();
         window.defer(cx, move |window, cx| {
             let on_close = {

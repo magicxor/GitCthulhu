@@ -1704,7 +1704,7 @@ fn worktrees_section_absent_in_m1(cx: &mut TestAppContext) {
 
 // ---- operation flows (scripted outcomes) ------------------------------------------------------------------------
 
-/// 21 §2.9: a conflicted or partial apply keeps the entry and adds a Warning toast to the success toast.
+/// 21 §2.9: a conflicted or partial apply keeps the entry; its one toast is a Warning instead of the success toast.
 #[gpui_kit::test]
 fn stash_apply_partial_warns(cx: &mut TestAppContext) {
     let (handle, app, tab) = mount_seeded(cx, refs_seed(), DEFAULT_SIZE);
@@ -1727,11 +1727,8 @@ fn stash_apply_partial_warns(cx: &mut TestAppContext) {
     run_on(cx, handle, &tab, |t, w, c| t.apply_stash(id, w, c));
     assert_eq!(
         cx.update(|cx| toast_texts(&app, cx)),
-        [
-            "Stash applied",
-            "Stash applied: the untracked file 'notes.txt' was not restored (it already exists)"
-        ],
-        "a partial restore warns after the success toast (which carries the undo action)"
+        ["Stash applied: the untracked file 'notes.txt' was not restored (it already exists)"],
+        "a partial restore shows one Warning (which carries the undo action) instead of the success toast"
     );
     assert_eq!(
         op_titles(&tab, cx),
@@ -1753,10 +1750,14 @@ fn stash_apply_partial_warns(cx: &mut TestAppContext) {
         )
     });
     run_on(cx, handle, &tab, |t, w, c| t.pop_stash(id, w, c));
+    let texts = cx.update(|cx| toast_texts(&app, cx));
     assert!(
-        cx.update(|cx| toast_texts(&app, cx))
-            .contains(&"Stash applied with conflicts".to_owned()),
+        texts.contains(&"Stash applied with conflicts".to_owned()),
         "conflicts warn"
+    );
+    assert!(
+        !texts.contains(&"Stash popped".to_owned()),
+        "no success toast next to the warning"
     );
 
     cx.update(|cx| {

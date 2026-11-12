@@ -7,10 +7,53 @@ use super::commits::{find_commit, local_branch, log_row, remote_branch, stash, t
 use crate::backend::{BlameRev, ByteSlice as _, RelaPath};
 use crate::qa::verbs::{Args, Verb, register_verb};
 use crate::tab::TabCtx;
-use crate::tab::ui::{BlameTarget, CloseableView, FileList, RepoUiEvent, Selection};
+use crate::tab::ui::{FileList, RepoUiEvent, Selection, SideExpansion};
 
 /// Registers the verbs of this file.
 pub(super) fn register(cx: &mut App) {
+    register_verb(
+        cx,
+        Verb::new(
+            "expand side sections",
+            "expand side sections",
+            "Expands every section of the side panel (Local branches, Remotes, Tags, Stashes, Submodules) and each remote",
+            |_, cx, _| {
+                let ctx = active_ctx(cx)?;
+                ctx.ui.update(cx, |ui, cx| {
+                    ui.side_expanded = SideExpansion {
+                        local: true,
+                        remotes: true,
+                        tags: true,
+                        stashes: true,
+                        submodules: true,
+                        worktrees: ui.side_expanded.worktrees,
+                    };
+                    ui.remotes_collapsed.clear();
+                    cx.emit(RepoUiEvent::TogglesChanged);
+                    cx.notify();
+                });
+                Ok(String::new())
+            },
+        ),
+    );
+    register_verb(
+        cx,
+        Verb::new(
+            "open rebase editor",
+            "open rebase editor <base commit: hex prefix | summary text>",
+            "Opens the interactive rebase editor for the commits above the base (the log menu's \"Rebase interactive\")",
+            |_, cx, args| {
+                let query = args.rest(0);
+                if query.is_empty() {
+                    return Err("missing argument: base commit".into());
+                }
+                let ctx = active_ctx(cx)?;
+                let (base, _) = find_commit(ctx.model.read(cx), &query)?;
+                crate::rebase_interactive::open(&ctx, Some(base), cx);
+                Ok(base.to_hex_with_len(7).to_string())
+            },
+        ),
+    );
     register_verb(
         cx,
         Verb::new(
@@ -198,15 +241,7 @@ pub(super) fn register(cx: &mut App) {
             |_, cx, args| {
                 let path = RelaPath::from(args.text(0, "file path")?.as_str());
                 let ctx = active_ctx(cx)?;
-                ctx.ui.update(cx, |ui, cx| {
-                    ui.blame = Some(BlameTarget {
-                        path,
-                        rev: BlameRev::Worktree,
-                        minimized: false,
-                    });
-                    ui.push_view(CloseableView::Blame, cx);
-                    cx.emit(RepoUiEvent::CenterChanged);
-                });
+                crate::blame::open(&ctx, path, BlameRev::Worktree, cx);
                 Ok(String::new())
             },
         ),
@@ -220,11 +255,7 @@ pub(super) fn register(cx: &mut App) {
             |_, cx, args| {
                 let path = RelaPath::from(args.text(0, "file path")?.as_str());
                 let ctx = active_ctx(cx)?;
-                ctx.ui.update(cx, |ui, cx| {
-                    ui.history = Some(path);
-                    ui.push_view(CloseableView::FileHistory, cx);
-                    cx.emit(RepoUiEvent::CenterChanged);
-                });
+                crate::file_history::open(&ctx, path, cx);
                 Ok(String::new())
             },
         ),

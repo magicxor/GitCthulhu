@@ -24,6 +24,7 @@ use crate::metrics::{self, dp, status as m};
 use crate::settings::Signoff;
 use crate::tab::model::RepoModelEvent;
 use crate::tab::ops::OpKind;
+use crate::tab::ui::RepoUiEvent;
 use crate::tab::{RepoTabEvent, TabCtx};
 use crate::theme::{ActiveTokens as _, TextStyleExt as _, Tokens};
 use crate::widgets::{CheckboxText, observed};
@@ -294,6 +295,20 @@ impl CommitBox {
                     _ => {}
                 },
             ),
+            // "Show status to amend this commit" (log menu) turns Amend on from outside the box: prefill like the
+            // checkbox does (08 §2.13).
+            cx.subscribe_in(
+                &ctx.ui,
+                window,
+                |this, ui, event: &RepoUiEvent, window, cx| {
+                    if matches!(event, RepoUiEvent::TogglesChanged)
+                        && ui.read(cx).amend
+                        && this.message(cx).trim().is_empty()
+                    {
+                        this.fetch_head_message(Fill::IfBlank, window, cx);
+                    }
+                },
+            ),
             cx.observe(&ctx.model, |_, _, cx| cx.notify()),
             cx.observe(&ctx.ui, |_, _, cx| cx.notify()),
         ];
@@ -410,6 +425,11 @@ impl CommitBox {
             )
         };
         let transition = self.seen.as_ref() != Some(&key);
+        if transition {
+            // A save scheduled before the repository entered or left an operation would write the half-typed text
+            // into the new state's message (MERGE_MSG): the new state's draft wins.
+            self.save_task = None;
+        }
         self.seen = Some(key.clone());
         let read_only_step = self.state_read_only_cached();
         if transition {

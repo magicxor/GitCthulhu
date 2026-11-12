@@ -15,6 +15,7 @@ members = [
     "crates/gitcthulhu-git",      # UI-agnostic plain Git backend: gix reads, `git` mutations, executor, graph layout.
     "crates/gitcthulhu-oplog",    # Snapshot-based undo/redo (operation log) on top of `but_core::snapshot`.
     "crates/gitcthulhu-services", # Forge, AI and update services shared by the GUI.
+    "crates/gitcthulhu",          # The GitCthulhu GUI (gpui-kit): app, helper binaries (askpass, editor).
 
     # Git CLI executor, credential prompts and file watching.
     "crates/gitbutler-git",         # Run fetch/push/clone through the Git CLI, with askpass support (+ askpass binary).
@@ -155,6 +156,8 @@ bitflags = "2.13"
 similar = "2.7"
 infer = "0.19"
 lru = "0.18"
+semver = "1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry", "env-filter", "ansi"] }
 encoding_rs = "0.8"
 proptest = "1.7"
 
@@ -226,6 +229,17 @@ serde_json = { opt-level = 3 }
 # Its build script picks Zig's Debug mode from `debug`, whatever `opt-level` says, and that
 # verifies the whole page for every cell a terminal prints in a hyperlink.
 libghostty-vt-sys = { opt-level = 3, debug = false }
+# GUI rendering and text shaping are slow unoptimised (gpui-kit cheat sheet, 10 §1.1).
+gpui-pre = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+gpui-pre-sum-tree = { opt-level = 3 }
+taffy = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+resvg = { opt-level = 3 }
+smol = { opt-level = 3 }
+syntect = { opt-level = 3 }
+fancy-regex = { opt-level = 3 }
 # This one is special as we can run into debug assertions otherwise.
 # They have a time, but let's chose the time instead of always being hit by it.
 gix-merge = { opt-level = 3, debug-assertions = false }

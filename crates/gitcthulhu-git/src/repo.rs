@@ -266,7 +266,7 @@ impl GitRuntime {
     /// prompts, English messages, no editor) and, in tests, the isolation of `RuntimeConfig::test_isolation`.
     ///
     /// For the few operations that run outside the async executor: the version probe and `git init`.
-    fn blocking_git(&self, cwd: Option<&Path>) -> std::process::Command {
+    pub(crate) fn blocking_git(&self, cwd: Option<&Path>) -> std::process::Command {
         blocking_git(&self.git_path, cwd, self.config.test_isolation.as_ref())
     }
 }

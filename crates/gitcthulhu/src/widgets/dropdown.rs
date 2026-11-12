@@ -165,6 +165,12 @@ impl FilterDropdown {
         cx.notify();
     }
 
+    /// Sets the width of the button and the popup in dp (default 240).
+    pub fn set_width(&mut self, width_dp: f32, cx: &mut Context<Self>) {
+        self.width = width_dp;
+        cx.notify();
+    }
+
     /// The selected option index.
     pub fn selected(&self) -> Option<usize> {
         self.selected

@@ -64,6 +64,8 @@ pub struct OutlinedField {
     id: SharedString,
     disabled: bool,
     error: bool,
+    /// Extra end padding in dp that an overlaid trailing control (eye toggle, folder button) occupies.
+    trailing_space: f32,
     _subscription: Subscription,
 }
 
@@ -99,8 +101,36 @@ impl OutlinedField {
             id,
             disabled: false,
             error: false,
+            trailing_space: 0.,
             _subscription: subscription,
         }
+    }
+
+    /// Reserves `width_dp` at the end of the field for a control the caller overlays (Gitnuro's trailing icon).
+    pub fn trailing_space(mut self, width_dp: f32) -> Self {
+        self.trailing_space = width_dp;
+        self
+    }
+
+    /// Selects the whole text (call after `focus`).
+    pub fn select_all(&self, window: &mut Window, cx: &mut App) {
+        self.input
+            .update(cx, |input, cx| input.select_all(window, cx));
+    }
+
+    /// Puts the caret after the last character.
+    pub fn caret_to_end(&self, cx: &mut App) {
+        self.input.update(cx, |input, cx| {
+            let end = input.value().len();
+            input.set_selected_range(end..end, cx);
+        });
+    }
+
+    /// Shows (`false`) or hides (`true`) the text of a password field.
+    pub fn set_masked(&mut self, masked: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_masked(masked, window, cx));
+        cx.notify();
     }
 
     /// The hint shown while the field is empty (13 sp, `on_background_secondary`).
@@ -175,7 +205,8 @@ impl Render for OutlinedField {
             .border(dp(metrics::FIELD_BORDER))
             .border_color(border)
             .rounded(dp(metrics::RADIUS))
-            .px(dp(10.))
+            .pl(dp(10.))
+            .pr(dp(10. + self.trailing_space))
             .text_body1()
             .text_color(if self.disabled {
                 tokens.field_border_disabled()

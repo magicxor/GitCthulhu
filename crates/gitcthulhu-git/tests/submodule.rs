@@ -3,10 +3,14 @@
 
 mod support;
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use gitcthulhu_git::{
-    CancelToken, GitErrorKind, NoPrompter, OpContext, RefreshSet, Repo, SubmoduleState, submodule,
+    CancelToken, GitErrorKind, NoPrompter, OpContext, Progress, RefreshSet, Repo, SubmoduleState,
+    submodule,
 };
 use support::{TestEnv, TestRepo, same_path};
 
@@ -188,6 +192,61 @@ fn add_and_list() {
     )
     .expect_err("occupied");
     assert_eq!(err.kind(), GitErrorKind::AlreadyExists, "target exists");
+}
+
+/// `--progress` is passed on every supported Git (2.34.1 accepts it) and the clone's progress reaches the sink.
+#[test]
+fn add_reports_clone_progress() {
+    let env = TestEnv::new();
+    let lib = env.repo("lib");
+    commit(&lib, "lib.txt", "lib one");
+    let fixture = env.repo("repo");
+    commit(&fixture, "a.txt", "one");
+    let repo = fixture.open();
+    let mut guard = fixture.exclusive(&repo);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let ctx = OpContext {
+        cancel: CancelToken::new(),
+        progress: Arc::new(move |ev: Progress| sink.lock().expect("lock").push(ev)),
+        prompter: Arc::new(NoPrompter),
+        label: "submodule add".into(),
+    };
+    // A file:// URL: a plain path clones locally (hard links) and reports no transfer phases.
+    let url = format!(
+        "file:///{}",
+        path_str(&lib.path)
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    submodule::add(
+        &repo,
+        guard.write_permission(),
+        &ctx,
+        &url,
+        &"sub".into(),
+        None,
+        None,
+    )
+    .expect("add");
+    assert!(
+        fixture.path.join("sub/lib.txt").is_file(),
+        "the submodule is checked out"
+    );
+    let events = events.lock().expect("lock");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Progress::Command(line) if line.contains("--progress"))),
+        "--progress is passed on Git {}: {events:?}",
+        env.rt.version()
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Progress::Phase { phase, .. } if phase == "Receiving objects")),
+        "the clone's transfer phases are reported: {events:?}"
+    );
 }
 
 #[test]

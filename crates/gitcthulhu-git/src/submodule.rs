@@ -11,11 +11,12 @@ use crate::{
     internal::{errors::gix_error, outcome::Collected},
 };
 
-/// `git submodule add --progress` is only passed from this version on (verified on 2.56; 2.34 is unverified).
+/// `git submodule add --progress` is only passed from this version on. Verified on 2.34.1 (the minimum, so every
+/// supported Git gets it) and 2.56.
 pub const SUBMODULE_ADD_PROGRESS_MIN: GitVersion = GitVersion {
     major: 2,
-    minor: 37,
-    patch: 0,
+    minor: 34,
+    patch: 1,
 };
 
 fn to_path(path: &RelaPath) -> Result<std::borrow::Cow<'_, Path>> {

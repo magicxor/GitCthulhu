@@ -9,8 +9,10 @@ engineering rules.
 - Windows: the Windows SDK (provides `fxc.exe`).
 - Zig 0.17 on `PATH`: `but-tty` builds libghostty-vt with it. Without Zig, add `--exclude but-tty` to cargo
   commands.
-- Linux: `libxcb1-dev libxkbcommon-x11-dev libfontconfig-dev` (GUI) and `libdbus-1-dev pkg-config` (keyring);
-  `scripts/install-minimal-debian-dependencies.sh` installs the latter on Debian/Ubuntu.
+- Linux: `libxcb1-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev
+  libfreetype-dev libssl-dev` (GUI and `-sys` crates) and `libdbus-1-dev pkg-config` (keyring);
+  `scripts/install-minimal-debian-dependencies.sh` installs the latter on Debian/Ubuntu. On Windows, `pwsh -NoProfile
+  -File tools/dev/linux-test.ps1 <cargo arguments>` runs cargo in a Linux container (`--git-min`: Git 2.34.1).
 - Optional: `nix develop` (or `direnv allow`) gives a dev shell with Rust and Zig; `cargo-nextest` for faster tests.
 
 ## Everyday commands

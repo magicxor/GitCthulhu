@@ -40,7 +40,12 @@
   same in every container, so the seed is reused as is. Concurrent runs for the same checkout wait
   until its volume is ready, and a copy that was killed halfway is redone (lock files and seed
   markers in .git\gitcthulhu-dev). Build in the main checkout once to create the seed; a seed from
-  an older main checkout is slower, not wrong. CARGO_BUILD_JOBS is passed through when set.
+  an older main checkout is slower, not wrong. CARGO_BUILD_JOBS, GITCTHULHU_CAPTURE_FIXTURES,
+  GITCTHULHU_PERF_ASSERT and LC_ALL are passed through when set. To capture the Git 2.34.1 stderr
+  fixtures: `$env:GITCTHULHU_CAPTURE_FIXTURES = '1'; pwsh -NoProfile -File tools/dev/linux-test.ps1
+  --git-min test -p gitcthulhu-git --test cli -- --ignored capture_fixtures --exact`. CI's git-min
+  job (the images have the de_DE.UTF-8 locale): `$env:LC_ALL = 'de_DE.UTF-8'; pwsh -NoProfile -File
+  tools/dev/linux-test.ps1 --git-min test -p gitcthulhu-git`.
 
   Permanent: the main volume of every clone and flavor (the seed of its worktree volumes) and the
   shared cache gitcthulhu-cargo-home, which this script never deletes. Losing them costs a cold
@@ -257,11 +262,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The Linux packages of .github/workflows/ci.yaml and scripts/install-minimal-debian-dependencies.sh
 # (libdbus: the keyring in but-secret; xcb, xkbcommon-x11, fontconfig: gpui-kit), plus wayland, X11 and
 # freetype headers for gpui's Linux platform layer and what the -sys crates compile (gcc, make,
-# cmake, openssl). Keep in sync with CI.
-RUN apt-get update \
+# cmake, openssl). Keep in sync with CI. The de_DE.UTF-8 locale: with LC_ALL=de_DE.UTF-8 Git prints
+# German messages unless the executor's LANGUAGE=en wins, which is what CI's git-min job checks.
+# Ubuntu moves the translations (git.mo) out of the packages into language-pack-de-base, which also
+# generates the locale; Debian ships them with git.
+RUN . /etc/os-release \
+ && apt-get update \
  && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git pkg-config xz-utils \
     libssl-dev libdbus-1-dev libxcb1-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
-    libwayland-dev libfontconfig-dev libfreetype-dev \
+    libwayland-dev libfontconfig-dev libfreetype-dev locales $([ "$ID" = ubuntu ] && echo language-pack-de-base) \
+ && localedef -i de_DE -c -f UTF-8 de_DE.UTF-8 \
  && rm -rf /var/lib/apt/lists/*
 # Zig for but-tty (libghostty-vt-sys). Keep the version in sync with .github/actions/setup-zig; the
 # checksums are the ones in https://ziglang.org/download/index.json.
@@ -402,6 +412,12 @@ $run = @('run', '--rm', '--init', '--pull', 'never', '--name', "$prefix-tmp-carg
     '--mount', "type=volume,src=$prefix-cargo-home,dst=/home/dev/.cargo",
 
     '-e', 'CARGO_TARGET_DIR=/target', '-e', 'RUST_BACKTRACE=1')
-if ($env:CARGO_BUILD_JOBS) { $run += @('-e', "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS") }
+# Passed through when set: the build parallelism, the switches of the test suites
+# (GITCTHULHU_CAPTURE_FIXTURES=1 for the capture_fixtures test, GITCTHULHU_PERF_ASSERT=1 for the perf budgets)
+# and LC_ALL (de_DE.UTF-8 for the locale run).
+foreach ($name in 'CARGO_BUILD_JOBS', 'GITCTHULHU_CAPTURE_FIXTURES', 'GITCTHULHU_PERF_ASSERT', 'LC_ALL') {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ($value) { $run += @('-e', "$name=$value") }
+}
 docker @run $image cargo @cargoArgs
 exit $LASTEXITCODE

@@ -267,9 +267,21 @@ fn env_has_language_and_no_git_dir() {
             "{expected} is set:\n{dump}"
         );
     }
-    for absent in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "LC_ALL"] {
+    for absent in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
         assert!(!has_var(&dump, absent), "{absent} is not set:\n{dump}");
     }
+    // `LC_ALL` is neither forced (hooks keep the user's UTF-8 locale) nor removed: the child sees the inherited value,
+    // and `LANGUAGE=en` keeps the messages English under it (the CI's git-min job runs with `LC_ALL=de_DE.UTF-8`).
+    let inherited = std::env::var("LC_ALL").ok().filter(|v| !v.is_empty());
+    let child = dump
+        .lines()
+        .find_map(|line| line.strip_prefix("LC_ALL="))
+        .filter(|v| !v.is_empty());
+    assert_eq!(
+        child,
+        inherited.as_deref(),
+        "LC_ALL is passed through unchanged:\n{dump}"
+    );
 }
 
 #[test]

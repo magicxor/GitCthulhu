@@ -408,6 +408,188 @@ fn first_parent_only() {
     );
 }
 
+/// The `git fast-import` stream of commits `range` of a random history. Commits of earlier streams are addressed as
+/// `refs/p/<n>` (every commit gets such a ref), commits of this stream by mark.
+fn random_history_stream(
+    range: std::ops::Range<usize>,
+    parents: &[Vec<usize>],
+    times: &[i64],
+    refs: &[(String, usize)],
+    annotated: &[(String, usize)],
+) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let start = range.start;
+    let at = |n: usize| {
+        if n >= start {
+            format!(":{}", n + 1)
+        } else {
+            format!("refs/p/{n}")
+        }
+    };
+    // The second part moves `main` and other refs backwards or sideways.
+    let mut out = String::from("feature force\n");
+    for n in range.clone() {
+        let time = times[n];
+        if parents[n].is_empty() {
+            out.push_str("reset refs/heads/main\n\n");
+        }
+        writeln!(out, "commit refs/heads/main\nmark :{}", n + 1).ok();
+        writeln!(out, "author A <a@example.com> {time} +0000").ok();
+        writeln!(out, "committer C <c@example.com> {time} +0000").ok();
+        let message = format!("c{n}\n");
+        writeln!(out, "data {}\n{message}", message.len()).ok();
+        for (i, parent) in parents[n].iter().enumerate() {
+            let verb = if i == 0 { "from" } else { "merge" };
+            writeln!(out, "{verb} {}", at(*parent)).ok();
+        }
+        out.push('\n');
+    }
+    for n in range {
+        writeln!(out, "reset refs/p/{n}\nfrom :{}\n", n + 1).ok();
+    }
+    for (name, n) in refs {
+        writeln!(out, "reset {name}\nfrom {}\n", at(*n)).ok();
+    }
+    for (name, n) in annotated {
+        let time = times[*n] + 1;
+        writeln!(
+            out,
+            "tag {name}\nfrom {}\ntagger T <t@example.com> {time} +0000\ndata 2\nt\n",
+            at(*n)
+        )
+        .ok();
+    }
+    out.into_bytes()
+}
+
+/// Random histories with clock skew, equal commit times, merges, octopus merges, forks from old commits and several
+/// roots, imported in two parts with a commit-graph written after the first part: the walk equals git's date, topo
+/// and first-parent orders without a commit-graph, with one covering only the older part, and with a full one.
+#[test]
+fn random_histories_equal_git_orders_with_partial_and_full_commit_graph() {
+    const COMMITS: usize = 300;
+    const SPLIT: usize = 180;
+    for seed in [11u64, 12, 13] {
+        let env = TestEnv::new();
+        let repo = env.repo("random");
+        let mut rng = graphs::Rng::new(seed);
+        let mut parents: Vec<Vec<usize>> = Vec::new();
+        let mut times: Vec<i64> = Vec::new();
+        let mut open: Vec<usize> = Vec::new();
+        for n in 0..COMMITS {
+            let mut ps: Vec<usize> = Vec::new();
+            if n > 0 && rng.below(30) != 0 {
+                let want = match rng.below(10) {
+                    _ if open.len() > 8 => 2,
+                    0 | 1 => 2,
+                    2 if rng.below(3) == 0 => 3,
+                    _ => 1,
+                };
+                // Now and then a line forks from an old commit instead of continuing an open one.
+                if open.is_empty() || rng.below(12) == 0 {
+                    ps.push(rng.below(n));
+                }
+                let mut candidates = open.clone();
+                while ps.len() < want && !candidates.is_empty() {
+                    let pick = candidates.swap_remove(rng.below(candidates.len()));
+                    if !ps.contains(&pick) {
+                        ps.push(pick);
+                    }
+                }
+            }
+            open.retain(|o| !ps.contains(o));
+            open.push(n);
+            // Mostly increasing with jitter (lines interleave out of order), sometimes the parent's exact time, and
+            // sometimes older than the parent (clock skew).
+            let base = 1_600_000_000 + n as i64 * 10;
+            let time = match (ps.first(), rng.below(8)) {
+                (Some(&p), 0 | 1) => times[p],
+                (Some(&p), 2) => times[p] - rng.below(100) as i64,
+                _ => base + rng.below(40) as i64,
+            };
+            parents.push(ps);
+            times.push(time);
+        }
+        let refs_at = |rng: &mut graphs::Rng, end: usize, part: usize| {
+            let mut refs = vec![("refs/heads/main".to_owned(), end - 1)];
+            for k in 0..4 {
+                refs.push((format!("refs/heads/b{part}-{k}"), rng.below(end)));
+                refs.push((format!("refs/remotes/origin/r{part}-{k}"), rng.below(end)));
+                refs.push((format!("refs/tags/l{part}-{k}"), rng.below(end)));
+            }
+            let annotated = (0..3)
+                .map(|k| (format!("a{part}-{k}"), rng.below(end)))
+                .collect::<Vec<_>>();
+            (refs, annotated)
+        };
+
+        let (refs, annotated) = refs_at(&mut rng, SPLIT, 1);
+        repo.fast_import(&random_history_stream(
+            0..SPLIT,
+            &parents,
+            &times,
+            &refs,
+            &annotated,
+        ));
+        repo.git(&["commit-graph", "write", "--reachable"]);
+        let (refs, annotated) = refs_at(&mut rng, COMMITS, 2);
+        repo.fast_import(&random_history_stream(
+            SPLIT..COMMITS,
+            &parents,
+            &times,
+            &refs,
+            &annotated,
+        ));
+
+        let tips = ["HEAD", "--branches", "--remotes", "--tags"];
+        let cases = [
+            (LogOrder::Date, false, &["--date-order"][..]),
+            (LogOrder::Topo, false, &["--topo-order"][..]),
+            (
+                LogOrder::Date,
+                true,
+                &["--date-order", "--first-parent"][..],
+            ),
+            (
+                LogOrder::Topo,
+                true,
+                &["--topo-order", "--first-parent"][..],
+            ),
+        ];
+        let oracles: Vec<Vec<ObjectId>> = cases
+            .iter()
+            .map(|(_, _, args)| {
+                let mut full = vec!["rev-list"];
+                full.extend_from_slice(args);
+                full.extend_from_slice(&tips);
+                parse_ids(&repo.git(&full))
+            })
+            .collect();
+        let check = |graph: &str| {
+            let backend = repo.open();
+            for ((order, first_parent, args), oracle) in cases.iter().zip(&oracles) {
+                let opts = LogOptions {
+                    order: *order,
+                    first_parent: *first_parent,
+                    ..LogOptions::default()
+                };
+                assert_eq!(
+                    ids(&walk_all(&backend, &opts)),
+                    *oracle,
+                    "seed {seed}, {graph}: git rev-list {args:?}"
+                );
+            }
+        };
+        check("a commit-graph of the older part");
+        let info = repo.path.join(".git/objects/info");
+        let _ = std::fs::remove_file(info.join("commit-graph"));
+        let _ = std::fs::remove_dir_all(info.join("commit-graphs"));
+        check("no commit-graph");
+        repo.git(&["commit-graph", "write", "--reachable"]);
+        check("a full commit-graph");
+    }
+}
+
 // ───────────────────────────── commit data ─────────────────────────────
 
 #[test]

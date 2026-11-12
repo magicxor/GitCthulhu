@@ -2,17 +2,22 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
 };
 
-use bstr::{BStr, ByteSlice as _};
+use bstr::{BStr, BString, ByteSlice as _};
 use gix::{ObjectId, refs::FullName, remote::Direction};
 
 use crate::{
     AheadBehind, CancelToken, Decorations, GitError, GitTime, HeadState, LocalBranch, RefLabel,
     RefList, RefListOptions, RemoteBranch, RemoteInfo, Repo, Result, StashInfo, TagInfo, Upstream,
-    internal::errors::gix_error, remote::symref_head_branch, worktree::head_state,
+    internal::{
+        errors::gix_error,
+        refscan::{self, RefNamespace, ScannedRef},
+    },
+    remote::symref_head_branch,
+    worktree::head_state,
 };
 
 impl RefListOptions {
@@ -36,6 +41,9 @@ fn git_time(time: gix::date::Time) -> GitTime {
 }
 
 /// All refs of the repository.
+///
+/// References are listed without object lookups (`internal::refscan`); only tags are looked at, by their object
+/// header, to tell annotated from lightweight ones. Errors: an unreadable reference fails the whole list.
 pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
     let gix_repo = repo.local();
     let head = head_state(&gix_repo)?;
@@ -51,17 +59,20 @@ pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
         }
     }
 
-    let platform = gix_repo.references().map_err(gix_error)?;
-
+    let with_config = branches_with_config(&gix_repo);
     let mut local = Vec::new();
-    for reference in platform.local_branches().map_err(gix_error)? {
-        let mut reference = reference.map_err(gix_error)?;
-        let full = reference.name().to_owned();
-        let Some(target) = resolved_id(&mut reference) else {
+    for reference in refscan::scan(&gix_repo, RefNamespace::LocalBranches)? {
+        let reference = reference?;
+        let Some(target) = reference.resolve(&gix_repo) else {
             continue;
         };
+        let full = reference.name;
         let name = full.shorten().to_str_lossy().into_owned();
-        let upstream = upstream_of(&gix_repo, &full, &name)?;
+        let upstream = if with_config.contains(name.as_bytes().as_bstr()) {
+            upstream_of(&gix_repo, &full, &name)?
+        } else {
+            None
+        };
         local.push(LocalBranch {
             is_head: matches!(&head, HeadState::Branch { name, .. } | HeadState::Unborn { name } if *name == full),
             checked_out_in: checked_out.get(&full).cloned(),
@@ -76,19 +87,20 @@ pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
 
     let mut remotes = Vec::new();
     if opts.remotes {
-        remotes = remote_infos(&gix_repo, &platform)?;
+        remotes = remote_infos(&gix_repo)?;
     }
 
     let mut tags = Vec::new();
     if opts.tags {
-        for reference in platform.tags().map_err(gix_error)? {
-            let reference = reference.map_err(gix_error)?;
-            let Some(info) = tag_info(&gix_repo, reference)? else {
+        // Many tags may point at one object; a loose one costs a file open per lookup.
+        let mut kinds = HashMap::new();
+        for reference in refscan::scan(&gix_repo, RefNamespace::Tags)? {
+            let Some(info) = tag_info(&gix_repo, reference?, &mut kinds)? else {
                 continue;
             };
             tags.push(info);
         }
-        tags.sort_by(|a, b| version_cmp(&a.name, &b.name));
+        tags = sorted_by_version(tags);
     }
 
     let stashes = if opts.stashes {
@@ -107,6 +119,19 @@ pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
     };
     list.decorations = decorations(&list);
     Ok(list)
+}
+
+/// The short names of the branches with a `branch.<name>` section in the configuration: only they can have an
+/// upstream, and asking gix for the upstream of each of thousands of branches costs about a microsecond each.
+fn branches_with_config(gix_repo: &gix::Repository) -> HashSet<BString> {
+    gix_repo
+        .config_snapshot()
+        .plumbing()
+        .sections_by_name("branch")
+        .into_iter()
+        .flatten()
+        .filter_map(|section| section.header().subsection_name().map(ToOwned::to_owned))
+        .collect()
 }
 
 fn upstream_of(
@@ -184,10 +209,7 @@ impl RemoteMap {
     }
 }
 
-fn remote_infos(
-    gix_repo: &gix::Repository,
-    platform: &gix::reference::iter::Platform<'_>,
-) -> Result<Vec<RemoteInfo>> {
+fn remote_infos(gix_repo: &gix::Repository) -> Result<Vec<RemoteInfo>> {
     let mut infos: BTreeMap<String, RemoteInfo> = BTreeMap::new();
     let mut maps = Vec::new();
     for name in gix_repo.remote_names() {
@@ -229,10 +251,9 @@ fn remote_infos(
     by_name_len.sort_by_key(|name| std::cmp::Reverse(name.len()));
     let by_name_len: Vec<String> = by_name_len.into_iter().cloned().collect();
 
-    for reference in platform.remote_branches().map_err(gix_error)? {
-        let mut reference = reference.map_err(gix_error)?;
-        let full = reference.name().to_owned();
-        let full_str = lossy(full.as_bstr());
+    for reference in refscan::scan(gix_repo, RefNamespace::RemoteBranches)? {
+        let reference = reference?;
+        let full_str = lossy(reference.name.as_bstr());
         let Some(rest) = full_str.strip_prefix("refs/remotes/") else {
             continue;
         };
@@ -261,9 +282,10 @@ fn remote_infos(
         if branch == "HEAD" {
             continue;
         }
-        let Some(target) = resolved_id(&mut reference) else {
+        let Some(target) = reference.resolve(gix_repo) else {
             continue;
         };
+        let full = reference.name;
         infos
             .entry(remote.clone())
             .or_insert_with(|| RemoteInfo {
@@ -288,29 +310,41 @@ fn remote_infos(
     Ok(remotes)
 }
 
-/// The object a reference points to, `None` if a symbolic reference cannot be resolved.
-///
-/// A direct reference is read as it is. Asking gix to `peel_to_id` it would look the reference up again, which for a
-/// packed reference means checking `packed-refs` on disk every time: about 50 us each, 0.5 s for 10k refs.
-fn resolved_id(reference: &mut gix::Reference<'_>) -> Option<ObjectId> {
-    match reference.target() {
-        gix::refs::TargetRef::Object(id) => Some(id.to_owned()),
-        gix::refs::TargetRef::Symbolic(_) => reference.peel_to_id().ok().map(gix::Id::detach),
-    }
-}
-
 /// `None` for a ref that cannot be resolved.
+///
+/// `kinds` remembers the object kind per id (`None`: missing or unreadable) across the tags of one listing.
 fn tag_info(
     gix_repo: &gix::Repository,
-    mut reference: gix::Reference<'_>,
+    reference: ScannedRef,
+    kinds: &mut HashMap<ObjectId, Option<gix::object::Kind>>,
 ) -> Result<Option<TagInfo>> {
-    let full = reference.name().to_owned();
-    let name = full.shorten().to_str_lossy().into_owned();
     // The id the reference points to, i.e. the tag object of an annotated tag (peeled below).
-    let Some(first) = resolved_id(&mut reference) else {
+    let Some(first) = reference.resolve(gix_repo) else {
         return Ok(None);
     };
-    let Ok(object) = gix_repo.find_object(first) else {
+    let full = reference.name;
+    let name = full.shorten().to_str_lossy().into_owned();
+    // Most tags are lightweight: the object header tells so without decoding the commit.
+    let kind = *kinds
+        .entry(first)
+        .or_insert_with(|| match gix_repo.try_find_header(first) {
+            Ok(Some(header)) => Some(header.kind()),
+            Ok(None) | Err(_) => None,
+        });
+    if let Some(kind) = kind
+        && kind != gix::object::Kind::Tag
+    {
+        return Ok(Some(TagInfo {
+            name,
+            full,
+            target: first,
+            peeled_kind: kind,
+            tag_object: None,
+            message_summary: None,
+            tagger_time: None,
+        }));
+    }
+    let Some(object) = kind.and_then(|_| gix_repo.find_object(first).ok()) else {
         tracing::warn!(tag = %full.as_bstr(), "Ignoring a tag whose object is missing");
         return Ok(None);
     };
@@ -346,28 +380,35 @@ fn tag_info(
     }))
 }
 
+/// `tags` sorted by [`version_cmp`] of their names (stable). The sort moves indices; each tag is moved once.
+fn sorted_by_version(tags: Vec<TagInfo>) -> Vec<TagInfo> {
+    let mut order: Vec<usize> = (0..tags.len()).collect();
+    order.sort_by(|&a, &b| version_cmp(&tags[a].name, &tags[b].name));
+    let mut slots: Vec<Option<TagInfo>> = tags.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|index| slots[index].take())
+        .collect()
+}
+
 /// Digit runs compare numerically, other runs bytewise (`v1.9` < `v1.10`).
+///
+/// Allocation-free: sorting 5k tags makes about 60k comparisons.
 fn version_cmp(a: &str, b: &str) -> Ordering {
-    fn runs(s: &str) -> Vec<(bool, &str)> {
-        let mut out = Vec::new();
-        let mut start = 0;
-        let mut kind = None;
-        for (i, c) in s.char_indices() {
-            let is_digit = c.is_ascii_digit();
-            if kind != Some(is_digit) {
-                if kind.is_some() {
-                    out.push((kind == Some(true), &s[start..i]));
-                }
-                start = i;
-                kind = Some(is_digit);
-            }
+    // The runs before the first differing byte are the same in both names and compare equal, so the comparison starts
+    // at the run that contains that byte. That start is an ASCII digit or follows one (or is 0): a char boundary.
+    let common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    let start = match common.checked_sub(1) {
+        None => 0,
+        Some(last) => {
+            let is_digit = a.as_bytes()[last].is_ascii_digit();
+            a.as_bytes()[..last]
+                .iter()
+                .rposition(|b| b.is_ascii_digit() != is_digit)
+                .map_or(0, |pos| pos + 1)
         }
-        if kind.is_some() {
-            out.push((kind == Some(true), &s[start..]));
-        }
-        out
-    }
-    for (x, y) in runs(a).into_iter().zip(runs(b)) {
+    };
+    for (x, y) in VersionRuns(&a[start..]).zip(VersionRuns(&b[start..])) {
         let ord = match (x.0, y.0) {
             (true, true) => {
                 let (xt, yt) = (x.1.trim_start_matches('0'), y.1.trim_start_matches('0'));
@@ -380,6 +421,26 @@ fn version_cmp(a: &str, b: &str) -> Ordering {
         }
     }
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// The maximal runs of ASCII digits and of other characters of a string, as `(is_digit, run)`.
+struct VersionRuns<'a>(&'a str);
+
+impl<'a> Iterator for VersionRuns<'a> {
+    type Item = (bool, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let is_digit = self.0.as_bytes().first()?.is_ascii_digit();
+        // An ASCII digit, or the first byte of any other character, is always a character boundary.
+        let end = self
+            .0
+            .bytes()
+            .position(|b| b.is_ascii_digit() != is_digit)
+            .unwrap_or(self.0.len());
+        let (run, rest) = self.0.split_at(end);
+        self.0 = rest;
+        Some((is_digit, run))
+    }
 }
 
 /// Ahead/behind per (local, upstream tracking) pair; walks at most `cap` commits per side ("999+" in the UI).
@@ -568,4 +629,60 @@ pub fn decorations(list: &RefList) -> Decorations {
         add(stash.id, RefLabel::Stash(stash.index));
     }
     Decorations(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The run-by-run comparison without the common-prefix shortcut, as a reference.
+    fn version_cmp_reference(a: &str, b: &str) -> Ordering {
+        for (x, y) in VersionRuns(a).zip(VersionRuns(b)) {
+            let ord = match (x.0, y.0) {
+                (true, true) => {
+                    let (xt, yt) = (x.1.trim_start_matches('0'), y.1.trim_start_matches('0'));
+                    xt.len().cmp(&yt.len()).then_with(|| xt.cmp(yt))
+                }
+                _ => x.1.cmp(y.1),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+    }
+
+    #[test]
+    fn version_cmp_equals_the_run_by_run_comparison() {
+        let names = [
+            "", "v", "v1", "v01", "v1.2", "v1.10", "v1.9", "v1.9.1", "v10.0", "v100", "v099",
+            "beta", "beta2", "beta10", "1", "10", "01", "a1b", "a1c", "a10b", "ä1", "ä10", "äb",
+            "v1ä", "v1ö", "1.0-rc1", "1.0-rc10", "1.0", "1.0.0",
+        ];
+        for a in names {
+            for b in names {
+                assert_eq!(
+                    version_cmp(a, b),
+                    version_cmp_reference(a, b),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn version_runs_split_digits_from_other_characters() {
+        let runs: Vec<_> = VersionRuns("v1.10-ä2").collect();
+        assert_eq!(
+            runs,
+            [
+                (false, "v"),
+                (true, "1"),
+                (false, "."),
+                (true, "10"),
+                (false, "-ä"),
+                (true, "2")
+            ]
+        );
+    }
 }

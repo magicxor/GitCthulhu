@@ -198,6 +198,41 @@ fn perf_log_first_page_and_next_page() {
     finish();
 }
 
+/// A linear history is the worst case of the walk without a commit-graph: there is only one line to read, so the
+/// threads of the prefetch cannot share the work (`branchy` above has up to 20 lines open at a time).
+#[test]
+#[ignore = "performance: run in release with GITCTHULHU_PERF_ASSERT=1 to assert the budget"]
+fn perf_log_first_page_linear_history() {
+    let commits = from_env("GITCTHULHU_PERF_COMMITS", 100_000);
+    let env = TestEnv::new();
+    let fixture = env.repo("repo");
+    let (_, generated) =
+        timed(|| fixture.fast_import(&graphs::linear(commits).fast_import_stream()));
+    report(&format!("importing {commits} commits"), generated);
+    let repo = fixture.open();
+    let cancel = CancelToken::new();
+    let samples: Vec<Duration> = (0..3)
+        .map(|_| {
+            let (page, took) = timed(|| {
+                LogWalker::new(&repo, &LogOptions::default(), &cancel)
+                    .expect("the walk starts")
+                    .next_page(2000, &cancel)
+                    .expect("the first page loads")
+            });
+            assert_eq!(page.commits.len(), 2000, "a full first page");
+            took
+        })
+        .collect();
+    check(
+        &format!(
+            "LogWalker first page (2000) of {commits} linear commits, no commit-graph (median of 3)"
+        ),
+        median(samples),
+        scaled(Duration::from_millis(600), commits, 100_000),
+    );
+    finish();
+}
+
 // ───────────────────────────── refs ─────────────────────────────
 
 #[test]
@@ -206,17 +241,46 @@ fn perf_refs_list_10k() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");
     fixture.fast_import_with(|stdin| {
-        let mut out = std::io::BufWriter::new(stdin);
-        writeln!(out, "commit refs/heads/main\nmark :1\ncommitter C <c@example.com> 1600000000 +0000\ndata 4\none")?;
-        for i in 0..5000 {
-            writeln!(out, "reset refs/heads/feature/b{i}\nfrom :1\n")?;
-        }
-        for i in 0..5000 {
-            writeln!(out, "reset refs/tags/v{i}\nfrom :1\n")?;
-        }
-        out.flush()
+        writeln!(
+            stdin,
+            "commit refs/heads/main\ncommitter C <c@example.com> 1600000000 +0000\ndata 4\none"
+        )
     });
-    let measure = |what: &str, budget: Option<Duration>| {
+    let main = fixture.git(&["rev-parse", "refs/heads/main"]);
+    // The loose files are written directly, as Git writes them: 10k `reset`s through fast-import take minutes on
+    // Windows (a lock file and a rename per ref).
+    let names: Vec<String> = (0..5000)
+        .map(|i| format!("refs/heads/feature/b{i}"))
+        .chain((0..5000).map(|i| format!("refs/tags/v{i}")))
+        .collect();
+    let ((), generated) = timed(|| {
+        for name in &names {
+            let path = fixture.path.join(".git").join(name);
+            std::fs::create_dir_all(path.parent().expect("a ref has a directory"))
+                .expect("writable");
+            std::fs::write(path, format!("{main}\n")).expect("writable");
+        }
+    });
+    report("writing the 10k loose ref files", generated);
+
+    let cancel = CancelToken::new();
+    // The log's tips are the same 10k refs, all at one commit: the walk costs nothing, listing the tips is measured.
+    let log_tips = || {
+        let repo = fixture.open();
+        let samples: Vec<Duration> = (0..5)
+            .map(|_| {
+                timed(|| {
+                    LogWalker::new(&repo, &LogOptions::default(), &cancel)
+                        .expect("the walk starts")
+                        .next_page(10, &cancel)
+                        .expect("the page loads")
+                })
+                .1
+            })
+            .collect();
+        median(samples)
+    };
+    let list = || {
         let repo = fixture.open();
         // A warm-up lets the file system cache settle; then the median of five.
         refs::list(&repo, RefListOptions::ALL).expect("the refs list");
@@ -229,19 +293,44 @@ fn perf_refs_list_10k() {
             10_001,
             "main, 5000 branches and 5000 tags"
         );
-        match budget {
-            Some(budget) => check(what, median(samples), budget),
-            None => report(what, median(samples)),
-        }
+        median(samples)
     };
-    // 10k loose refs are 10k file opens: on Windows that is about 100 us each however they are read (iterating them
-    // with gix alone takes more than half of the time), so only the packed layout of a repository that ever ran
-    // `git gc` or `git pack-refs` can meet the budget of the spec. The loose layout is reported for reference.
-    measure("refs::list of 10k loose refs", None);
+
+    // 10k loose refs are 10k file opens: on Windows 50-200 us each (on-access scanning included), so no listing of
+    // them can meet the budget of the spec, which holds for the packed layout of a repository that ever ran `git gc`
+    // or `git pack-refs`. The loose layout must instead beat the floor of reading the same files one after the other
+    // with plain `std::fs::read` (the listing reads them on several threads).
+    let loose_list = list();
+    let (files, floor) = timed(|| {
+        let mut files = 0;
+        for name in &names {
+            std::fs::read(fixture.path.join(".git").join(name)).expect("readable");
+            files += 1;
+        }
+        files
+    });
+    report(
+        &format!("reading the {files} loose ref files serially (the floor)"),
+        floor,
+    );
+    check("refs::list of 10k loose refs", loose_list, floor);
+    check(
+        "LogWalker::new + first page with 10k loose refs as tips (median of 5)",
+        log_tips(),
+        floor,
+    );
+
     fixture.git(&["pack-refs", "--all"]);
-    measure(
+    check(
         "refs::list of 10k packed refs",
-        Some(Duration::from_millis(30)),
+        list(),
+        Duration::from_millis(30),
+    );
+    // Spec §9 has no row for the tips of the walk; they are a listing of the same refs, so its budget applies.
+    check(
+        "LogWalker::new + first page with 10k packed refs as tips (median of 5)",
+        log_tips(),
+        Duration::from_millis(30),
     );
     finish();
 }

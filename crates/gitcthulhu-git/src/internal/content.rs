@@ -648,6 +648,21 @@ pub(crate) mod fixture {
                 .to_owned()
         }
 
+        /// Like [`Self::git`], with extra environment variables (e.g. `GIT_COMMITTER_DATE`).
+        pub fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> String {
+            let out = self
+                .command(args)
+                .envs(env.iter().copied())
+                .output()
+                .expect("git is installed");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim_end().to_owned()
+        }
+
         /// Write `rela` (creating parent directories).
         pub fn write(&self, rela: &str, content: impl AsRef<[u8]>) {
             let path = self.path.join(rela);

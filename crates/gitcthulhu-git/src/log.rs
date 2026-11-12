@@ -1,9 +1,9 @@
 //! Commit log walking and search (WP-B4, spec §2.5 `log.rs`, §3.1).
 //!
-//! The log is a `gix_traverse` topological walk in date order (`git rev-list --date-order`) or topo order, which
-//! guarantees every child before its parents, the precondition of the lane layout in [`crate::graph`]. The walk is
-//! built once per [`LogWalker`] (on a detached thread, because the build is not interruptible) and then delivers
-//! pages incrementally.
+//! The log is a topological walk in date order (`git rev-list --date-order`) or topo order, which guarantees every
+//! child before its parents, the precondition of the lane layout in [`crate::graph`] (the walk itself lives in
+//! `internal::topo`). The walk is built once per [`LogWalker`] (on a detached thread, so cancel returns at once) and
+//! then delivers pages incrementally.
 
 use std::{
     borrow::Cow,
@@ -17,13 +17,16 @@ use bstr::{BStr, ByteSlice};
 use gix::{
     ObjectId,
     objs::{Find as _, commit::ref_iter::Token},
-    traverse::commit::{Parents, Topo, topo},
 };
 use smallvec::SmallVec;
 
 use crate::{
     CancelToken, CommitInfo, GitError, GitTime, LogOptions, LogOrder, LogPage, LogTips, Person,
     Repo, Result, SearchQuery, Signature,
+    internal::{
+        refscan::{self, RefNamespace},
+        topo::{CommitTable, Node, TopoWalk},
+    },
 };
 
 impl Default for LogOptions {
@@ -44,15 +47,14 @@ impl Default for LogOptions {
 /// How often long loops look at the cancel token.
 const CANCEL_CHECK_INTERVAL: usize = 256;
 
-/// The predicate that hides stash helper commits from the walk.
-type HidePredicate = Box<dyn FnMut(&gix::oid) -> bool + Send>;
-
 /// An incremental walk over history, producing pages of commits in walk order (children before parents).
 ///
 /// `Send`, not `Sync`: the GUI keeps it in a `Mutex` and drives it from background tasks.
 pub struct LogWalker {
     repo: gix::Repository,
-    topo: Topo<WalkObjects, HidePredicate>,
+    topo: TopoWalk,
+    /// The index and untracked commits of stashes: walked, never returned.
+    hidden: HashSet<ObjectId>,
     first_parent: bool,
     stash_ids: HashSet<ObjectId>,
     shallow: Arc<HashSet<ObjectId>>,
@@ -61,15 +63,15 @@ pub struct LogWalker {
     /// so the next page starts with them and pagination never loses rows.
     pending: Vec<CommitInfo>,
     /// The walk's next item, read ahead so `is_exhausted()` is exact after a full page.
-    peeked: Option<gix::Result<ObjectId>>,
+    peeked: Option<Result<ObjectId>>,
     /// The topological walk returned its last commit.
     topo_done: bool,
     loaded: usize,
 }
 
 impl LogWalker {
-    /// Start a walk. The Topo build (up to seconds without a commit-graph) runs on a detached compute thread (§1.4);
-    /// on cancel this returns `Err(Cancelled)` immediately and the build result is dropped when it finishes.
+    /// Start a walk. The build (a walk over the whole history without a commit-graph) runs on a detached compute
+    /// thread (§1.4); on cancel this returns `Err(Cancelled)` immediately and the build stops soon after.
     ///
     /// Tips: `LogTips::AllRefs` walks HEAD (if born), local branches, and optionally remote-tracking branches, tags
     /// (peeled; tags of non-commits are skipped) and every stash in the `refs/stash` reflog. Other namespaces, such as
@@ -85,22 +87,18 @@ impl LogWalker {
         })
     }
 
-    fn build(repo: gix::Repository, opts: &LogOptions, cancel: &CancelToken) -> Result<LogWalker> {
+    fn build(
+        mut repo: gix::Repository,
+        opts: &LogOptions,
+        cancel: &CancelToken,
+    ) -> Result<LogWalker> {
+        // Every commit of the log is decoded once; an object cache would only copy each of them.
+        repo.objects.unset_object_cache();
         let shallow: HashSet<ObjectId> = repo
             .shallow_commits()?
             .map(|commits| commits.iter().copied().collect())
             .unwrap_or_default();
         let shallow = Arc::new(shallow);
-        let (tips, stash_ids) = collect_tips(&repo, &opts.tips, cancel)?;
-
-        // The index and untracked commits of stashes are parents 2.. of the stash commit; they are never shown.
-        let mut helpers = HashSet::new();
-        let mut buf = Vec::new();
-        for stash in &stash_ids {
-            let commit = find_commit_iter(&repo, stash, &mut buf)?;
-            helpers.extend(commit.parent_ids().skip(1));
-        }
-        helpers.retain(|id| !stash_ids.contains(id));
 
         // Git ignores the commit-graph in shallow repositories (its parent lists would contradict the cut).
         let commit_graph = if shallow.is_empty() {
@@ -114,30 +112,25 @@ impl LogWalker {
         } else {
             None
         };
+        let mut table = CommitTable::new(&repo, commit_graph, shallow.clone());
+        let (tips, stash_ids) = collect_tips(&repo, &mut table, &opts.tips, cancel)?;
+
+        // The index and untracked commits of stashes are parents 2.. of the stash commit; they are never shown.
+        let mut hidden = HashSet::new();
+        let mut buf = Vec::new();
+        for stash in &stash_ids {
+            let commit = find_commit_iter(&repo, stash, &mut buf)?;
+            hidden.extend(commit.parent_ids().skip(1));
+        }
+        hidden.retain(|id| !stash_ids.contains(id));
 
         cancel.check()?;
-        let hide: HidePredicate = Box::new(move |id| !helpers.contains(id));
-        let objects = WalkObjects {
-            odb: repo.objects.clone(),
-            shallow: shallow.clone(),
-        };
-        let topo = topo::Builder::from_iters(objects, tips, None::<Vec<ObjectId>>)
-            .with_predicate(hide)
-            .sorting(match opts.order {
-                LogOrder::Date => topo::Sorting::DateOrder,
-                LogOrder::Topo => topo::Sorting::TopoOrder,
-            })
-            .parents(if opts.first_parent {
-                Parents::First
-            } else {
-                Parents::All
-            })
-            .with_commit_graph(commit_graph)
-            .build()?;
+        let topo = TopoWalk::new(table, &tips, opts.order, opts.first_parent, cancel)?;
         let decoder = CommitDecoder::new(opts.mailmap.then(|| repo.open_mailmap()));
         Ok(LogWalker {
             repo,
             topo,
+            hidden,
             first_parent: opts.first_parent,
             stash_ids,
             shallow,
@@ -174,7 +167,7 @@ impl LogWalker {
                 Some(Ok(id)) => id,
                 Some(Err(err)) => {
                     self.pending = commits;
-                    return Err(err.into());
+                    return Err(err);
                 }
             };
             match self.decoder.decode(&self.repo, id, false) {
@@ -218,18 +211,21 @@ impl LogWalker {
     }
 
     /// The next commit of the walk, after the read-ahead one.
-    fn next_id(&mut self) -> Option<gix::Result<ObjectId>> {
+    fn next_id(&mut self) -> Option<Result<ObjectId>> {
         if let Some(peeked) = self.peeked.take() {
             return Some(peeked);
         }
         if self.topo_done {
             return None;
         }
-        match self.topo.next() {
-            Some(item) => Some(item.map(|info| info.id)),
-            None => {
-                self.topo_done = true;
-                None
+        loop {
+            match self.topo.next() {
+                Some(Ok(id)) if self.hidden.contains(&id) => continue,
+                Some(item) => return Some(item),
+                None => {
+                    self.topo_done = true;
+                    return None;
+                }
             }
         }
     }
@@ -361,21 +357,20 @@ pub fn commit_info(repo: &Repo, id: ObjectId) -> Result<CommitInfo> {
 
 /// The walk's tips in the order HEAD, local branches, remote branches, tags, stashes (newest first), and the set of
 /// stash commits among them.
+///
+/// References are listed without object lookups (`internal::refscan`); each tip is then read once by the commit
+/// table, which also peels annotated tags and skips everything that is not a commit.
 fn collect_tips(
     repo: &gix::Repository,
+    table: &mut CommitTable,
     tips: &LogTips,
     cancel: &CancelToken,
-) -> Result<(Vec<ObjectId>, HashSet<ObjectId>)> {
+) -> Result<(Vec<Node>, HashSet<ObjectId>)> {
     let (remotes, tags, stashes) = match tips {
         LogTips::Explicit(ids) => {
             let mut out = Vec::with_capacity(ids.len());
             for id in ids {
-                if !is_commit(repo, id)? {
-                    return Err(not_found_commit(id));
-                }
-                if !out.contains(id) {
-                    out.push(*id);
-                }
+                out.push(table.tip(*id, false)?.ok_or_else(|| not_found_commit(id))?);
             }
             return Ok((out, HashSet::new()));
         }
@@ -387,48 +382,39 @@ fn collect_tips(
     };
 
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut add = |id: ObjectId, out: &mut Vec<ObjectId>| {
-        if seen.insert(id) {
-            out.push(id);
-        }
-    };
-    if let Some(head) = repo.head()?.id() {
-        let head = head.detach();
-        if is_commit(repo, &head)? {
-            add(head, &mut out);
-        }
+    if let Some(head) = repo.head()?.id()
+        && let Some(node) = table.tip(head.detach(), false)?
+    {
+        out.push(node);
     }
-    let platform = repo.references()?;
-    let mut namespaces = vec![platform.local_branches()?];
+    let mut namespaces = vec![RefNamespace::LocalBranches];
     if remotes {
-        namespaces.push(platform.remote_branches()?);
+        namespaces.push(RefNamespace::RemoteBranches);
     }
     if tags {
-        namespaces.push(platform.tags()?);
+        namespaces.push(RefNamespace::Tags);
     }
     let mut read = 0usize;
-    for refs in namespaces {
-        for reference in refs {
+    for namespace in namespaces {
+        for reference in refscan::scan(repo, namespace)? {
             if read.is_multiple_of(CANCEL_CHECK_INTERVAL) {
                 cancel.check()?;
             }
             read += 1;
             // Like Git, a broken or dangling ref is skipped rather than failing the whole log.
-            let mut reference = match reference {
+            let reference = match reference {
                 Ok(reference) => reference,
                 Err(err) => {
                     tracing::warn!(%err, "Ignoring an unreadable reference in the log walk");
                     continue;
                 }
             };
-            let Ok(id) = reference.peel_to_id() else {
-                tracing::debug!(name = %reference.name().as_bstr(), "Ignoring a dangling reference");
+            let Some(id) = reference.resolve(repo) else {
+                tracing::debug!(name = %reference.name.as_bstr(), "Ignoring a dangling reference");
                 continue;
             };
-            let id = id.detach();
-            if is_commit(repo, &id)? {
-                add(id, &mut out);
+            if let Some(node) = table.tip(id, true)? {
+                out.push(node);
             }
         }
     }
@@ -436,9 +422,9 @@ fn collect_tips(
     let mut stash_ids = HashSet::new();
     if stashes {
         for id in stash_commits(repo)? {
-            if is_commit(repo, &id)? {
+            if let Some(node) = table.tip(id, false)? {
                 stash_ids.insert(id);
-                add(id, &mut out);
+                out.push(node);
             }
         }
     }
@@ -477,65 +463,6 @@ fn stash_commits(repo: &gix::Repository) -> Result<Vec<ObjectId>> {
     let mut seen = HashSet::new();
     ids.retain(|id| seen.insert(*id));
     Ok(ids)
-}
-
-fn is_commit(repo: &gix::Repository, id: &ObjectId) -> Result<bool> {
-    match repo.try_find_header(*id)? {
-        Some(header) => Ok(header.kind() == gix::object::Kind::Commit),
-        None => Ok(false),
-    }
-}
-
-// ───────────────────────────── objects ─────────────────────────────
-
-/// The object access of the topological walk: the repository's object database, with the parents of shallow
-/// boundary commits cut off (as Git's shallow grafts do), so the walk never asks for commits a shallow clone lacks.
-#[derive(Clone)]
-struct WalkObjects {
-    odb: gix::OdbHandle,
-    shallow: Arc<HashSet<ObjectId>>,
-}
-
-impl gix::objs::Find for WalkObjects {
-    fn try_find<'a>(
-        &self,
-        id: &gix::oid,
-        buffer: &'a mut Vec<u8>,
-    ) -> gix::Result<Option<gix::objs::Data<'a>>> {
-        if self.shallow.is_empty() || !self.shallow.contains(id) {
-            return self.odb.try_find(id, buffer);
-        }
-        let (kind, object_hash, stripped) = match self.odb.try_find(id, buffer)? {
-            None => return Ok(None),
-            Some(data) => (
-                data.kind,
-                data.object_hash,
-                (data.kind == gix::object::Kind::Commit).then(|| without_parents(data.data)),
-            ),
-        };
-        match stripped {
-            Some(stripped) => {
-                *buffer = stripped;
-                Ok(Some(gix::objs::Data::new(buffer, kind, object_hash)))
-            }
-            // Only commits are listed as shallow; anything else is returned as stored.
-            None => self.odb.try_find(id, buffer),
-        }
-    }
-}
-
-/// `commit` without its `parent` header lines.
-fn without_parents(commit: &[u8]) -> Vec<u8> {
-    let header_end = commit.find(b"\n\n").map_or(commit.len(), |pos| pos + 1);
-    let (header, rest) = commit.split_at(header_end);
-    let mut out = Vec::with_capacity(commit.len());
-    for line in header.split_inclusive(|&b| b == b'\n') {
-        if !line.starts_with(b"parent ") {
-            out.extend_from_slice(line);
-        }
-    }
-    out.extend_from_slice(rest);
-    out
 }
 
 fn not_found_commit(id: &ObjectId) -> GitError {

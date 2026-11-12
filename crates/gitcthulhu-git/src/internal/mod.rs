@@ -12,3 +12,5 @@ pub(crate) mod outcome;
 pub(crate) mod partial;
 pub(crate) mod pathspec;
 pub(crate) mod post_state;
+pub(crate) mod refscan;
+pub(crate) mod topo;

@@ -438,7 +438,7 @@ mod tests {
             .await?;
         stream.flush().await?;
         let mut answer = String::new();
-        stream.read_line(&mut answer).await?;
+        AsyncBufReadExt::read_line(&mut stream, &mut answer).await?;
         Ok(answer.trim_end_matches(['\r', '\n']).to_owned())
     }
 

@@ -1,5 +1,8 @@
-//! The composite asset source: embedded fonts and app SVGs, the Lucide icons of [`crate::icons::AppIcon`], and the
-//! kit's default icons last (the kit source errors on unknown paths, so it must come last; spec 21 §1.4).
+//! The composite asset source: the app's own SVGs, the Lucide icons of [`crate::icons::AppIcon`], and the kit's
+//! default icons last (the kit source errors on unknown paths, so it must come last; spec 21 §1.4).
+//!
+//! The fonts are not assets: `fonts.rs` embeds them with `include_bytes!` and registers them with the text system;
+//! nothing loads a font by asset path, so embedding them here too would only add ~6 MB to the binary.
 
 use std::borrow::Cow;
 
@@ -8,7 +11,6 @@ use gpui_kit::{AssetSource, Result, SharedString};
 #[derive(rust_embed::RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/assets"]
 #[include = "icons/**/*.svg"]
-#[include = "fonts/**/*"]
 struct AppFiles;
 
 // One entry per distinct Lucide file used by `AppIcon::name`. The `app_icons_are_embedded` test keeps the list
@@ -147,10 +149,8 @@ mod tests {
             "unknown paths are not found"
         );
         assert!(
-            assets
-                .load("fonts/Inter-Regular.ttf")
-                .is_ok_and(|v| v.is_some()),
-            "embedded fonts are served"
+            !AppFiles::iter().any(|p| p.starts_with("fonts/")),
+            "fonts are embedded once, by fonts.rs (not as assets)"
         );
     }
 }

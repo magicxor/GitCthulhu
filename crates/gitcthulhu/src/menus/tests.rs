@@ -7,13 +7,12 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{App, Entity, TestAppContext, div, point, px};
 
 use super::*;
-use crate::tab::{TabCtx, TabId};
 use crate::test_support::geometry::{assert_height, bounds, init_visual, open_probe};
 
-fn target(kind: MenuKind) -> MenuTarget {
+fn target(kind: MenuKind, cx: &mut App) -> MenuTarget {
     MenuTarget {
         kind,
-        tab: TabCtx { id: TabId(1) },
+        tab: crate::test_support::inert_tab_ctx(cx),
         branch: None,
         upstream: None,
         commit: None,
@@ -53,7 +52,7 @@ fn menu_extender_inserted_at_slot_with_separator(cx: &mut TestAppContext) {
         register_extender(cx, MenuKind::LocalBranch, MenuSlot::End, ext_other_kind);
         register_extender(cx, MenuKind::Tag, MenuSlot::AfterCheckout, ext_other_kind);
 
-        let target = target(MenuKind::LocalBranch);
+        let target = target(MenuKind::LocalBranch, cx);
         let mut items = vec![MenuItem::action("checkout", "Checkout branch", |_, _| {})];
         extend(cx, MenuSlot::AfterCheckout, &target, &mut items);
         items.push(MenuItem::action("rename", "Rename branch", |_, _| {}));
@@ -76,7 +75,8 @@ fn menu_extender_inserted_at_slot_with_separator(cx: &mut TestAppContext) {
 fn extend_without_any_registration_is_a_no_op(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let mut items = vec![MenuItem::Separator];
-        extend(cx, MenuSlot::End, &target(MenuKind::Commit), &mut items);
+        let commit_target = target(MenuKind::Commit, cx);
+        extend(cx, MenuSlot::End, &commit_target, &mut items);
         assert_eq!(
             items.len(),
             1,

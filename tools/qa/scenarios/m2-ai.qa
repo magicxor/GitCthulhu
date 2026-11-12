@@ -1,0 +1,40 @@
+# Milestone 2 (X3): AI commit message generation and the AI settings page. A fake provider on a loopback port streams
+# a canned message, an in-memory key store stands in for the keychain and nothing leaves the machine. Compare with
+# 21 section 5.3 (commit box) and 5.4 (Settings > AI).
+resize 1280x720
+set theme dark
+ai use fake provider 100
+open repository linear
+wait idle
+ai prepare staged changes
+wait idle
+shot x3-01-commit-box-generate
+ai set message wip: sign-up form
+ai generate
+wait 1500
+shot x3-02-streaming-stop
+wait idle
+shot x3-03-generated
+open settings page ai
+wait idle
+shot x3-04-settings-ready
+ai test connection
+wait idle
+shot x3-05-settings-test-ok
+close dialog
+ai use hosted provider
+open settings page ai
+wait idle
+shot x3-06-settings-hosted-key-stored
+close dialog
+ai set message
+ai generate
+wait idle
+shot x3-07-privacy-consent
+close dialog
+ai reset
+open settings page ai
+wait idle
+shot x3-08-settings-not-configured
+close dialog
+assert no error

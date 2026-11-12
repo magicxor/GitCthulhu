@@ -4,10 +4,40 @@ version = "0.0.0"
 edition.workspace = true
 publish = false
 rust-version.workspace = true
-description = "Forge, AI and update services for the GitCthulhu GUI (placeholder, filled by WP-S0)"
+description = "Forge, AI and update services for the GitCthulhu GUI, sharing one tokio runtime"
 
 [lib]
+name = "gitcthulhu_services"
 doctest = false
+
+[features]
+default = ["forge", "ai", "update"]
+forge = [
+    "dep:but-forge", "dep:but-forge-storage", "dep:but-github", "dep:but-gitlab", "dep:but-bitbucket",
+    "dep:but-db", "dep:gix",
+]
+ai = ["dep:but-llm"]
+update = ["dep:but-update", "dep:but-db"]
+
+[dependencies]
+gitcthulhu-git.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros", "sync"] }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver = { version = "1", features = ["serde"] }
+but-secret.workspace = true
+
+but-forge = { workspace = true, optional = true }
+but-forge-storage = { workspace = true, optional = true }
+but-github = { workspace = true, optional = true }
+but-gitlab = { workspace = true, optional = true }
+but-bitbucket = { workspace = true, optional = true }
+but-db = { workspace = true, optional = true }
+gix = { workspace = true, optional = true }
+but-llm = { workspace = true, optional = true }
+but-update = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -1,8 +1,8 @@
 //! Blame and file-history reads (owned by G8 after G0b; spec 21 §2.4).
 
 use super::{
-    BlameOptions, BlameResult, BlameRev, CancelToken, FileHistoryPage, FileHistoryWalker, GitError,
-    RelaPath, Repo,
+    Against, BlameOptions, BlameResult, BlameRev, CancelToken, DiffTarget, FileDiff,
+    FileHistoryEntry, FileHistoryPage, FileHistoryWalker, GitError, RelaPath, Repo,
 };
 
 /// Blame of `path` at `rev`, following renames.
@@ -36,4 +36,21 @@ impl HistoryPager {
     pub fn next(&mut self, n: usize, cancel: &CancelToken) -> Result<FileHistoryPage, GitError> {
         self.walker.next_page(n, cancel)
     }
+}
+
+/// The diff a history entry made to its file: the commit against its first parent, at the file's path in that
+/// commit (renames carry the previous path). `full_file` is Gitnuro's "view the complete file".
+pub fn commit_diff(
+    repo: &Repo,
+    entry: &FileHistoryEntry,
+    full_file: bool,
+    cancel: &CancelToken,
+) -> Result<FileDiff, GitError> {
+    let target = DiffTarget::Commit {
+        commit: entry.commit.id,
+        against: Against::FirstParent,
+        path: entry.path.clone(),
+        previous_path: entry.previous_path.clone(),
+    };
+    super::diff::file_diff(repo, &target, full_file, cancel)
 }

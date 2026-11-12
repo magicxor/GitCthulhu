@@ -296,9 +296,10 @@ fn present_table_rows(cx: &mut TestAppContext) {
             data.message
                 .contains("'feature' is checked out in another worktree")
         );
-        assert!(
-            data.extra.is_none(),
-            "milestone 1: no open-in-new-tab action"
+        assert_eq!(
+            data.extra.as_ref().map(|e| e.label.to_string()),
+            Some("Open worktree in new tab".to_owned()),
+            "X6: the dialog offers to open the worktree in a new tab"
         );
 
         let data = dialog(p(

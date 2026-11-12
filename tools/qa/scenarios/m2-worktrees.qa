@@ -1,0 +1,71 @@
+# Milestone 2 (X6): the Worktrees side-panel section on the linear fixture, dark, 1280x720. Four linked worktrees are
+# added through the same operations the Add worktree dialog uses (new branch, new branch from HEAD, detached, locked),
+# then the section, the row and header menus, the dialog, a worktree opened in its own tab, a vanished (prunable)
+# worktree and Prune, Remove, and the branch menu of the freed branch with "Create worktree...". Compare with spec 21
+# section 5.7 and the side-panel layout (07 section 6).
+resize 1280x720
+set theme dark
+open repository linear
+wait idle
+assert worktree count 1
+worktree add $REPOS/linear-login new feature/login
+wait idle
+worktree add $REPOS/linear-hotfix new hotfix/crash from head
+wait idle
+worktree add $REPOS/linear-v1 detach head
+wait idle
+worktree add $REPOS/linear-release new release/1.0 lock Release candidate frozen
+wait idle
+assert worktree count 5
+assert worktree linear-login branch feature/login
+assert worktree linear-v1 detached
+assert worktree linear-release locked
+shot m2-x6-01-section-collapsed
+expand worktrees section
+wait idle
+shot m2-x6-02-section-expanded
+open worktree menu linear-login at 130 520
+wait idle
+shot m2-x6-03-row-menu
+close menu
+open worktree menu linear-release at 130 540
+wait idle
+shot m2-x6-04-row-menu-locked
+close menu
+open worktrees menu at 130 420
+wait idle
+shot m2-x6-05-header-menu
+close menu
+open dialog add-worktree
+assert dialog open
+wait idle
+shot m2-x6-06-add-dialog
+close dialog
+wait idle
+open worktree linear-login
+wait idle
+assert tab count 2
+assert tab title linear-login
+shot m2-x6-07-worktree-tab
+select tab 1
+wait idle
+worktree vanish linear-hotfix
+wait idle
+assert worktree linear-hotfix prunable
+shot m2-x6-08-prunable
+worktree prune
+wait idle
+assert worktree count 4
+worktree unlock linear-release
+wait idle
+assert worktree linear-release unlocked
+worktree remove linear-release
+wait idle
+assert worktree count 3
+shot m2-x6-09-after-remove
+# release/1.0 is free again: its branch menu offers "Create worktree..." right after "Checkout branch".
+open context menu branch release/1.0 at 130 200
+wait idle
+shot m2-x6-10-branch-menu-create-worktree
+close menu
+assert no error

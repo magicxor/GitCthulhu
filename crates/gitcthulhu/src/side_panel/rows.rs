@@ -269,6 +269,14 @@ impl SidePanelView {
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_section(section, cx)),
             )
+            .when(section == Section::Worktrees, |header| {
+                // D0.7 (X6): right-click on the Worktrees header opens its menu (Add worktree, Prune worktrees).
+                let target = menus::worktree::header_target(&self.ctx);
+                header.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                    let items = menus::worktree::worktrees_header(&target, cx);
+                    menus::open_context_menu(window, cx, ev.position, items);
+                })
+            })
             .child(
                 div()
                     .flex_none()

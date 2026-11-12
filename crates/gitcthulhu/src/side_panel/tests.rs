@@ -579,8 +579,8 @@ fn rows_and_indents(cx: &mut TestAppContext) {
             "Tags is collapsed by default"
         );
         assert!(
-            window.try_find(ids::header(Section::Worktrees)).is_none(),
-            "no Worktrees section in milestone 1"
+            y(Section::Submodules) < y(Section::Worktrees),
+            "X6: the Worktrees section follows Submodules"
         );
     })
     .expect("window");
@@ -1060,6 +1060,8 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
         item_ids(&items),
         [
             "branch-checkout",
+            "branch-create-worktree",
+            "---",
             "branch-merge",
             "branch-rebase",
             "---",
@@ -1070,12 +1072,13 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
             "---",
             "branch-copy-name"
         ],
-        "a local branch other than the current one"
+        "a local branch other than the current one (with X6's Create worktree…)"
     );
     assert_eq!(
         item_labels(&items),
         [
             "Checkout branch",
+            "Create worktree…",
             "Merge branch",
             "Rebase branch",
             "Rename branch",
@@ -1139,6 +1142,8 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
         item_ids(&items),
         [
             "branch-checkout",
+            "branch-create-worktree",
+            "---",
             "branch-rename",
             "branch-upstream",
             "---",
@@ -1146,7 +1151,7 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
             "---",
             "branch-copy-name"
         ],
-        "detached HEAD: merge and rebase are hidden, and so is their separator (08 §2.13)"
+        "detached HEAD: merge and rebase are hidden, and so is their separator (08 §2.13); the separator after X6's Create worktree… is the one `menus::extend` adds after an extender's items"
     );
     let items = menu_of(
         &tab,
@@ -1328,6 +1333,7 @@ fn branch_menu_calls_extender_slots(cx: &mut TestAppContext) {
         item_ids(&items),
         [
             "branch-checkout",
+            "branch-create-worktree",
             "x-after-checkout",
             "---",
             "branch-merge",
@@ -1513,7 +1519,11 @@ fn ten_thousand_tags_virtualized(cx: &mut TestAppContext) {
             (rows, rendered)
         })
         .expect("window");
-    assert_eq!(rows, 5 + 10_000, "five headers and one row per tag");
+    assert_eq!(
+        rows,
+        6 + 10_000,
+        "six headers (X6 adds Worktrees) and one row per tag"
+    );
     assert!(
         (10..=40).contains(&rendered),
         "only the visible rows exist as elements, got {rendered}"
@@ -1529,7 +1539,11 @@ fn ten_thousand_tags_virtualized(cx: &mut TestAppContext) {
     frame(cx, handle);
     let rows = cx.update(|cx| view.read(cx).built.rows.len());
     // v99, v990-v999, v9900-v9999: 1 + 10 + 100.
-    assert_eq!(rows, 5 + 111, "the filtered rows");
+    assert_eq!(
+        rows,
+        6 + 111,
+        "the filtered rows (six headers with X6's Worktrees)"
+    );
 }
 
 /// 21 §2.6, §4.3: after a paint the panel asks for the ahead/behind of the VISIBLE tracking branches only, each pair
@@ -1665,41 +1679,6 @@ fn ahead_behind_asked_again_when_a_pair_returns(cx: &mut TestAppContext) {
     set_main_target(cx, oid(10));
     frame(cx, handle);
     assert_eq!(asked(cx), 3, "the original pair is asked for again");
-}
-
-#[gpui_kit::test]
-fn worktrees_section_absent_in_m1(cx: &mut TestAppContext) {
-    let mut seed = refs_seed();
-    seed.worktrees = vec![crate::backend::WorktreeInfo {
-        id: None,
-        path: std::path::PathBuf::from("/tmp/wt"),
-        git_dir: std::path::PathBuf::from("/tmp/wt/.git"),
-        head: None,
-        is_current: true,
-        locked: None,
-        prunable: false,
-        bare: false,
-    }];
-    let (handle, _app, tab) = mount_seeded(cx, seed, DEFAULT_SIZE);
-    frame(cx, handle);
-    let view = view_of(&tab, cx);
-    let has_worktree_rows = cx.update(|cx| {
-        view.read(cx).built.rows.iter().any(|r| {
-            matches!(
-                r,
-                SideRow::Worktree { .. }
-                    | SideRow::Header {
-                        section: Section::Worktrees,
-                        ..
-                    }
-            )
-        })
-    });
-    assert!(!has_worktree_rows, "milestone 1: no Worktrees section");
-    cx.update_window(handle, |_, window, _| {
-        assert!(window.try_find(ids::header(Section::Worktrees)).is_none());
-    })
-    .expect("window");
 }
 
 // ---- operation flows (scripted outcomes) ------------------------------------------------------------------------

@@ -110,6 +110,7 @@ fn build_items(
             let mut target = base(MenuKind::LocalBranch, ctx);
             target.upstream = tracking(&branch);
             target.is_current = branch.is_head;
+            target.checked_out_elsewhere = branch.checked_out_in.is_some();
             target.commit = Some(branch.target);
             target.branch = Some(branch.full);
             menus::refs::local_branch(&target, cx)

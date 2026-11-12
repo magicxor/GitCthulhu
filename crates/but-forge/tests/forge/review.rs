@@ -7,6 +7,11 @@ use but_forge::{
     restore_native_stacks, sync_reviews, update_review,
 };
 
+/// Run `future` to completion; the code under test is async, the tests are not.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Runtime::new().unwrap().block_on(future)
+}
+
 fn cached_review(number: i64, merged_at: Option<&str>, closed_at: Option<&str>) -> ForgeReview {
     ForgeReview {
         html_url: format!("https://github.com/o/r/pull/{number}"),
@@ -49,7 +54,7 @@ fn missing_credentials_do_not_turn_a_stale_cache_into_an_empty_listing() {
         .set_all(vec![cached_review(1, None, None).try_into().unwrap()])
         .unwrap();
 
-    let reviews = list_forge_reviews_with_cache(
+    let reviews = block_on(list_forge_reviews_with_cache(
         None,
         &repo_info("owner", "repo"),
         &storage,
@@ -57,7 +62,7 @@ fn missing_credentials_do_not_turn_a_stale_cache_into_an_empty_listing() {
         Some(CacheConfig::CacheWithFallback {
             max_age_seconds: 300,
         }),
-    )
+    ))
     .unwrap();
 
     let listed: Vec<i64> = reviews.iter().map(|review| review.number).collect();
@@ -164,7 +169,13 @@ fn cached_reviews_and_empty_sync_do_not_require_accounts() -> Result<()> {
             max_age_seconds: 300,
         },
     ] {
-        let reviews = list_forge_reviews_with_cache(None, &repo, &storage, &mut db, Some(cache))?;
+        let reviews = block_on(list_forge_reviews_with_cache(
+            None,
+            &repo,
+            &storage,
+            &mut db,
+            Some(cache),
+        ))?;
         assert_eq!(
             (reviews.len(), reviews[0].number),
             (1, 1),

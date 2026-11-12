@@ -16,7 +16,9 @@ pub use association::{
     reviews_by_head, without_unrelated_forks,
 };
 pub use ci::{CiCheck, CiConclusion, CiOutput, CiStatus, ci_checks_for_ref_with_cache};
-pub use forge_info::{ForgeCapabilities, ForgeInfo, ForgeUnitInfo, compare_branch_url, forge_info};
+pub use forge_info::{
+    ForgeCapabilities, ForgeInfo, ForgeUnitInfo, branch_url, compare_branch_url, forge_info,
+};
 pub use repo::{RepoInfo, RepoPermissions, get_repo_info};
 pub use review::{
     CacheConfig, CreateForgeReviewParams, ForgeAccountValidity, ForgeReview, ForgeReviewComment,
@@ -50,21 +52,20 @@ fn determine_forge_from_host(host: &str) -> Option<ForgeName> {
 /// Derive the forge repository information from a remote URL.
 ///
 /// The forge type is resolved by `resolve_forge_name`: the URL host first,
-/// then a match against configured accounts' custom hosts, and finally the
-/// project's `override_forge` (from its stored `forge_override`) as a last
-/// resort. Pass `None` for `override_forge` when no project preference applies,
-/// e.g. when comparing two arbitrary remote URLs for identity.
+/// then a match against the custom hosts of `accounts` (the known forge accounts, see
+/// [`all_forge_accounts()`]), and finally the project's `override_forge` (from its stored
+/// forge override) as a last resort. Pass `None` for `override_forge` when no project
+/// preference applies, e.g. when comparing two arbitrary remote URLs for identity, and an
+/// empty `accounts` when no account is known.
 pub fn derive_forge_repo_info(
     url: &str,
     override_forge: Option<ForgeName>,
+    accounts: &[ForgeUser],
 ) -> Option<ForgeRepoInfo> {
     let remote = remote_url::RemoteUrl::parse(url)?;
     let forge = resolve_forge_name(&remote.host, override_forge, || {
-        // Only fetch the accounts if the forge type can't be determined from the
-        // repository's host - reading them involves retrieving data from storage.
-        get_all_forge_accounts()
-            .unwrap_or_default()
-            .into_iter()
+        accounts
+            .iter()
             .filter(|account| {
                 account_matches_repository(
                     account,
@@ -78,6 +79,7 @@ pub fn derive_forge_repo_info(
                     },
                 )
             })
+            .cloned()
             .collect()
     })?;
     let (owner, repo) = remote.repository_parts(&forge)?;
@@ -239,7 +241,9 @@ fn account_matches_repository(account: &ForgeUser, repo: &ForgeRepoInfo) -> bool
 
 /// Select only stored accounts for the repository's forge and host. A saved
 /// preference must itself be eligible; it never falls back to another account.
-pub(crate) fn find_forge_account(
+///
+/// This reads the account list from `storage`, never the secrets, so it needs neither network nor keychain.
+pub fn find_forge_account(
     preferred: &Option<ForgeUser>,
     repo: &ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
@@ -278,29 +282,29 @@ pub(crate) fn resolve_account(
     }
     find_forge_account(preferred, repo, storage)?.map(Some).ok_or_else(|| {
         let message = format!(
-            "Not authenticated with {:?} for '{}'. No stored account matches this host and account preference. Connect an account for this host under Settings → Integrations, or run 'but config forge auth'.",
+            "Not authenticated with {:?} for '{}'. No stored account matches this host and account preference. Connect an account for this host under Settings > Accounts.",
             repo.forge, repo.host
         );
         anyhow::anyhow!(but_error::Context::new(message).with_code(but_error::Code::ForgeNotAuthenticated))
     })
 }
 
-/// Get all known forge accounts
-pub fn get_all_forge_accounts() -> anyhow::Result<Vec<ForgeUser>> {
-    let storage = but_forge_storage::Controller::from_path(but_path::app_data_dir()?);
-    let gh_accounts = but_github::list_known_github_accounts(&storage)?;
-    let gl_accounts = but_gitlab::list_known_gitlab_accounts(&storage)?;
-
-    let mut forge_users = vec![];
-    for gh_account in gh_accounts {
-        forge_users.push(ForgeUser::GitHub(gh_account));
-    }
-
-    for gl_account in gl_accounts {
-        forge_users.push(ForgeUser::GitLab(gl_account));
-    }
-
-    Ok(forge_users)
+/// All accounts known to `storage`: GitHub, then GitLab, then Bitbucket ones.
+///
+/// Reads the account list only, never the secrets.
+pub fn all_forge_accounts(
+    storage: &but_forge_storage::Controller,
+) -> anyhow::Result<Vec<ForgeUser>> {
+    let github = but_github::list_known_github_accounts(storage)?
+        .into_iter()
+        .map(ForgeUser::GitHub);
+    let gitlab = but_gitlab::list_known_gitlab_accounts(storage)?
+        .into_iter()
+        .map(ForgeUser::GitLab);
+    let bitbucket = but_bitbucket::list_known_bitbucket_accounts(storage)?
+        .into_iter()
+        .map(ForgeUser::Bitbucket);
+    Ok(github.chain(gitlab).chain(bitbucket).collect())
 }
 
 #[cfg(test)]
@@ -380,6 +384,33 @@ mod tests {
     };
 
     #[test]
+    fn all_forge_accounts_lists_every_forge_including_bitbucket() {
+        let (_tmp, storage, expected) = accounts();
+        assert_eq!(
+            super::all_forge_accounts(&storage).unwrap(),
+            expected,
+            "GitHub, GitLab and Bitbucket accounts, in that order"
+        );
+    }
+
+    #[test]
+    fn derive_forge_repo_info_takes_self_hosted_hosts_from_the_accounts_it_is_given() {
+        let account = GitLab(Gl::selfhosted("alice", "https://code.example/api/v4"));
+        let remote = "git@code.example:group/repo.git";
+        assert!(
+            derive_forge_repo_info(remote, None, &[]).is_none(),
+            "an unknown host is no forge without an account that claims it"
+        );
+        let found = derive_forge_repo_info(remote, None, &[account])
+            .expect("the account's host is a GitLab");
+        assert_eq!(
+            (found.forge, found.owner.as_str(), found.repo.as_str()),
+            (ForgeName::GitLab, "group", "repo"),
+            "the given accounts decide, not any global storage"
+        );
+    }
+
+    #[test]
     fn account_resolution_selects_the_matching_instance_not_the_first_saved_account() {
         let (_tmp, storage, public) = accounts();
         let endpoint = "https://code.example:8443/api/v4";
@@ -449,7 +480,7 @@ mod tests {
             "code.private.example",
         ] {
             let remote = format!("https://{host}/owner/repo");
-            let repository = derive_forge_repo_info(&remote, Some(ForgeName::GitLab)).unwrap();
+            let repository = derive_forge_repo_info(&remote, Some(ForgeName::GitLab), &[]).unwrap();
             assert_eq!(
                 find_forge_account(&None, &repository, &storage).unwrap(),
                 None,
@@ -502,13 +533,14 @@ mod tests {
     #[test]
     fn azure_repository_identity_matches_public_ssh_and_https_urls() {
         let https =
-            derive_forge_repo_info("https://dev.azure.com/org/project/_git/repo", None).unwrap();
+            derive_forge_repo_info("https://dev.azure.com/org/project/_git/repo", None, &[])
+                .unwrap();
         for url in [
             "git@ssh.dev.azure.com:v3/org/project/repo.git",
             "ssh://git@SSH.DEV.AZURE.COM.:2222/v3/org/project/repo.git",
             "git@dev.azure.com:v3/org/project/repo.git",
         ] {
-            let ssh = derive_forge_repo_info(url, None).unwrap();
+            let ssh = derive_forge_repo_info(url, None, &[]).unwrap();
             assert!(
                 https.same_repository(&ssh),
                 "Azure aliases identify the same repository: {url}"

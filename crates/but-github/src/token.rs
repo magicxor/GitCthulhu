@@ -105,8 +105,10 @@ impl GithubAccountIdentifier {
             GithubAccountIdentifier::PatUsername { username } => {
                 format!("github_pat_{username}")
             }
-            GithubAccountIdentifier::Enterprise { host, .. } => {
-                format!("github_enterprise_{host}")
+            // The user name is part of the key: two users of one Enterprise host must not
+            // overwrite each other's token and cached profile.
+            GithubAccountIdentifier::Enterprise { username, host } => {
+                format!("github_enterprise_{username}_{host}")
             }
         }
     }
@@ -295,4 +297,27 @@ fn find_stored_github_account(
         .github_accounts()?
         .into_iter()
         .find(|account| GithubAccountIdentifier::from(account) == *account_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GithubAccountIdentifier as Id;
+
+    #[test]
+    fn enterprise_keys_tell_the_users_of_one_host_apart() {
+        let host = "https://ghe.example.com/api/v3";
+        let (alice, bob) = (Id::enterprise("alice", host), Id::enterprise("bob", host));
+        assert_ne!(
+            alice.cache_key(),
+            bob.cache_key(),
+            "two users of one Enterprise host must not share a token or a cached profile"
+        );
+        assert_eq!(
+            alice.cache_key(),
+            "github_enterprise_alice_https://ghe.example.com/api/v3",
+            "the key names user and host"
+        );
+        assert_eq!(Id::pat("alice").cache_key(), "github_pat_alice");
+        assert_eq!(Id::oauth("alice").cache_key(), "github_oauth_alice");
+    }
 }

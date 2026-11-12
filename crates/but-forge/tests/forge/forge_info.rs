@@ -1,4 +1,4 @@
-use but_forge::{ForgeName, ForgeUser, compare_branch_url, forge_info};
+use but_forge::{ForgeName, ForgeUser, branch_url, compare_branch_url, forge_info};
 
 // Recognizable hosts resolve without account storage; override tests use
 // synthetic hosts with no matching stored accounts.
@@ -458,5 +458,37 @@ fn ssh_alias_hosts_yield_public_web_urls() {
     assert_eq!(
         composed_pr_url("git@ssh.bitbucket.org:owner/repo.git", 42),
         "https://bitbucket.org/owner/repo/pull-requests/42"
+    );
+}
+
+#[test]
+fn branch_urls_per_forge_encode_each_path_segment() {
+    for (remote, expected) in [
+        (
+            "git@github.com:owner/repo.git",
+            "https://github.com/owner/repo/tree/feat/a%20b%23c",
+        ),
+        (
+            "https://gitlab.com/group/sub/repo.git",
+            "https://gitlab.com/group/sub/repo/-/tree/feat/a%20b%23c",
+        ),
+        (
+            "https://bitbucket.org/owner/repo",
+            "https://bitbucket.org/owner/repo/branch/feat/a%20b%23c",
+        ),
+        (
+            "git@ssh.dev.azure.com:v3/org/project/repo",
+            "https://dev.azure.com/org/project/_git/repo?version=GBfeat%2Fa%20b%23c",
+        ),
+    ] {
+        assert_eq!(
+            branch_url(remote, "feat/a b#c", &[], None).as_deref(),
+            Some(expected),
+            "branch URL of {remote}"
+        );
+    }
+    assert!(
+        branch_url("https://example.com/owner/repo", "main", &[], None).is_none(),
+        "a remote on no forge has no branch URL"
     );
 }

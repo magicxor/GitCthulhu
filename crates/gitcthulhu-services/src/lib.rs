@@ -42,22 +42,23 @@ impl Services {
         but_secret::secret::set_application_namespace(SECRET_NAMESPACE);
         let runtime = Runtime::new()?;
         let _ = &cfg; // unused when neither `forge` nor `update` is enabled
-        #[cfg(feature = "forge")]
-        let forge = forge::ForgeHub::new(
-            runtime.clone(),
-            forge::ForgeDirs {
-                app_data: cfg.app_data_dir.clone(),
-                cache: cfg.cache_dir.clone(),
-            },
-            forge::ForgeConfig {
-                github_oauth_client_id: cfg.github_oauth_client_id.clone(),
-                user_agent: cfg.user_agent.clone(),
-            },
-        )?;
         #[cfg(feature = "ai")]
         let ai = ai::AiService::new(runtime.clone());
         #[cfg(feature = "update")]
         let update = update::UpdateService::new(runtime.clone(), &cfg);
+        // Last, so that it can take the configuration's fields instead of copies.
+        #[cfg(feature = "forge")]
+        let forge = forge::ForgeHub::new(
+            runtime.clone(),
+            forge::ForgeDirs {
+                app_data: cfg.app_data_dir,
+                cache: cfg.cache_dir,
+            },
+            forge::ForgeConfig {
+                github_oauth_client_id: cfg.github_oauth_client_id,
+                user_agent: cfg.user_agent,
+            },
+        )?;
         Ok(Services {
             runtime,
             #[cfg(feature = "forge")]

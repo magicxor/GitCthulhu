@@ -511,8 +511,11 @@ pub enum CacheConfig {
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(CacheConfig);
 
-/// List the open reviews (e.g. pull requests) for a given forge repository
-pub fn list_forge_reviews_with_cache(
+/// List the open reviews (e.g. pull requests) for a given forge repository.
+///
+/// Dropping the returned future abandons the request (and closes its connection); the cache is written
+/// only after the forge has answered, so a cancelled call leaves it untouched.
+pub async fn list_forge_reviews_with_cache(
     preferred_forge_user: Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
@@ -534,7 +537,7 @@ pub fn list_forge_reviews_with_cache(
             {
                 return Ok(reviews.into_iter().filter(ForgeReview::is_open).collect());
             }
-            match sync_listed_reviews(preferred_forge_user, forge_repo_info, storage, db) {
+            match sync_listed_reviews(preferred_forge_user, forge_repo_info, storage, db).await {
                 Ok(reviews) => reviews,
                 Err(err) => {
                     let cached_open: Vec<ForgeReview> = crate::list_cached_forge_reviews(db)?
@@ -550,7 +553,7 @@ pub fn list_forge_reviews_with_cache(
             }
         }
         CacheConfig::NoCache => {
-            sync_listed_reviews(preferred_forge_user, forge_repo_info, storage, db)?
+            sync_listed_reviews(preferred_forge_user, forge_repo_info, storage, db).await?
         }
     };
     Ok(reviews)
@@ -589,18 +592,19 @@ fn serves_stale_reviews(err: &anyhow::Error, has_open_reviews: bool) -> bool {
 /// stale open listing cannot overwrite a fate just learned. A failed sweep
 /// degrades to the pre-sweep behavior — the vanished row is deleted once its
 /// grace expires — rather than blocking the sync.
-fn sync_listed_reviews(
+async fn sync_listed_reviews(
     preferred_forge_user: Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
     db: &mut but_db::DbHandle,
 ) -> Result<Vec<ForgeReview>> {
-    let reviews = list_forge_reviews(&preferred_forge_user, forge_repo_info, storage)?;
+    let reviews = list_forge_reviews(&preferred_forge_user, forge_repo_info, storage).await?;
     let cached_states = crate::db::cached_review_states(db).unwrap_or_default();
     let mut to_cache = reviews.clone();
     if open_review_vanished(&cached_states, &reviews) {
         let settled =
             list_recently_settled_reviews(&preferred_forge_user, forge_repo_info, storage)
+                .await
                 .unwrap_or_default();
         to_cache.extend(
             fates_to_record(&settled, &cached_states)
@@ -647,7 +651,7 @@ fn fates_to_record<'a>(
 /// One page of the forge's most recently updated merged/closed reviews,
 /// newest first. Forges without an implementation report nothing, which
 /// leaves their reconcile behavior as it was.
-fn list_recently_settled_reviews(
+async fn list_recently_settled_reviews(
     preferred_forge_user: &Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
@@ -661,80 +665,37 @@ fn list_recently_settled_reviews(
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.github().cloned());
-            let owner = owner.clone();
-            let repo = repo.clone();
-            let storage = storage.clone();
-
-            let pulls = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to create a runtime for the settled-review sweep: {e}"
-                        )
-                    })?
-                    .block_on(but_github::pr::list_recently_closed(
-                        preferred_account.as_ref(),
-                        &owner,
-                        &repo,
-                        &storage,
-                    ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-
-            pulls.into_iter().map(ForgeReview::from).collect()
+            but_github::pr::list_recently_closed(preferred_account.as_ref(), owner, repo, storage)
+                .await?
+                .into_iter()
+                .map(ForgeReview::from)
+                .collect()
         }
         ForgeName::GitLab => {
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.gitlab().cloned());
             let project_id = GitLabProjectId::new(owner, repo);
-            let storage = storage.clone();
-
-            let mrs = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to create a runtime for the settled-review sweep: {e}"
-                        )
-                    })?
-                    .block_on(but_gitlab::mr::list_recently_closed(
-                        preferred_account.as_ref(),
-                        project_id,
-                        &storage,
-                    ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-
-            mrs.into_iter().map(ForgeReview::from).collect()
+            but_gitlab::mr::list_recently_closed(preferred_account.as_ref(), project_id, storage)
+                .await?
+                .into_iter()
+                .map(ForgeReview::from)
+                .collect()
         }
         ForgeName::Bitbucket => {
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.bitbucket().cloned());
-            let workspace = owner.clone();
-            let repo_slug = repo.clone();
-            let storage = storage.clone();
-
-            let prs = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to create a runtime for the settled-review sweep: {e}"
-                        )
-                    })?
-                    .block_on(but_bitbucket::pr::list_recently_closed(
-                        preferred_account.as_ref(),
-                        &workspace,
-                        &repo_slug,
-                        &storage,
-                    ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-
-            prs.into_iter().map(ForgeReview::from).collect()
+            but_bitbucket::pr::list_recently_closed(
+                preferred_account.as_ref(),
+                owner,
+                repo,
+                storage,
+            )
+            .await?
+            .into_iter()
+            .map(ForgeReview::from)
+            .collect()
         }
         _ => Vec::new(),
     };
@@ -753,7 +714,7 @@ pub fn cache_review(db: &mut but_db::DbHandle, review: &ForgeReview) -> Result<(
     crate::db::upsert_review(db, review)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ForgeAccountValidity {
     Valid,
@@ -823,7 +784,7 @@ pub async fn check_forge_account_is_valid(
     }
 }
 
-fn list_forge_reviews(
+async fn list_forge_reviews(
     preferred_forge_user: &Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
@@ -837,26 +798,8 @@ fn list_forge_reviews(
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.github().cloned());
-
-            // Clone owned data for thread
-            let owner = owner.clone();
-            let repo = repo.clone();
-            let storage = storage.clone();
-
-            let pulls = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(but_github::pr::list(
-                        preferred_account.as_ref(),
-                        &owner,
-                        &repo,
-                        &storage,
-                    ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-
-            pulls
+            but_github::pr::list(preferred_account.as_ref(), owner, repo, storage)
+                .await?
                 .into_iter()
                 .map(ForgeReview::from)
                 .collect::<Vec<ForgeReview>>()
@@ -865,24 +808,10 @@ fn list_forge_reviews(
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.gitlab().cloned());
-
-            // Clone owned data for thread
             let project_id = GitLabProjectId::new(owner, repo);
-            let storage = storage.clone();
-
-            let mrs = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(but_gitlab::mr::list(
-                        preferred_account.as_ref(),
-                        project_id,
-                        &storage,
-                    ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-
-            mrs.into_iter()
+            but_gitlab::mr::list(preferred_account.as_ref(), project_id, storage)
+                .await?
+                .into_iter()
                 .map(ForgeReview::from)
                 .collect::<Vec<ForgeReview>>()
         }
@@ -890,26 +819,9 @@ fn list_forge_reviews(
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.bitbucket().cloned());
-
-            // Clone owned data for thread
-            let workspace = owner.clone();
-            let repo_slug = repo.clone();
-            let storage = storage.clone();
-
-            let prs = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(but_bitbucket::pr::list(
-                        preferred_account.as_ref(),
-                        &workspace,
-                        &repo_slug,
-                        &storage,
-                    ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-
-            prs.into_iter()
+            but_bitbucket::pr::list(preferred_account.as_ref(), owner, repo, storage)
+                .await?
+                .into_iter()
                 .map(ForgeReview::from)
                 .collect::<Vec<ForgeReview>>()
         }
@@ -1488,35 +1400,20 @@ pub async fn get_review_merge_status(
 /// Get a specific review (e.g. pull request) for a given forge repository
 ///
 /// The resulting review will be cached.
-pub fn get_forge_review(
+pub async fn get_forge_review(
     preferred_forge_user: &Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     review_number: usize,
     db: &mut but_db::DbHandle,
     storage: &but_forge_storage::Controller,
 ) -> Result<ForgeReview> {
-    let preferred_forge_user = preferred_forge_user.clone();
-    let forge_repo_info = forge_repo_info.clone();
-    let storage = storage.clone();
-
-    let review = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed fetch review {review_number}: failed to create Tokio runtime: {e}"
-            )
-        })?;
-
-        runtime.block_on(get_forge_review_inner(
-            &preferred_forge_user,
-            &forge_repo_info,
-            review_number,
-            &storage,
-        ))
-    })
-    .join()
-    .map_err(|e| {
-        anyhow::anyhow!("Failed to fetch review {review_number}: thread panicked: {e:?}")
-    })??;
+    let review = get_forge_review_inner(
+        preferred_forge_user,
+        forge_repo_info,
+        review_number,
+        storage,
+    )
+    .await?;
 
     // Cache the review and ignore any issues, if any.
     crate::db::upsert_review(db, &review).ok();
@@ -3033,7 +2930,9 @@ mod tests {
                 repo.host = "forge.example.com".into();
                 for preferred in std::iter::once(None).chain(accounts.iter().cloned().map(Some)) {
                     for error in [
-                        list_forge_reviews(&preferred, &repo, &storage).unwrap_err(),
+                        list_forge_reviews(&preferred, &repo, &storage)
+                            .await
+                            .unwrap_err(),
                         create_forge_review(&preferred, &repo, &None, &review_params(), &storage)
                             .await
                             .unwrap_err(),
@@ -3097,6 +2996,7 @@ mod tests {
             let azure = crate::derive_forge_repo_info(
                 "git@ssh.dev.azure.com:v3/org/project/repo.git",
                 None,
+                &[],
             )
             .unwrap();
             let error = create_forge_review(
@@ -3121,12 +3021,16 @@ mod tests {
                     access_token_key: "unused-fork-token".into(),
                 },
             )?;
-            let base =
-                crate::derive_forge_repo_info("git@gitlab.private.example:target/repo.git", None)
-                    .unwrap();
+            let base = crate::derive_forge_repo_info(
+                "git@gitlab.private.example:target/repo.git",
+                None,
+                &[],
+            )
+            .unwrap();
             let push = crate::derive_forge_repo_info(
                 "https://gitlab.private.example:9443/fork/repo.git",
                 None,
+                &[],
             )
             .unwrap();
             // The SSH base cannot constrain the port; the HTTP fork must reject the 8443 client.

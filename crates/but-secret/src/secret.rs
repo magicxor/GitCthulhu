@@ -180,16 +180,20 @@ pub fn application_namespace() -> String {
 fn entry_for(handle: &str, namespace: Namespace) -> Result<keyring::Entry> {
     let ns = match namespace {
         Namespace::BuildKind => NAMESPACE.lock().unwrap().clone(),
-        Namespace::Global => "gitbutler".into(),
+        Namespace::Global => "gitcthulhu".into(),
     };
     Ok(keyring::Entry::new(
         &format!(
             "{prefix}-{handle}",
             prefix = if ns.is_empty() { "development" } else { &ns }
         ),
-        "GitButler",
+        KEYRING_USER,
     )?)
 }
+
+/// The user name of every keyring entry. Together with the `<namespace>-<handle>` service name it keeps
+/// GitCthulhu's entries apart from every other application's, GitButler's included.
+const KEYRING_USER: &str = "GitCthulhu";
 
 /// How to further specialize secrets to avoid name clashes in the globally shared keystore.
 static NAMESPACE: Mutex<String> = Mutex::new(String::new());
@@ -359,9 +363,9 @@ pub mod git_credentials {
         )> {
             let url = gix::Url::from_parts(
                 gix::url::Scheme::Https,
-                Some("gitbutler-secrets".into()),
+                Some("gitcthulhu-secrets".into()),
                 password.map(ToOwned::to_owned),
-                Some("gitbutler.com".into()),
+                Some("gitcthulhu.invalid".into()),
                 None,
                 format!("/{handle}").into(),
                 false,

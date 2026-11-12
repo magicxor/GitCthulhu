@@ -49,7 +49,7 @@ impl GitLabClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("gb-gitlab-integration"),
+            HeaderValue::from_static("gitcthulhu-gitlab-integration"),
         );
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
@@ -77,7 +77,7 @@ impl GitLabClient {
             account_id.client(&access_token)
         } else {
             Err(anyhow::anyhow!(
-                "No GitLab access token found for account '{account_id}'.\nRun 'but config forge auth' to re-authenticate."
+                "No GitLab access token found for account '{account_id}'.\nSign in again under Settings > Accounts."
             )
             .context(NOT_AUTHENTICATED))
         }
@@ -87,7 +87,7 @@ impl GitLabClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("gb-gitlab-integration"),
+            HeaderValue::from_static("gitcthulhu-gitlab-integration"),
         );
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
@@ -1015,7 +1015,7 @@ pub struct GitLabProject {
     pub access_level: Option<i64>,
 }
 
-/// GitLab CI job with the pipeline fields needed to build GitButler check status.
+/// GitLab CI job with the pipeline fields needed to build the check status.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabPipelineJob {
     pub id: i64,
@@ -1199,7 +1199,7 @@ pub(crate) fn resolve_account(
     let known_accounts = crate::token::list_known_gitlab_accounts(storage)?;
     let Some(default_account) = known_accounts.first() else {
         return Err(anyhow::anyhow!(
-            "No authenticated GitLab users found.\nRun 'but config forge auth' to authenticate with GitLab."
+            "No authenticated GitLab users found.\nAdd a GitLab account under Settings > Accounts."
         )
         .context(NOT_AUTHENTICATED));
     };
@@ -1208,7 +1208,7 @@ pub(crate) fn resolve_account(
             account
         } else {
             return Err(anyhow::anyhow!(
-                "Preferred GitLab account '{account}' has not authenticated yet.\nRun 'but config forge auth' to authenticate, or choose another account."
+                "Preferred GitLab account '{account}' has not authenticated yet.\nSign in under Settings > Accounts, or choose another account."
             )
             .context(NOT_AUTHENTICATED));
         }

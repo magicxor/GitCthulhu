@@ -14,7 +14,7 @@ doctest = false
 default = ["forge", "ai", "update"]
 forge = [
     "dep:but-forge", "dep:but-forge-storage", "dep:but-github", "dep:but-gitlab", "dep:but-bitbucket",
-    "dep:but-db", "dep:gix",
+    "dep:but-db", "dep:but-error", "dep:gix", "dep:reqwest", "dep:chrono", "dep:sha2", "dep:tracing",
 ]
 ai = ["dep:but-llm"]
 update = ["dep:but-update", "dep:but-db"]
@@ -35,9 +35,19 @@ but-github = { workspace = true, optional = true }
 but-gitlab = { workspace = true, optional = true }
 but-bitbucket = { workspace = true, optional = true }
 but-db = { workspace = true, optional = true }
+but-error = { workspace = true, optional = true }
 gix = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 but-llm = { workspace = true, optional = true }
 but-update = { workspace = true, optional = true }
+
+[dev-dependencies]
+keyring.workspace = true
+tempfile.workspace = true
+tiny_http = "0.12"
 
 [lints]
 workspace = true

@@ -127,18 +127,22 @@ pub trait ToolResult: 'static + Send + Sync {
     fn to_json(&self, action_identifier: &str) -> serde_json::Value;
 }
 
-impl ToolResult for Result<gix::ObjectId, anyhow::Error> {
+impl ToolResult for Result<String, anyhow::Error> {
     fn to_json(&self, action_identifier: &str) -> serde_json::Value {
-        let result = self.as_ref().map(|id| id.to_string());
+        let result = match self {
+            Ok(value) => Ok(value.clone()),
+            Err(e) => Err(e),
+        };
         string_result_to_json(&result, action_identifier)
     }
 }
 
-impl ToolResult for Result<Vec<gix::ObjectId>, anyhow::Error> {
+impl ToolResult for Result<Vec<String>, anyhow::Error> {
     fn to_json(&self, action_identifier: &str) -> serde_json::Value {
-        let result = self
-            .as_ref()
-            .map(|ids| ids.iter().map(|id| id.to_string()).collect::<Vec<String>>());
+        let result = match self {
+            Ok(values) => Ok(values.clone()),
+            Err(e) => Err(e),
+        };
         string_vec_result_to_json(&result, action_identifier)
     }
 }

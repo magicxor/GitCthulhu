@@ -1,13 +1,14 @@
 use crate::tool::Toolset;
-use anyhow::{Context as _, Result};
-use async_openai::{Client, config::OpenAIConfig};
-use but_secret::{Sensitive, secret};
-use reqwest::header::{HeaderMap, HeaderValue};
+use anyhow::Result;
+use async_openai::{
+    Client,
+    config::{OPENAI_API_BASE, OpenAIConfig},
+};
+use but_secret::Sensitive;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    AI_OPENAI_SECRET_HANDLE, GITBUTLER_ACCESS_TOKEN_HANDLE,
     chat::ChatMessage,
     client::LLMClient,
     openai_utils::{
@@ -16,129 +17,45 @@ use crate::{
     },
 };
 
-pub const GB_OPENAI_API_BASE: &str = "https://app.gitbutler.com/api/proxy/openai";
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, strum::Display)]
-pub enum CredentialsKind {
-    EnvVarOpenAiKey,
-    OwnOpenAiKey,
-    GitButlerProxied,
-}
-
+/// OpenAI, or an OpenAI-compatible server (Azure, vLLM, LiteLLM, ...) behind a custom endpoint, with the
+/// user's own API key.
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
-    /// The API endpoint to use, if any. As configured in the git global config
+    /// The API base URL to use instead of OpenAI's.
     custom_endpoint: Option<String>,
-    /// The preferred model to use, as configured in the git global config
+    /// The model to use.
     model: Option<String>,
-    credentials: (CredentialsKind, Sensitive<String>),
+    api_key: Sensitive<String>,
 }
 
 impl OpenAiProvider {
     pub fn with(
-        preferred_creds: Option<CredentialsKind>,
+        api_key: Sensitive<String>,
         model: Option<String>,
         custom_endpoint: Option<String>,
-    ) -> Option<Self> {
-        let credentials = if let Some(kind) = preferred_creds {
-            match kind {
-                CredentialsKind::EnvVarOpenAiKey => OpenAiProvider::openai_env_var_creds(),
-                CredentialsKind::OwnOpenAiKey => OpenAiProvider::openai_own_key_creds(),
-                CredentialsKind::GitButlerProxied => OpenAiProvider::gitbutler_proxied_creds(),
-            }
-        } else {
-            OpenAiProvider::gitbutler_proxied_creds()
-                .or_else(|_| OpenAiProvider::openai_own_key_creds())
-                .or_else(|_| OpenAiProvider::openai_env_var_creds())
-                .context("No OpenAI credentials found. This can be configured in the app or read from a OPENAI_API_KEY environment variable")
-        };
-
-        match credentials {
-            Ok(credentials) => Some(Self {
-                credentials,
-                model,
-                custom_endpoint,
-            }),
-            Err(e) => {
-                tracing::error!("Failed to retrieve OpenAI credentials: {}", e);
-                None
-            }
+    ) -> Self {
+        Self {
+            custom_endpoint,
+            model,
+            api_key,
         }
-    }
-
-    /// Configure a custom endpoint if set in the provider, if any.
-    fn configure_custom_endpoint(&self, config: OpenAIConfig) -> OpenAIConfig {
-        if let Some(custom_endpont) = &self.custom_endpoint {
-            config.with_api_base(custom_endpont)
-        } else {
-            config
-        }
-    }
-
-    pub fn credentials_kind(&self) -> CredentialsKind {
-        self.credentials.0.clone()
-    }
-
-    fn gitbutler_proxied_creds() -> Result<(CredentialsKind, Sensitive<String>)> {
-        let creds = secret::retrieve(GITBUTLER_ACCESS_TOKEN_HANDLE, secret::Namespace::BuildKind)?
-            .ok_or(anyhow::anyhow!(
-                "No GitButler token available. Log-in to use the GitButler OpenAI provider"
-            ))?;
-        Ok((CredentialsKind::GitButlerProxied, creds))
-    }
-
-    fn openai_own_key_creds() -> Result<(CredentialsKind, Sensitive<String>)> {
-        let creds = secret::retrieve(AI_OPENAI_SECRET_HANDLE, secret::Namespace::Global)?.ok_or(
-            anyhow::anyhow!(
-                "No OpenAI own key configured. Add this through the GitButler settings"
-            ),
-        )?;
-        Ok((CredentialsKind::OwnOpenAiKey, creds))
-    }
-
-    fn openai_env_var_creds() -> Result<(CredentialsKind, Sensitive<String>)> {
-        let creds = Sensitive(
-            std::env::var_os("OPENAI_API_KEY")
-                .ok_or(anyhow::anyhow!(
-                    "Environment variable OPENAI_API_KEY is not set"
-                ))?
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("Invalid UTF-8 in OPENAI_API_KEY"))?,
-        );
-        Ok((CredentialsKind::EnvVarOpenAiKey, creds))
     }
 }
 
 impl OpenAIClientProvider for OpenAiProvider {
     fn client(&self) -> Result<Client<OpenAIConfig>> {
-        match &self.credentials {
-            (CredentialsKind::EnvVarOpenAiKey, _) => {
-                let config = self.configure_custom_endpoint(OpenAIConfig::new());
-                Ok(Client::with_config(config))
-            }
-            (CredentialsKind::OwnOpenAiKey, key) => {
-                let config =
-                    self.configure_custom_endpoint(OpenAIConfig::new().with_api_key(key.0.clone()));
-                Ok(Client::with_config(config))
-            }
+        // The base is always explicit: `OpenAIConfig::new()` alone would honor `OPENAI_BASE_URL` and send the
+        // user's key wherever the environment points.
+        let api_base = self.custom_endpoint.as_deref().unwrap_or(OPENAI_API_BASE);
+        let config = OpenAIConfig::new()
+            .with_api_base(api_base)
+            .with_api_key(self.api_key.0.clone());
+        Ok(Client::with_config(config))
+    }
 
-            (CredentialsKind::GitButlerProxied, key) => {
-                let config = OpenAIConfig::new().with_api_base(GB_OPENAI_API_BASE);
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    reqwest::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                headers.insert(
-                    "X-Auth-Token",
-                    key.0.parse().unwrap_or(HeaderValue::from_static("")),
-                );
-                let http_client = reqwest::Client::builder()
-                    .default_headers(headers)
-                    .build()?;
-                Ok(Client::with_config(config).with_http_client(http_client))
-            }
-        }
+    fn uses_max_completion_tokens(&self) -> bool {
+        // OpenAI's newer models reject `max_tokens`; compatible servers may not know the new name.
+        self.custom_endpoint.is_none()
     }
 }
 

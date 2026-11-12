@@ -1,25 +1,15 @@
+//! The AI settings of the application, independent of where they are stored.
+//!
+//! An [`AiConfiguration`] is plain data (serde) that the application keeps in its own settings file. It holds no
+//! secrets: API keys live in the secret store, under the handles named by [`AiConfiguration::secret_handle`].
+
 use anyhow::{Context as _, Result, bail};
-use but_core::git_config::{remove_config_value, set_config_value};
 
-use crate::{CredentialsKeyOption, LLMProviderKind};
-
-pub const AI_MODEL_PROVIDER_KEY: &str = "gitbutler.aiModelProvider";
-pub const AI_OPENAI_KEY_OPTION_KEY: &str = "gitbutler.aiOpenAIKeyOption";
-pub const AI_OPENAI_MODEL_NAME_KEY: &str = "gitbutler.aiOpenAIModelName";
-pub const AI_OPENAI_CUSTOM_ENDPOINT_KEY: &str = "gitbutler.aiOpenAICustomEndpoint";
-pub const AI_ANTHROPIC_KEY_OPTION_KEY: &str = "gitbutler.aiAnthropicKeyOption";
-pub const AI_ANTHROPIC_MODEL_NAME_KEY: &str = "gitbutler.aiAnthropicModelName";
-pub const AI_OLLAMA_ENDPOINT_KEY: &str = "gitbutler.aiOllamaEndpoint";
-pub const AI_OLLAMA_MODEL_NAME_KEY: &str = "gitbutler.aiOllamaModelName";
-pub const AI_LMSTUDIO_ENDPOINT_KEY: &str = "gitbutler.aiLMStudioEndpoint";
-pub const AI_LMSTUDIO_MODEL_NAME_KEY: &str = "gitbutler.aiLMStudioModelName";
-pub const AI_OPENROUTER_MODEL_NAME_KEY: &str = "gitbutler.aiOpenRouterModelName";
-pub const AI_OPENROUTER_ENDPOINT_KEY: &str = "gitbutler.aiOpenRouterEndpoint";
+use crate::LLMProviderKind;
 
 pub const AI_OPENAI_SECRET_HANDLE: &str = "aiOpenAIKey";
 pub const AI_ANTHROPIC_SECRET_HANDLE: &str = "aiAnthropicKey";
 pub const AI_OPENROUTER_SECRET_HANDLE: &str = "aiOpenRouterKey";
-pub const GITBUTLER_ACCESS_TOKEN_HANDLE: &str = "gitbutler_access_token";
 
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4-nano";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
@@ -27,138 +17,173 @@ pub const DEFAULT_OLLAMA_ENDPOINT: &str = "127.0.0.1:11434";
 pub const DEFAULT_OLLAMA_MODEL: &str = "llama3";
 pub const DEFAULT_LMSTUDIO_ENDPOINT: &str = "http://127.0.0.1:1234/v1";
 pub const DEFAULT_LMSTUDIO_MODEL: &str = "default";
+pub const DEFAULT_OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-4.1-mini";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What is missing for the active provider to be usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiMissing {
+    /// No provider selected.
+    Provider,
+    /// No API key.
+    Key,
+    /// No model.
+    Model,
+    /// No endpoint, or one that is not valid for the provider.
+    Endpoint,
+}
+
+/// Which API keys are available, as the secret store reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyAvailability {
+    pub openai: bool,
+    pub anthropic: bool,
+    pub openrouter: bool,
+}
+
+/// OpenAI, or any OpenAI-compatible server behind `custom_endpoint`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct OpenAiConfiguration {
-    pub key_option: CredentialsKeyOption,
     pub model: String,
     pub custom_endpoint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct AnthropicConfiguration {
-    pub key_option: CredentialsKeyOption,
     pub model: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A local Ollama server, addressed as `host:port` (an IPv6 host in brackets).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct OllamaConfiguration {
     pub endpoint: String,
     pub model: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A local LM Studio server, addressed by its base URL.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct LmStudioConfiguration {
     pub endpoint: String,
     pub model: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OpenRouterConfiguration {
+    pub endpoint: String,
+    pub model: String,
+}
+
+/// The settings of every provider plus the choice among them. `provider: None` means AI is not set up.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct AiConfiguration {
-    pub provider: LLMProviderKind,
+    /// A provider name this version does not know (written by a newer one) reads as `None`, so the rest of the
+    /// settings survive.
+    #[serde(deserialize_with = "known_provider_or_none")]
+    pub provider: Option<LLMProviderKind>,
     pub openai: OpenAiConfiguration,
     pub anthropic: AnthropicConfiguration,
     pub ollama: OllamaConfiguration,
     pub lmstudio: LmStudioConfiguration,
+    pub openrouter: OpenRouterConfiguration,
 }
 
-impl Default for AiConfiguration {
+impl Default for OpenAiConfiguration {
     fn default() -> Self {
         Self {
-            provider: LLMProviderKind::OpenAi,
-            openai: OpenAiConfiguration {
-                key_option: CredentialsKeyOption::ButlerApi,
-                model: DEFAULT_OPENAI_MODEL.into(),
-                custom_endpoint: None,
-            },
-            anthropic: AnthropicConfiguration {
-                key_option: CredentialsKeyOption::ButlerApi,
-                model: DEFAULT_ANTHROPIC_MODEL.into(),
-            },
-            ollama: OllamaConfiguration {
-                endpoint: DEFAULT_OLLAMA_ENDPOINT.into(),
-                model: DEFAULT_OLLAMA_MODEL.into(),
-            },
-            lmstudio: LmStudioConfiguration {
-                endpoint: DEFAULT_LMSTUDIO_ENDPOINT.into(),
-                model: DEFAULT_LMSTUDIO_MODEL.into(),
-            },
+            model: DEFAULT_OPENAI_MODEL.into(),
+            custom_endpoint: None,
+        }
+    }
+}
+
+impl Default for AnthropicConfiguration {
+    fn default() -> Self {
+        Self {
+            model: DEFAULT_ANTHROPIC_MODEL.into(),
+        }
+    }
+}
+
+impl Default for OllamaConfiguration {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_OLLAMA_ENDPOINT.into(),
+            model: DEFAULT_OLLAMA_MODEL.into(),
+        }
+    }
+}
+
+impl Default for LmStudioConfiguration {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_LMSTUDIO_ENDPOINT.into(),
+            model: DEFAULT_LMSTUDIO_MODEL.into(),
+        }
+    }
+}
+
+impl Default for OpenRouterConfiguration {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_OPENROUTER_ENDPOINT.into(),
+            model: DEFAULT_OPENROUTER_MODEL.into(),
         }
     }
 }
 
 impl AiConfiguration {
-    pub fn from_git_config(config: &gix::config::File) -> Result<Self> {
-        let values = AiConfigurationSnapshot::from_git_config(config);
-        let defaults = Self::default();
-        let provider = match values.provider.as_deref() {
-            Some(value) => LLMProviderKind::from_git_config_value(value)
-                .with_context(|| format!("Unsupported AI provider '{value}'"))?,
-            None => defaults.provider,
-        };
-        let openai_key_option = match values.openai_key_option.as_deref() {
-            Some(value) => CredentialsKeyOption::from_git_config_value(value)
-                .with_context(|| format!("Unsupported OpenAI credential source '{value}'"))?,
-            None => defaults.openai.key_option,
-        };
-        let anthropic_key_option = match values.anthropic_key_option.as_deref() {
-            Some(value) => CredentialsKeyOption::from_git_config_value(value)
-                .with_context(|| format!("Unsupported Anthropic credential source '{value}'"))?,
-            None => defaults.anthropic.key_option,
-        };
-
-        let configuration = Self {
-            provider,
-            openai: OpenAiConfiguration {
-                key_option: openai_key_option,
-                model: values.openai_model.unwrap_or(defaults.openai.model),
-                custom_endpoint: values.openai_endpoint,
-            },
-            anthropic: AnthropicConfiguration {
-                key_option: anthropic_key_option,
-                model: values.anthropic_model.unwrap_or(defaults.anthropic.model),
-            },
-            ollama: OllamaConfiguration {
-                endpoint: values.ollama_endpoint.unwrap_or(defaults.ollama.endpoint),
-                model: values.ollama_model.unwrap_or(defaults.ollama.model),
-            },
-            lmstudio: LmStudioConfiguration {
-                endpoint: values
-                    .lmstudio_endpoint
-                    .unwrap_or(defaults.lmstudio.endpoint),
-                model: values.lmstudio_model.unwrap_or(defaults.lmstudio.model),
-            },
-        };
-        Ok(configuration)
+    /// The secret-store handle of the API key of `provider`, for the providers that need one.
+    pub fn secret_handle(provider: LLMProviderKind) -> Option<&'static str> {
+        match provider {
+            LLMProviderKind::OpenAi => Some(AI_OPENAI_SECRET_HANDLE),
+            LLMProviderKind::Anthropic => Some(AI_ANTHROPIC_SECRET_HANDLE),
+            LLMProviderKind::OpenRouter => Some(AI_OPENROUTER_SECRET_HANDLE),
+            LLMProviderKind::Ollama | LLMProviderKind::LMStudio => None,
+        }
     }
 
+    /// The model of the active provider, as configured (possibly blank).
+    pub fn active_model(&self) -> Option<&str> {
+        Some(match self.provider? {
+            LLMProviderKind::OpenAi => &self.openai.model,
+            LLMProviderKind::Anthropic => &self.anthropic.model,
+            LLMProviderKind::Ollama => &self.ollama.model,
+            LLMProviderKind::LMStudio => &self.lmstudio.model,
+            LLMProviderKind::OpenRouter => &self.openrouter.model,
+        })
+    }
+
+    /// Check every provider's settings, as when the settings page saves them.
     pub fn validate(&self) -> Result<()> {
         required(&self.openai.model, "OpenAI model")?;
         required(&self.anthropic.model, "Anthropic model")?;
         required(&self.ollama.model, "Ollama model")?;
         required(&self.lmstudio.model, "LM Studio model")?;
+        required(&self.openrouter.model, "OpenRouter model")?;
         validate_ollama_endpoint(&self.ollama.endpoint)?;
         validate_url(&self.lmstudio.endpoint, "LM Studio endpoint")?;
-        if self.openai.key_option == CredentialsKeyOption::BringYourOwn
-            && let Some(endpoint) = self
-                .openai
-                .custom_endpoint
-                .as_deref()
-                .filter(|endpoint| !endpoint.trim().is_empty())
-        {
+        validate_url(&self.openrouter.endpoint, "OpenRouter endpoint")?;
+        if let Some(endpoint) = nonempty(self.openai.custom_endpoint.as_deref()) {
             validate_url(endpoint, "OpenAI custom endpoint")?;
         }
         Ok(())
     }
 
+    /// Check the settings of the active provider; fails with the reason if there is none.
     pub fn validate_active(&self) -> Result<()> {
-        match self.provider {
+        let Some(provider) = self.provider else {
+            bail!("No AI provider is selected")
+        };
+        match provider {
             LLMProviderKind::OpenAi => {
                 required(&self.openai.model, "OpenAI model")?;
-                if self.openai.key_option == CredentialsKeyOption::BringYourOwn
-                    && let Some(endpoint) = nonempty(self.openai.custom_endpoint.as_deref())
-                {
+                if let Some(endpoint) = nonempty(self.openai.custom_endpoint.as_deref()) {
                     validate_url(endpoint, "OpenAI custom endpoint")?;
                 }
             }
@@ -173,203 +198,70 @@ impl AiConfiguration {
                 required(&self.lmstudio.model, "LM Studio model")?;
                 validate_url(&self.lmstudio.endpoint, "LM Studio endpoint")?;
             }
-            LLMProviderKind::OpenRouter => {}
+            LLMProviderKind::OpenRouter => {
+                required(&self.openrouter.model, "OpenRouter model")?;
+                validate_url(&self.openrouter.endpoint, "OpenRouter endpoint")?;
+            }
         }
         Ok(())
     }
 
-    /// Return whether the active provider has valid settings and its required credentials.
-    pub fn is_configured(
-        &self,
-        has_openai_key: bool,
-        has_anthropic_key: bool,
-        has_gitbutler_token: bool,
-    ) -> bool {
-        if self.validate_active().is_err() {
-            return false;
-        }
-        match self.provider {
-            LLMProviderKind::OpenAi => match self.openai.key_option {
-                CredentialsKeyOption::BringYourOwn => has_openai_key,
-                CredentialsKeyOption::ButlerApi => has_gitbutler_token,
-            },
-            LLMProviderKind::Anthropic => match self.anthropic.key_option {
-                CredentialsKeyOption::BringYourOwn => has_anthropic_key,
-                CredentialsKeyOption::ButlerApi => has_gitbutler_token,
-            },
-            LLMProviderKind::Ollama | LLMProviderKind::LMStudio => true,
-            LLMProviderKind::OpenRouter => false,
-        }
-    }
-
-    pub fn apply(&self, config: &mut gix::config::File) -> Result<()> {
-        self.validate()?;
-        set_config_value(
-            config,
-            AI_MODEL_PROVIDER_KEY,
-            self.provider.as_git_config_value(),
-        )?;
-        set_config_value(
-            config,
-            AI_OPENAI_KEY_OPTION_KEY,
-            self.openai.key_option.as_git_config_value(),
-        )?;
-        set_config_value(config, AI_OPENAI_MODEL_NAME_KEY, self.openai.model.trim())?;
-        set_optional(
-            config,
-            AI_OPENAI_CUSTOM_ENDPOINT_KEY,
-            self.openai.custom_endpoint.as_deref(),
-        )?;
-        set_config_value(
-            config,
-            AI_ANTHROPIC_KEY_OPTION_KEY,
-            self.anthropic.key_option.as_git_config_value(),
-        )?;
-        set_config_value(
-            config,
-            AI_ANTHROPIC_MODEL_NAME_KEY,
-            self.anthropic.model.trim(),
-        )?;
-        set_config_value(config, AI_OLLAMA_ENDPOINT_KEY, self.ollama.endpoint.trim())?;
-        set_config_value(config, AI_OLLAMA_MODEL_NAME_KEY, self.ollama.model.trim())?;
-        set_config_value(
-            config,
-            AI_LMSTUDIO_ENDPOINT_KEY,
-            self.lmstudio.endpoint.trim(),
-        )?;
-        set_config_value(
-            config,
-            AI_LMSTUDIO_MODEL_NAME_KEY,
-            self.lmstudio.model.trim(),
-        )?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct AiConfigurationSnapshot {
-    pub provider: Option<String>,
-    pub openai_key_option: Option<String>,
-    pub openai_model: Option<String>,
-    pub openai_endpoint: Option<String>,
-    pub anthropic_key_option: Option<String>,
-    pub anthropic_model: Option<String>,
-    pub ollama_endpoint: Option<String>,
-    pub ollama_model: Option<String>,
-    pub lmstudio_endpoint: Option<String>,
-    pub lmstudio_model: Option<String>,
-}
-
-impl AiConfigurationSnapshot {
-    pub fn from_git_config(config: &gix::config::File) -> Self {
-        Self {
-            provider: config_value(config, AI_MODEL_PROVIDER_KEY),
-            openai_key_option: config_value(config, AI_OPENAI_KEY_OPTION_KEY),
-            openai_model: config_value(config, AI_OPENAI_MODEL_NAME_KEY),
-            openai_endpoint: config_value(config, AI_OPENAI_CUSTOM_ENDPOINT_KEY),
-            anthropic_key_option: config_value(config, AI_ANTHROPIC_KEY_OPTION_KEY),
-            anthropic_model: config_value(config, AI_ANTHROPIC_MODEL_NAME_KEY),
-            ollama_endpoint: config_value(config, AI_OLLAMA_ENDPOINT_KEY),
-            ollama_model: config_value(config, AI_OLLAMA_MODEL_NAME_KEY),
-            lmstudio_endpoint: config_value(config, AI_LMSTUDIO_ENDPOINT_KEY),
-            lmstudio_model: config_value(config, AI_LMSTUDIO_MODEL_NAME_KEY),
+    /// What the active provider still lacks, or `None` if it is ready to be used.
+    pub fn missing(&self, keys: KeyAvailability) -> Option<AiMissing> {
+        let Some(provider) = self.provider else {
+            return Some(AiMissing::Provider);
+        };
+        let (model, endpoint_ok, key_ok) = match provider {
+            LLMProviderKind::OpenAi => (
+                &self.openai.model,
+                nonempty(self.openai.custom_endpoint.as_deref())
+                    .is_none_or(|e| validate_url(e, "").is_ok()),
+                keys.openai,
+            ),
+            LLMProviderKind::Anthropic => (&self.anthropic.model, true, keys.anthropic),
+            LLMProviderKind::Ollama => (
+                &self.ollama.model,
+                validate_ollama_endpoint(&self.ollama.endpoint).is_ok(),
+                true,
+            ),
+            LLMProviderKind::LMStudio => (
+                &self.lmstudio.model,
+                validate_url(&self.lmstudio.endpoint, "").is_ok(),
+                true,
+            ),
+            LLMProviderKind::OpenRouter => (
+                &self.openrouter.model,
+                validate_url(&self.openrouter.endpoint, "").is_ok(),
+                keys.openrouter,
+            ),
+        };
+        if model.trim().is_empty() {
+            Some(AiMissing::Model)
+        } else if !endpoint_ok {
+            Some(AiMissing::Endpoint)
+        } else if !key_ok {
+            Some(AiMissing::Key)
+        } else {
+            None
         }
     }
-}
 
-pub fn apply_openai_configuration(
-    config: &mut gix::config::File,
-    key_option: CredentialsKeyOption,
-    model: Option<&str>,
-    endpoint: Option<&str>,
-) -> Result<()> {
-    validate_optional(model, "OpenAI model")?;
-    if let Some(endpoint) = nonempty(endpoint) {
-        validate_url(endpoint, "OpenAI custom endpoint")?;
+    /// Whether the active provider has valid settings and its required key.
+    pub fn is_configured(&self, keys: KeyAvailability) -> bool {
+        self.missing(keys).is_none()
     }
-    set_provider(config, LLMProviderKind::OpenAi)?;
-    set_config_value(
-        config,
-        AI_OPENAI_KEY_OPTION_KEY,
-        key_option.as_git_config_value(),
-    )?;
-    set_optional(config, AI_OPENAI_MODEL_NAME_KEY, model)?;
-    set_optional(config, AI_OPENAI_CUSTOM_ENDPOINT_KEY, endpoint)
 }
 
-pub fn apply_anthropic_configuration(
-    config: &mut gix::config::File,
-    key_option: CredentialsKeyOption,
-    model: Option<&str>,
-) -> Result<()> {
-    validate_optional(model, "Anthropic model")?;
-    set_provider(config, LLMProviderKind::Anthropic)?;
-    set_config_value(
-        config,
-        AI_ANTHROPIC_KEY_OPTION_KEY,
-        key_option.as_git_config_value(),
-    )?;
-    set_optional(config, AI_ANTHROPIC_MODEL_NAME_KEY, model)
-}
-
-pub fn apply_ollama_configuration(
-    config: &mut gix::config::File,
-    endpoint: Option<&str>,
-    model: Option<&str>,
-) -> Result<()> {
-    if let Some(endpoint) = nonempty(endpoint) {
-        validate_ollama_endpoint(endpoint)?;
-    }
-    validate_optional(model, "Ollama model")?;
-    set_provider(config, LLMProviderKind::Ollama)?;
-    set_optional(config, AI_OLLAMA_ENDPOINT_KEY, endpoint)?;
-    set_optional(config, AI_OLLAMA_MODEL_NAME_KEY, model)
-}
-
-pub fn apply_lmstudio_configuration(
-    config: &mut gix::config::File,
-    endpoint: Option<&str>,
-    model: Option<&str>,
-) -> Result<()> {
-    if let Some(endpoint) = nonempty(endpoint) {
-        validate_url(endpoint, "LM Studio endpoint")?;
-    }
-    validate_optional(model, "LM Studio model")?;
-    set_provider(config, LLMProviderKind::LMStudio)?;
-    set_optional(config, AI_LMSTUDIO_ENDPOINT_KEY, endpoint)?;
-    set_optional(config, AI_LMSTUDIO_MODEL_NAME_KEY, model)
-}
-
-pub fn apply_openrouter_configuration(
-    config: &mut gix::config::File,
-    model: Option<&str>,
-) -> Result<()> {
-    validate_optional(model, "OpenRouter model")?;
-    set_provider(config, LLMProviderKind::OpenRouter)?;
-    set_optional(config, AI_OPENROUTER_MODEL_NAME_KEY, model)
-}
-
-fn set_provider(config: &mut gix::config::File, provider: LLMProviderKind) -> Result<()> {
-    set_config_value(
-        config,
-        AI_MODEL_PROVIDER_KEY,
-        provider.as_git_config_value(),
-    )
+fn known_provider_or_none<'de, D>(deserializer: D) -> Result<Option<LLMProviderKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(name.as_deref().and_then(LLMProviderKind::from_config_value))
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn validate_optional(value: Option<&str>, field: &str) -> Result<()> {
-    if value.is_some() && nonempty(value).is_none() {
-        bail!("{field} is required when provided")
-    }
-    Ok(())
-}
-
-fn config_value(config: &gix::config::File, key: &str) -> Option<String> {
-    config.string(key).map(|value| value.to_string())
 }
 
 fn required<'a>(value: &'a str, field: &str) -> Result<&'a str> {
@@ -397,17 +289,14 @@ fn validate_ollama_endpoint(value: &str) -> Result<()> {
     let (host, port) = value
         .rsplit_once(':')
         .context("Ollama endpoint must use host:port format")?;
-    if host.trim().is_empty() || port.parse::<u16>().is_err() {
-        bail!("Ollama endpoint must use host:port format")
+    let host = host.trim();
+    // An IPv6 host needs brackets, or the URL built from it (`http://{host}:{port}`) is invalid.
+    let ipv6 = host.starts_with('[') || host.contains(':');
+    let bracketed = host.len() > 2 && host.starts_with('[') && host.ends_with(']');
+    if host.is_empty() || (ipv6 && !bracketed) || port.parse::<u16>().is_err() {
+        bail!("Ollama endpoint must use host:port format (an IPv6 host in brackets)")
     }
     Ok(())
-}
-
-fn set_optional(config: &mut gix::config::File, key: &str, value: Option<&str>) -> Result<()> {
-    match nonempty(value) {
-        Some(value) => set_config_value(config, key, value),
-        None => remove_config_value(config, key),
-    }
 }
 
 #[cfg(test)]
@@ -415,71 +304,171 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_roundtrip_through_git_config() {
-        let expected = AiConfiguration::default();
-        let mut config =
-            gix::config::File::new(gix::config::file::Metadata::from(gix::config::Source::User));
+    fn settings_round_trip_through_json_and_missing_fields_take_defaults() {
+        let mut configuration = AiConfiguration {
+            provider: Some(LLMProviderKind::OpenRouter),
+            ..AiConfiguration::default()
+        };
+        configuration.openrouter.model = "anthropic/claude-sonnet".into();
+        configuration.openai.custom_endpoint = Some("http://localhost:8000/v1".into());
 
-        expected.apply(&mut config).unwrap();
-
+        let json = serde_json::to_string(&configuration).expect("plain data serializes");
         assert_eq!(
-            AiConfiguration::from_git_config(&config).unwrap(),
-            expected,
-            "one shared model must own config keys and defaults"
+            serde_json::from_str::<AiConfiguration>(&json).expect("what was written reads back"),
+            configuration,
+            "the settings file keeps every field"
+        );
+        assert_eq!(
+            serde_json::from_str::<AiConfiguration>(r#"{"provider":"lmstudio"}"#)
+                .expect("a partial file reads")
+                .lmstudio,
+            LmStudioConfiguration::default(),
+            "fields absent from an older settings file take their defaults"
+        );
+        assert_eq!(
+            serde_json::from_str::<AiConfiguration>("{}")
+                .expect("an empty object reads")
+                .provider,
+            None,
+            "a fresh install has no provider"
         );
     }
 
     #[test]
-    fn custom_openai_endpoint_only_applies_to_own_keys() {
+    fn an_unknown_provider_reads_as_none_and_keeps_the_other_settings() {
+        let read: AiConfiguration = serde_json::from_str(
+            r#"{"provider":"gemini","ollama":{"endpoint":"[::1]:11434","model":"qwen3"}}"#,
+        )
+        .expect("a provider written by a newer version does not break the whole file");
+        assert_eq!(read.provider, None, "the unknown provider is not selected");
+        assert_eq!(
+            read.ollama.model, "qwen3",
+            "the settings of known providers survive"
+        );
+        assert_eq!(
+            serde_json::from_str::<AiConfiguration>(r#"{"provider":null}"#)
+                .expect("null reads")
+                .provider,
+            None
+        );
+        for kind in [
+            LLMProviderKind::OpenAi,
+            LLMProviderKind::Anthropic,
+            LLMProviderKind::Ollama,
+            LLMProviderKind::LMStudio,
+            LLMProviderKind::OpenRouter,
+        ] {
+            let configuration = AiConfiguration {
+                provider: Some(kind),
+                ..AiConfiguration::default()
+            };
+            let json = serde_json::to_string(&configuration).expect("serializes");
+            assert_eq!(
+                serde_json::from_str::<AiConfiguration>(&json)
+                    .expect("reads back")
+                    .provider,
+                Some(kind),
+                "{kind:?} round-trips through {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_openai_endpoint_must_be_a_url_and_blank_means_openai() {
         let mut configuration = AiConfiguration::default();
         configuration.openai.custom_endpoint = Some("not a URL".into());
-
-        assert!(
-            configuration.validate().is_ok(),
-            "the GitButler proxy ignores custom endpoints"
-        );
-
-        configuration.openai.key_option = CredentialsKeyOption::BringYourOwn;
         assert!(
             configuration.validate().is_err(),
-            "own-key endpoints must remain valid URLs"
+            "an endpoint that is no URL is rejected"
+        );
+        configuration.openai.custom_endpoint = Some("  ".into());
+        assert!(
+            configuration.validate().is_ok(),
+            "a blank endpoint means OpenAI's own"
         );
     }
 
     #[test]
-    fn configured_requires_the_active_providers_credentials() {
+    fn configured_requires_the_active_providers_key_and_settings() {
+        let none = KeyAvailability::default();
         let mut config = AiConfiguration::default();
-        assert!(
-            !config.is_configured(false, false, false),
-            "GitButler-proxied OpenAI needs an account token"
-        );
-        assert!(
-            config.is_configured(false, false, true),
-            "an account token configures GitButler-proxied OpenAI"
+        assert_eq!(
+            config.missing(none),
+            Some(AiMissing::Provider),
+            "nothing is selected"
         );
 
-        config.openai.key_option = CredentialsKeyOption::BringYourOwn;
+        config.provider = Some(LLMProviderKind::OpenAi);
+        assert_eq!(
+            config.missing(none),
+            Some(AiMissing::Key),
+            "OpenAI needs its key"
+        );
         assert!(
-            config.is_configured(true, false, false),
-            "BYOK OpenAI needs only its own key"
+            config.is_configured(KeyAvailability {
+                openai: true,
+                ..none
+            }),
+            "OpenAI needs only its own key"
         );
 
-        config.provider = LLMProviderKind::Anthropic;
-        config.anthropic.key_option = CredentialsKeyOption::BringYourOwn;
+        config.provider = Some(LLMProviderKind::Anthropic);
         assert!(
-            config.is_configured(false, true, false),
-            "BYOK Anthropic needs its own key"
+            config.is_configured(KeyAvailability {
+                anthropic: true,
+                ..none
+            }),
+            "Anthropic needs its own key"
         );
 
-        config.provider = LLMProviderKind::Ollama;
+        config.provider = Some(LLMProviderKind::OpenRouter);
         assert!(
-            config.is_configured(false, false, false),
-            "a valid local provider needs no credentials"
+            !config.is_configured(none),
+            "OpenRouter without a key is not configured"
+        );
+        assert!(
+            config.is_configured(KeyAvailability {
+                openrouter: true,
+                ..none
+            }),
+            "an OpenRouter key configures OpenRouter"
+        );
+
+        config.provider = Some(LLMProviderKind::Ollama);
+        assert!(
+            config.is_configured(none),
+            "a valid local provider needs no key"
         );
         config.ollama.endpoint.clear();
-        assert!(
-            !config.is_configured(false, false, false),
-            "an invalid local provider is not configured"
+        assert_eq!(
+            config.missing(none),
+            Some(AiMissing::Endpoint),
+            "an invalid local endpoint is reported as such"
         );
+        config.ollama.endpoint = DEFAULT_OLLAMA_ENDPOINT.into();
+        config.ollama.model = " ".into();
+        assert_eq!(
+            config.missing(none),
+            Some(AiMissing::Model),
+            "a blank model"
+        );
+    }
+
+    #[test]
+    fn ollama_endpoints_are_host_and_port() {
+        for good in ["127.0.0.1:11434", "localhost:1", "[::1]:11434"] {
+            assert!(validate_ollama_endpoint(good).is_ok(), "{good} is valid");
+        }
+        for bad in [
+            "",
+            "localhost",
+            "http://localhost:11434",
+            ":11434",
+            "h:port",
+            "::1:11434",
+            "[]:11434",
+        ] {
+            assert!(validate_ollama_endpoint(bad).is_err(), "{bad:?} is invalid");
+        }
     }
 }

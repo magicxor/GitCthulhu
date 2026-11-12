@@ -35,10 +35,10 @@ pub struct LMStudioProvider {
 }
 
 impl LMStudioProvider {
-    pub fn with(config: Option<LMStudioConfig>, model: Option<String>) -> Option<Self> {
+    pub fn with(config: Option<LMStudioConfig>, model: Option<String>) -> Self {
         let mut config = config.unwrap_or_default();
         config.api_base = normalize_api_base(&config.api_base);
-        Some(Self { config, model })
+        Self { config, model }
     }
 
     pub fn config(&self) -> &LMStudioConfig {

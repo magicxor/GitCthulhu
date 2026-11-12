@@ -275,8 +275,8 @@ impl CancelToken {
         }
     }
 
-    /// A future that completes when cancelled, for async callers that want to select on it (the executor does).
-    /// Dropping the future unregisters its waker.
+    /// A future that completes when cancelled, for async callers that want to select on it (the executor, the services
+    /// crate, `cli.rs`). Dropping the losing future unregisters its waker; this is how network requests are aborted.
     pub fn cancelled(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
         Cancelled {
             token: self,

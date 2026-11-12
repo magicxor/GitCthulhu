@@ -16,7 +16,7 @@ forge = [
     "dep:but-forge", "dep:but-forge-storage", "dep:but-github", "dep:but-gitlab", "dep:but-bitbucket",
     "dep:but-db", "dep:but-error", "dep:gix", "dep:reqwest", "dep:chrono", "dep:sha2", "dep:tracing",
 ]
-ai = ["dep:but-llm"]
+ai = ["dep:but-llm", "dep:gix"]
 update = ["dep:but-update", "dep:but-db"]
 
 [dependencies]
@@ -48,6 +48,7 @@ but-update = { workspace = true, optional = true }
 keyring.workspace = true
 tempfile.workspace = true
 tiny_http = "0.12"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
 
 [lints]
 workspace = true

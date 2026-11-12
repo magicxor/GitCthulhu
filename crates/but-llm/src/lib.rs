@@ -1,20 +1,28 @@
 mod anthropic;
 mod chat;
+mod chat_completions;
 mod client;
 mod config;
-mod key;
+mod error;
+mod http;
 mod lmstudio;
 mod ollama;
 mod openai;
 mod openai_utils;
 mod openrouter;
+mod runtime;
+mod sse;
+#[cfg(test)]
+mod test_server;
 pub mod tool;
 
 use std::sync::Arc;
 
+use but_secret::Sensitive;
+
 pub use chat::{ChatMessage, StreamToolCallResult, ToolCall, ToolCallContent, ToolResponseContent};
 pub use config::*;
-pub use key::CredentialsKeyOption;
+pub use error::LlmError;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
@@ -31,7 +39,7 @@ pub enum LLMProviderKind {
 }
 
 impl LLMProviderKind {
-    pub fn from_git_config_value(s: &str) -> Option<Self> {
+    pub fn from_config_value(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "openai" => Some(LLMProviderKind::OpenAi),
             "anthropic" => Some(LLMProviderKind::Anthropic),
@@ -42,7 +50,7 @@ impl LLMProviderKind {
         }
     }
 
-    pub fn as_git_config_value(self) -> &'static str {
+    pub fn as_config_value(self) -> &'static str {
         match self {
             LLMProviderKind::OpenAi => "openai",
             LLMProviderKind::Anthropic => "anthropic",
@@ -69,13 +77,34 @@ impl From<LLMProviderKind> for String {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum LLMProviderConfig {
-    OpenAi(Option<openai::CredentialsKind>),
-    Anthropic(Option<anthropic::CredentialsKind>),
-    Ollama(Option<ollama::OllamaConfig>),
-    LMStudio(Option<lmstudio::LMStudioConfig>),
-    OpenRouter(Option<openrouter::OpenRouterConfig>),
+/// The API keys to use, for the providers that need one. They are handed over per provider because the
+/// application, not this crate, knows where its secrets are kept.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderKeys {
+    pub openai: Option<Sensitive<String>>,
+    pub anthropic: Option<Sensitive<String>>,
+    pub openrouter: Option<Sensitive<String>>,
+}
+
+impl ProviderKeys {
+    /// Which keys are present and not blank.
+    pub fn availability(&self) -> KeyAvailability {
+        let present =
+            |key: &Option<Sensitive<String>>| key.as_ref().is_some_and(|k| !k.0.trim().is_empty());
+        KeyAvailability {
+            openai: present(&self.openai),
+            anthropic: present(&self.anthropic),
+            openrouter: present(&self.openrouter),
+        }
+    }
+}
+
+/// Per-request options of the plain-text calls.
+#[derive(Debug, Clone, Default)]
+pub struct GenerateOptions {
+    /// Upper bound of generated tokens. `None` leaves it to the provider (Anthropic: 4096, as it requires a
+    /// limit on every request).
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,135 +129,153 @@ pub struct LLMProvider {
 /// LLM service is being used. The provider handles authentication, request formatting,
 /// response parsing, and tool calling orchestration for all supported backends.
 impl LLMProvider {
-    /// Creates a new LLM provider based on the specified configuration.
+    /// Create the provider that `configuration` selects, with the keys in `keys`.
     ///
-    /// This method initializes the appropriate underlying client (OpenAI or Ollama)
-    /// based on the provided configuration. For OpenAI, it will attempt to use
-    /// the provided credentials or fall back to environment variables. For Ollama,
-    /// it will use the provided host configuration or default to localhost.
-    ///
-    /// # Arguments
-    ///
-    /// * `kind` - The provider configuration specifying which LLM backend to use
-    ///   and any associated credentials or settings.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(LLMProvider)` if the provider was successfully initialized,
-    /// or `None` if initialization failed (e.g., missing required credentials).
-    pub fn new(kind: LLMProviderConfig) -> Option<Self> {
-        let client = match kind {
-            LLMProviderConfig::OpenAi(creds) => openai::OpenAiProvider::with(creds, None, None)
-                .map(|p| LLMClientType::OpenAi(Arc::new(p)))?,
-            LLMProviderConfig::Anthropic(creds) => anthropic::AnthropicProvider::with(creds, None)
-                .map(|p| LLMClientType::Anthropic(Arc::new(p)))?,
-            LLMProviderConfig::Ollama(config) => {
-                let config = config.unwrap_or_default();
-                LLMClientType::Ollama(Arc::new(ollama::OllamaProvider::new(config, None)))
-            }
-            LLMProviderConfig::LMStudio(config) => lmstudio::LMStudioProvider::with(config, None)
-                .map(|p| LLMClientType::LMStudio(Arc::new(p)))?,
-            LLMProviderConfig::OpenRouter(config) => {
-                openrouter::OpenRouterProvider::with(config, None)
-                    .map(|p| LLMClientType::OpenRouter(Arc::new(p)))?
-            }
+    /// Fails with what is missing when the active provider is not usable: no provider selected, a blank model,
+    /// an invalid endpoint, or no key where one is needed.
+    pub fn from_configuration(
+        configuration: &AiConfiguration,
+        keys: &ProviderKeys,
+    ) -> Result<Self, AiMissing> {
+        if let Some(missing) = configuration.missing(keys.availability()) {
+            return Err(missing);
+        }
+        let Some(provider) = configuration.provider else {
+            return Err(AiMissing::Provider);
         };
-        Some(Self { client })
-    }
-
-    /// Creates a new LLM provider based on configuration stored in the global Git config.
-    ///
-    /// This method reads the LLM provider settings from Git's configuration system,
-    /// specifically looking for the `gitbutler.aiModelProvider` setting to determine
-    /// which provider to instantiate. It then delegates to the appropriate provider's
-    /// `from_git_config` method to read provider-specific settings like API keys,
-    /// model names, and endpoints.
-    ///
-    /// This is the recommended way to initialize an LLM provider in a Git repository
-    /// context, as it respects user-configured settings and credentials stored in
-    /// their Git configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - A reference to a Git configuration object, typically the global
-    ///   or repository-level config, containing the LLM provider settings.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(LLMProvider)` if a valid provider is configured and successfully
-    /// initialized, or `None` if:
-    /// - The `gitbutler.aiModelProvider` setting is not present
-    /// - The configured provider is not supported
-    /// - Provider-specific initialization fails (e.g., missing credentials)
-    pub fn from_git_config(config: &gix::config::File) -> Option<Self> {
-        let configuration = AiConfiguration::from_git_config(config).ok()?;
-        configuration.validate_active().ok()?;
-        match configuration.provider {
+        let key = |key: &Option<Sensitive<String>>| {
+            key.as_ref()
+                .map(|k| Sensitive(k.0.trim().to_owned()))
+                .ok_or(AiMissing::Key)
+        };
+        let model = |model: &str| Some(model.trim().to_owned());
+        let client = match provider {
             LLMProviderKind::OpenAi => {
-                let credentials = match configuration.openai.key_option {
-                    CredentialsKeyOption::BringYourOwn => openai::CredentialsKind::OwnOpenAiKey,
-                    CredentialsKeyOption::ButlerApi => openai::CredentialsKind::GitButlerProxied,
-                };
-                let client = openai::OpenAiProvider::with(
-                    Some(credentials),
-                    Some(configuration.openai.model),
-                    configuration.openai.custom_endpoint,
-                )?;
-                Some(Self {
-                    client: LLMClientType::OpenAi(Arc::new(client)),
-                })
+                LLMClientType::OpenAi(Arc::new(openai::OpenAiProvider::with(
+                    key(&keys.openai)?,
+                    model(&configuration.openai.model),
+                    configuration
+                        .openai
+                        .custom_endpoint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|endpoint| !endpoint.is_empty())
+                        .map(str::to_owned),
+                )))
             }
             LLMProviderKind::Anthropic => {
-                let credentials = match configuration.anthropic.key_option {
-                    CredentialsKeyOption::BringYourOwn => {
-                        anthropic::CredentialsKind::OwnAnthropicKey
-                    }
-                    CredentialsKeyOption::ButlerApi => anthropic::CredentialsKind::GitButlerProxied,
-                };
-                let client = anthropic::AnthropicProvider::with(
-                    Some(credentials),
-                    Some(configuration.anthropic.model),
-                )?;
-                Some(Self {
-                    client: LLMClientType::Anthropic(Arc::new(client)),
-                })
+                LLMClientType::Anthropic(Arc::new(anthropic::AnthropicProvider::with(
+                    key(&keys.anthropic)?,
+                    model(&configuration.anthropic.model),
+                )))
             }
             LLMProviderKind::Ollama => {
-                let host_config = ollama::OllamaHostConfig::from(configuration.ollama.endpoint);
-                let client = ollama::OllamaProvider::new(
+                LLMClientType::Ollama(Arc::new(ollama::OllamaProvider::new(
                     ollama::OllamaConfig {
-                        host_config: Some(host_config),
+                        host_config: Some(ollama::OllamaHostConfig::from(
+                            configuration.ollama.endpoint.trim().to_owned(),
+                        )),
                     },
-                    Some(configuration.ollama.model),
-                );
-                Some(Self {
-                    client: LLMClientType::Ollama(Arc::new(client)),
-                })
+                    model(&configuration.ollama.model),
+                )))
             }
             LLMProviderKind::LMStudio => {
-                let client = lmstudio::LMStudioProvider::with(
+                LLMClientType::LMStudio(Arc::new(lmstudio::LMStudioProvider::with(
                     Some(lmstudio::LMStudioConfig {
-                        api_base: configuration.lmstudio.endpoint,
+                        api_base: configuration.lmstudio.endpoint.trim().to_owned(),
                     }),
-                    Some(configuration.lmstudio.model),
-                )?;
-                Some(Self {
-                    client: LLMClientType::LMStudio(Arc::new(client)),
-                })
+                    model(&configuration.lmstudio.model),
+                )))
             }
             LLMProviderKind::OpenRouter => {
-                let provider_config = config.string(AI_OPENROUTER_ENDPOINT_KEY).map(|api_base| {
-                    openrouter::OpenRouterConfig {
-                        api_base: api_base.to_string(),
-                    }
-                });
-                let model = config
-                    .string(AI_OPENROUTER_MODEL_NAME_KEY)
-                    .map(|model| model.to_string());
-                let client = openrouter::OpenRouterProvider::with(provider_config, model)?;
-                Some(Self {
-                    client: LLMClientType::OpenRouter(Arc::new(client)),
-                })
+                LLMClientType::OpenRouter(Arc::new(openrouter::OpenRouterProvider::with(
+                    key(&keys.openrouter)?,
+                    Some(openrouter::OpenRouterConfig {
+                        api_base: configuration.openrouter.endpoint.trim().to_owned(),
+                    }),
+                    model(&configuration.openrouter.model),
+                )))
+            }
+        };
+        Ok(Self { client })
+    }
+
+    /// Which kind of provider this is.
+    pub fn kind(&self) -> LLMProviderKind {
+        match &self.client {
+            LLMClientType::OpenAi(_) => LLMProviderKind::OpenAi,
+            LLMClientType::Anthropic(_) => LLMProviderKind::Anthropic,
+            LLMClientType::Ollama(_) => LLMProviderKind::Ollama,
+            LLMClientType::LMStudio(_) => LLMProviderKind::LMStudio,
+            LLMClientType::OpenRouter(_) => LLMProviderKind::OpenRouter,
+        }
+    }
+
+    /// Stream a plain-text answer, calling `on_token` with each piece as it arrives. Returns the whole answer,
+    /// or `None` if the model said nothing.
+    ///
+    /// The future does its work only while polled and holds the HTTP connection: dropping it (for instance
+    /// when it loses a `select!` against a cancellation signal) closes the connection immediately. It runs on
+    /// the caller's tokio runtime, which must have its time and IO drivers enabled.
+    pub async fn stream_text(
+        &self,
+        system_message: &str,
+        chat_messages: Vec<ChatMessage>,
+        model: &str,
+        options: &GenerateOptions,
+        on_token: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<Option<String>, LlmError> {
+        let (s, m, o) = (system_message, model, options);
+        match &self.client {
+            LLMClientType::OpenAi(c) => {
+                chat_completions::stream(c.as_ref(), s, chat_messages, m, o, on_token).await
+            }
+            LLMClientType::Ollama(c) => {
+                chat_completions::stream(c.as_ref(), s, chat_messages, m, o, on_token).await
+            }
+            LLMClientType::LMStudio(c) => {
+                chat_completions::stream(c.as_ref(), s, chat_messages, m, o, on_token).await
+            }
+            LLMClientType::OpenRouter(c) => {
+                chat_completions::stream(c.as_ref(), s, chat_messages, m, o, on_token).await
+            }
+            LLMClientType::Anthropic(c) => {
+                let client = c
+                    .client()
+                    .map_err(|err| LlmError::Provider(format!("{err:#}")))?;
+                anthropic::stream_text(&client, s, chat_messages, m, o, on_token).await
+            }
+        }
+    }
+
+    /// Ask for a plain-text answer without streaming. `None` if the model said nothing. Cancellable by
+    /// dropping the future, like [`Self::stream_text`].
+    pub async fn text(
+        &self,
+        system_message: &str,
+        chat_messages: Vec<ChatMessage>,
+        model: &str,
+        options: &GenerateOptions,
+    ) -> Result<Option<String>, LlmError> {
+        let (s, m, o) = (system_message, model, options);
+        match &self.client {
+            LLMClientType::OpenAi(c) => {
+                chat_completions::complete(c.as_ref(), s, chat_messages, m, o).await
+            }
+            LLMClientType::Ollama(c) => {
+                chat_completions::complete(c.as_ref(), s, chat_messages, m, o).await
+            }
+            LLMClientType::LMStudio(c) => {
+                chat_completions::complete(c.as_ref(), s, chat_messages, m, o).await
+            }
+            LLMClientType::OpenRouter(c) => {
+                chat_completions::complete(c.as_ref(), s, chat_messages, m, o).await
+            }
+            LLMClientType::Anthropic(c) => {
+                let client = c
+                    .client()
+                    .map_err(|err| LlmError::Provider(format!("{err:#}")))?;
+                anthropic::text(&client, s, chat_messages, m, o).await
             }
         }
     }
@@ -236,7 +283,7 @@ impl LLMProvider {
     /// Returns the model identifier configured for this LLM provider.
     ///
     /// This method retrieves the model name that was configured for the provider
-    /// at the time of instantiation, typically read from the Git global configuration.
+    /// at the time of instantiation, from the application's [`AiConfiguration`].
     /// The model identifier (e.g., "gpt-4", "claude-3-opus", "llama2") determines
     /// which specific model variant will be used for LLM requests.
     ///
@@ -275,53 +322,6 @@ impl LLMProvider {
             LLMClientType::OpenRouter(_) => DEFAULT_OPENROUTER_MODEL,
         }
         .to_string()
-    }
-
-    /// Creates a default OpenAI LLM provider using environment-based credentials.
-    ///
-    /// This is a convenience method that attempts to create an OpenAI provider
-    /// by reading credentials from environment variables (typically GB credentials or `OPENAI_API_KEY`).
-    /// It's the recommended way to create an OpenAI provider when you want to use
-    /// the default configuration without explicitly passing credentials.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(LLMProvider)` if OpenAI credentials are found in the environment
-    /// and the provider was successfully initialized, or `None` if credentials are
-    /// missing or initialization failed.
-    pub fn default_openai() -> Option<Self> {
-        Self::new(LLMProviderConfig::OpenAi(None))
-    }
-
-    /// Creates a default Anthropic LLM provider using environment-based credentials.
-    ///
-    /// This is a convenience method that attempts to create an Anthropic provider
-    /// by reading credentials from environment variables (typically GB credentials or `ANTHROPIC_API_KEY`).
-    /// It's the recommended way to create an Anthropic provider when you want to use
-    /// the default configuration without explicitly passing credentials.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(LLMProvider)` if Anthropic credentials are found in the environment
-    /// and the provider was successfully initialized, or `None` if credentials are
-    /// missing or initialization failed.
-    pub fn default_anthropic() -> Option<Self> {
-        Self::new(LLMProviderConfig::Anthropic(None))
-    }
-
-    /// Creates a default LM Studio LLM provider using environment-based configuration.
-    ///
-    /// This is a convenience method that attempts to create an LM Studio provider
-    /// by reading configuration from environment variables (LM_STUDIO_API_BASE and LM_API_TOKEN).
-    /// It's the recommended way to create an LM Studio provider when you want to use
-    /// the default configuration without explicitly passing settings.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(LLMProvider)` if the provider was successfully initialized,
-    /// or `None` if initialization failed.
-    pub fn default_lmstudio() -> Option<Self> {
-        Self::new(LLMProviderConfig::LMStudio(None))
     }
 
     /// Executes an interactive tool-calling loop with streaming output.

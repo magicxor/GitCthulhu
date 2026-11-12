@@ -7,7 +7,6 @@ use crate::{ForgeName, ForgeUser};
 /// doesn't need to branch on forge name. Computed from the project's
 /// own remote URL plus a forge-name lookup for the rest.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeInfo {
     pub name: ForgeName,
@@ -27,11 +26,7 @@ pub struct ForgeInfo {
     pub capabilities: ForgeCapabilities,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeInfo);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeUnitInfo {
     pub name: String,
@@ -39,11 +34,7 @@ pub struct ForgeUnitInfo {
     pub symbol: String,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeUnitInfo);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeCapabilities {
     pub checks: bool,
@@ -55,9 +46,6 @@ pub struct ForgeCapabilities {
     /// Labels and review requests can be listed and changed.
     pub review_management: bool,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeCapabilities);
 
 /// Build the per-project ForgeInfo from the project's remote URL.
 ///

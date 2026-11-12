@@ -8,9 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::IgnoredWorktreeChange;
 
-/// Represents the pushable status for the current stack.
+/// Represents the pushable status of a branch.
 #[derive(Debug, Clone, PartialEq, Eq, Copy, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum PushStatus {
     /// Can push, but there are no changes to be pushed
@@ -24,12 +23,9 @@ pub enum PushStatus {
     /// Fully integrated, no changes to push.
     Integrated,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(PushStatus);
 
 /// Represents the state a commit could be in.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject")]
 pub enum CommitState {
     /// The commit is only local
@@ -42,17 +38,11 @@ pub enum CommitState {
     /// This variant carries the remote commit id.
     /// The `remote_commit_id` may be the same as the `id` or it may be different if the local commit has been rebased or updated in another way.
     #[serde(with = "but_serde::object_id")]
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::object_id")
-    )]
     LocalAndRemote(gix::ObjectId),
     /// The commit is considered integrated.
     /// This should happen when this commit or the contents of this commit is already part of the base.
     Integrated,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CommitState);
 
 impl CommitState {
     /// A short human-readable label for this state, given the owning commit `id`.
@@ -77,7 +67,6 @@ impl CommitState {
 /// super WorktreeChanges type.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 pub struct WorktreeChanges {
     /// Changes that could be committed.
     pub changes: Vec<TreeChange>,
@@ -118,7 +107,6 @@ impl From<crate::WorktreeChanges> for WorktreeChanges {
 
 /// All the changes that were made to the tree, including stats
 #[derive(Default, Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TreeChanges {
     /// The changes that were made to the tree.
@@ -126,8 +114,6 @@ pub struct TreeChanges {
     /// The stats of the changes.
     pub stats: TreeStats,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(TreeChanges);
 
 impl TreeChanges {
     pub fn try_to_unidiff(
@@ -157,24 +143,13 @@ fn changes_to_unidiff(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TreeChange {
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::bstring_lossy")
-    )]
     pub path: BStringForFrontend,
     /// Something silently carried back and forth between the frontend and the backend.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::bstring_bytes")
-    )]
     pub path_bytes: BString,
     pub status: TreeStatus,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(TreeChange);
 
 impl From<gix::object::tree::diff::Stats> for TreeStats {
     fn from(stats: gix::object::tree::diff::Stats) -> Self {
@@ -187,7 +162,6 @@ impl From<gix::object::tree::diff::Stats> for TreeStats {
 }
 
 #[derive(Default, Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TreeStats {
     /// The total amount of lines added.
@@ -197,11 +171,8 @@ pub struct TreeStats {
     /// The number of files added, removed or modified.
     pub files_changed: u64,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(TreeStats);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject")]
 pub enum TreeStatus {
     Addition {
@@ -221,17 +192,9 @@ pub enum TreeStatus {
     },
     Rename {
         #[serde(rename = "previousPath")]
-        #[cfg_attr(
-            feature = "export-schema",
-            schemars(schema_with = "but_schemars::bstring_lossy")
-        )]
         previous_path: BStringForFrontend,
         /// Something silently carried back and forth between the frontend and the backend.
         #[serde(rename = "previousPathBytes")]
-        #[cfg_attr(
-            feature = "export-schema",
-            schemars(schema_with = "but_schemars::bstring_bytes")
-        )]
         previous_path_bytes: BString,
         #[serde(rename = "previousState")]
         previous_state: ChangeState,
@@ -239,8 +202,6 @@ pub enum TreeStatus {
         flags: Option<ModeFlags>,
     },
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(TreeStatus);
 
 impl From<TreeStatus> for crate::TreeStatus {
     fn from(value: TreeStatus) -> Self {
@@ -319,26 +280,14 @@ impl From<crate::TreeStatus> for TreeStatus {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeState {
     #[serde(with = "but_serde::object_id")]
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::object_id")
-    )]
     pub id: gix::ObjectId,
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::entry_kind")
-    )]
     pub kind: EntryKind,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ChangeState);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[expect(missing_docs)]
 pub enum ModeFlags {
     ExecutableBitAdded,
@@ -347,8 +296,6 @@ pub enum ModeFlags {
     TypeChangeLinkToFile,
     TypeChange,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ModeFlags);
 
 impl From<TreeChange> for crate::TreeChange {
     fn from(

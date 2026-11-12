@@ -15,7 +15,6 @@ ln -s nonexisting-target link
 mkfifo fifo-should-be-ignored
 
 git add . && git commit -m "init"
-add_change_id_to_given_commit 3333 "$(git rev-parse HEAD)" >.git/refs/heads/main
 
 seq 5 10 >file
 seq 1 5 >executable

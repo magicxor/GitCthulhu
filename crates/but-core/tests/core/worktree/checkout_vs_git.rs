@@ -878,7 +878,7 @@ EOF
 
 /// Make `z.f`'s filter run `.git/meddle.sh` in the repository at `dir`, once, at `when`. The
 /// snapshot and the merge clean `z.f` too, but only before checkout creates its staging directory
-/// below `.git/gitbutler`, so the clean filter meddles only once that directory exists.
+/// below `.git/gitcthulhu`, so the clean filter meddles only once that directory exists.
 fn configure_meddling(dir: &Path, when: When) -> anyhow::Result<()> {
     std::fs::write(dir.join(".git/info/attributes"), "*.f filter=meddle\n")?;
     let meddle = r#". "$GIT_DIR/meddle.sh" >&2"#;
@@ -887,7 +887,7 @@ fn configure_meddling(dir: &Path, when: When) -> anyhow::Result<()> {
         When::Checking => (
             "cat".to_owned(),
             format!(
-                r#"sh -c 'if [ ! -e "$GIT_DIR/meddled" ] && ls -d "$GIT_DIR"/gitbutler/.gitbutler-checkout-* >/dev/null 2>&1; then touch "$GIT_DIR/meddled"; {meddle}; fi; cat'"#
+                r#"sh -c 'if [ ! -e "$GIT_DIR/meddled" ] && ls -d "$GIT_DIR"/gitcthulhu/.gitcthulhu-checkout-* >/dev/null 2>&1; then touch "$GIT_DIR/meddled"; {meddle}; fi; cat'"#
             ),
         ),
     };

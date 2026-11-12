@@ -18,7 +18,7 @@ use plan::Plan;
 /// as with Git. These drivers are the only filters that can fail, and they run before anything in
 /// the worktree is removed. Everything checkout removes is checked against the snapshot after the
 /// filters ran, and a failure while writing files into place is undone. A crash in the middle
-/// can leave what was moved aside in a `.gitbutler-checkout-*` directory below the Git directory,
+/// can leave what was moved aside in a `.gitcthulhu-checkout-*` directory below the Git directory,
 /// or in the worktree for objects on another filesystem.
 /// `.git/index` is updated for the written and deleted paths only, keeping all other entries as
 /// they are. If `conflicts` is set, its unresolved conflicts are recorded as index stages.

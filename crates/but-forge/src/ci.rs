@@ -189,7 +189,6 @@ async fn ci_checks_for_ref(
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CiCheck {
     pub id: i64,
@@ -208,9 +207,6 @@ pub struct CiCheck {
     pub last_sync_at: chrono::NaiveDateTime,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiCheck);
-
 impl CiCheck {
     /// The struct version for persistence compatibility purposes
     pub fn struct_version() -> i32 {
@@ -219,7 +215,6 @@ impl CiCheck {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CiOutput {
     pub summary: String,
@@ -227,11 +222,7 @@ pub struct CiOutput {
     pub title: String,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiOutput);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum CiStatus {
     Complete {
@@ -243,11 +234,7 @@ pub enum CiStatus {
     Unknown,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiStatus);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum CiConclusion {
     ActionRequired,
@@ -260,11 +247,7 @@ pub enum CiConclusion {
     Unknown,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiConclusion);
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequestMinimal {
     pub id: i64,
@@ -275,9 +258,6 @@ pub struct PullRequestMinimal {
     pub head_ref: String,
     pub head_repo_url: Option<String>,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(PullRequestMinimal);
 
 impl From<but_gitlab::GitLabPipelineJob> for CiCheck {
     fn from(job: but_gitlab::GitLabPipelineJob) -> Self {

@@ -8,7 +8,6 @@ pub mod checks;
 mod client;
 mod graphql;
 pub mod pr;
-pub mod stacks;
 pub use client::{
     AutoMergeState, CheckRun, CommentReactions, CreatePullRequestParams, GitHubClient,
     GitHubPrLabel, GitHubRepoPermissions, GitHubRepository, GitHubUser, HttpStatusError,
@@ -31,7 +30,6 @@ const OAUTH_USER_AGENT: &str = "gitcthulhu-github-integration";
 /// The timeout of one OAuth request.
 const OAUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Verification {
     /// The code the user types in at `verification_uri`.
@@ -60,8 +58,6 @@ fn default_interval() -> u64 {
 fn default_expires_in() -> u64 {
     DEFAULT_EXPIRES_IN_SECS
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(Verification);
 
 /// The device flow has not finished yet: the user has not confirmed (`authorization_pending`) or polling is
 /// too fast (`slow_down`). Poll again later; this is not a failure.
@@ -481,7 +477,6 @@ pub mod json {
     /// The credential is stored by the backend as part of the call, so the caller is told
     /// who authenticated and nothing more. Field names are camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct GithubAuthStatusResponse {
         pub login: String,
@@ -510,15 +505,11 @@ pub mod json {
         }
     }
 
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(GithubAuthStatusResponse);
-
     /// Serializable version of [`AuthenticatedUser`] with exposed access token.
     ///
     /// This struct represents an authenticated GitHub user with their credentials
     /// exposed as plain strings for API responses. Field names are converted to camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct GithubAuthenticatedUserSensitive {
         /// The GitHub access token as a plain string (sensitive data).
@@ -552,9 +543,6 @@ pub mod json {
             }
         }
     }
-
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(GithubAuthenticatedUserSensitive);
 }
 
 #[cfg(test)]

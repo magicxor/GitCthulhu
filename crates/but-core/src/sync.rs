@@ -9,10 +9,10 @@ use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock};
 /// The scope of a lock. It can be either on the entire project or on specific operations.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum LockScope {
-    /// Represents a lock on the entire project, preventing other GitButler instances from operating on it.
+    /// Represents a lock on the entire project, preventing other GitCthulhu instances from operating on it.
     #[default]
     AllOperations,
-    /// Represents a lock on background refresh operations only. This would prevent other GitButler instances
+    /// Represents a lock on background refresh operations only. This would prevent other GitCthulhu instances
     /// from performing background refreshes, but would still allow exclusive access for user-driven operations.
     BackgroundRefreshOperations,
 }
@@ -29,10 +29,10 @@ impl From<LockScope> for PathBuf {
 /// Try to obtain an exclusive inter-process lock on a project that stores its application data in `project_data`.
 ///
 /// The `scope` parameter determines what operations the lock protects:
-/// - [`LockScope::AllOperations`]: Prevents other GitButler instances from performing any operations on the project.
+/// - [`LockScope::AllOperations`]: Prevents other GitCthulhu instances from performing any operations on the project.
 ///   This lock should be held for as long as a user interface is observing the project.
 /// - [`LockScope::BackgroundRefreshOperations`]: Only prevents background refresh operations, allowing other
-///   user-driven operations to proceed. This enables multiple GitButler instances to work on the same project
+///   user-driven operations to proceed. This enables multiple GitCthulhu instances to work on the same project
 ///   as long as only one is performing background refreshes at a time.
 ///
 /// Returns an error if another process already holds the requested lock scope.
@@ -54,13 +54,13 @@ pub fn try_exclusive_inter_process_access(
         let error_message = match scope {
             LockScope::AllOperations => {
                 format!(
-                    "Project at '{}' is already opened for writing by another GitButler instance",
+                    "Project at '{}' is already opened for writing by another GitCthulhu instance",
                     project_data.display()
                 )
             }
             LockScope::BackgroundRefreshOperations => {
                 format!(
-                    "Project at '{}' is already being refreshed in the background by another GitButler instance",
+                    "Project at '{}' is already being refreshed in the background by another GitCthulhu instance",
                     project_data.display()
                 )
             }
@@ -80,7 +80,7 @@ pub fn try_exclusive_inter_process_access(
 /// If the current process inherits Git's commit-hook environment (`GIT_EDITOR=:` together with
 /// `GIT_INDEX_FILE`), acquiring the inter-process lock becomes non-blocking: if another process
 /// already holds it, we continue without that file lock instead of waiting. This avoids
-/// deadlocking hook re-entry when the parent GitButler command is already holding the same
+/// deadlocking hook re-entry when the parent GitCthulhu process is already holding the same
 /// inter-process lock while waiting for the hook to finish.
 /// If `project_data_dir` is `None`, no inter-process lock is obtained.
 ///
@@ -412,7 +412,7 @@ fn open_inter_process_lock_file(project_data_dir: &Path) -> Option<LockFile> {
 /// Normally this blocks until the file lock is acquired. However, if the current process inherits
 /// Git's commit-hook environment (`GIT_EDITOR=:` together with `GIT_INDEX_FILE`), we only try once
 /// and immediately continue without the inter-process lock when it is already held. This prevents
-/// a hook that re-enters GitButler from hanging forever behind the parent process that launched the
+/// a hook that re-enters GitCthulhu from hanging forever behind the parent process that launched the
 /// hook and is itself waiting for the hook to exit.
 fn best_effort_inter_process_lock(project_data_dir: &Path) -> Option<LockFile> {
     let mut lock = open_inter_process_lock_file(project_data_dir)?;
@@ -451,9 +451,8 @@ fn best_effort_inter_process_lock(project_data_dir: &Path) -> Option<LockFile> {
 fn log_error_if_unsupported(err: std::io::Error, self_path: &Path) -> Result<bool, std::io::Error> {
     if err.kind() == std::io::ErrorKind::Unsupported {
         tracing::warn!(
-            "Filesystem hosting '{}' doesn't support file locking - pretending to own exclusive lock to avoid possibly needless failure. Consider using {gb_storage_path_key} to move project data to a different location",
+            "Filesystem hosting '{}' doesn't support file locking - pretending to own exclusive lock to avoid possibly needless failure",
             self_path.display(),
-            gb_storage_path_key = but_project_handle::storage_path_config_key(),
         );
         Ok(true)
     } else {

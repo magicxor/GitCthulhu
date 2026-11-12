@@ -2,8 +2,6 @@
 //! Otherwise, some tools may have problems, or it seems to hang there.
 //!
 //! # WARNING: Flaky the first time it runs locally
-use but_db::DbHandle;
-
 #[cfg(unix)]
 #[test]
 #[ignore = "it's too unstable locally and I think more needs to be figured out - \
@@ -11,6 +9,8 @@ use but_db::DbHandle;
             Now it runs once the test compiled at least once"]
 fn migrations_in_parallel_with_processes() -> anyhow::Result<()> {
     use std::os::unix::process::ExitStatusExt;
+
+    use but_db::DbHandle;
 
     let tmp = tempfile::tempdir()?;
     // More processes = higher failure rate.
@@ -32,7 +32,7 @@ fn migrations_in_parallel_with_processes() -> anyhow::Result<()> {
                             libc::_exit(42);
                         }
                     };
-                    assert!(handle.hunk_assignments().list_all().unwrap().is_empty());
+                    assert!(handle.forge_reviews().list_all().unwrap().is_empty());
                 }
                 libc::_exit(0);
             } else if pid > 0 {

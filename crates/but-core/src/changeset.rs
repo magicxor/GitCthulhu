@@ -4,8 +4,9 @@
 //! This property allows changeset IDs to be used to determine if two different commits, or sets of commits,
 //! represent the same change.
 //!
-//! This module is the generic similarity engine: it works on anything implementing [`ChangesetCommit`](crate::changeset::ChangesetCommit), so both
-//! the rebase Editor's commits and the richer `but-workspace` commits can reuse it without copying commit data.
+//! This module is the generic similarity engine: it works on anything implementing [`ChangesetCommit`](crate::changeset::ChangesetCommit),
+//! so callers with their own commit types can reuse it without copying commit data. It can tell, for instance, whether
+//! the commits of a branch were integrated upstream by a rebase, a cherry-pick or a squash.
 
 use std::{
     borrow::Cow,
@@ -20,7 +21,7 @@ use gix::{
     prelude::ObjectIdExt,
 };
 
-use crate::{ChangeId, ChangeState, Commit, commit, commit::TreeKind};
+use crate::{ChangeState, Commit};
 
 /// The ID of a changeset, calculated as Git hash for convenience.
 type ChangesetID = gix::ObjectId;
@@ -37,19 +38,16 @@ const CURRENT_VERSION: ChangesetVersion = ChangesetVersion::V1;
 
 /// The commit data the changeset-similarity engine needs to identify a commit.
 ///
-/// Implemented for [`crate::Commit`] (the by-id path used by the rebase Editor)
-/// and, in `but-workspace`, for its richer `ref_info::Commit`, so neither side
-/// has to copy commit data into an intermediate struct.
+/// Implemented for [`crate::Commit`], and implementable for richer commit types,
+/// so callers don't have to copy commit data into an intermediate struct.
 pub trait ChangesetCommit {
     /// The commit's own id.
     fn id(&self) -> gix::ObjectId;
     /// The id of the first parent, if any.
     fn first_parent_id(&self) -> Option<gix::ObjectId>;
-    /// The GitButler change-id, if the commit carries one.
-    fn change_id(&self) -> Option<ChangeId>;
     /// The commit's author signature.
     fn author(&self) -> &gix::actor::Signature;
-    /// The commit message, with conflict markers stripped.
+    /// The commit message.
     fn message(&self) -> Cow<'_, BStr>;
 }
 
@@ -60,14 +58,11 @@ impl ChangesetCommit for Commit<'_> {
     fn first_parent_id(&self) -> Option<gix::ObjectId> {
         self.inner.parents.first().copied()
     }
-    fn change_id(&self) -> Option<ChangeId> {
-        self.headers().and_then(|hdr| hdr.change_id)
-    }
     fn author(&self) -> &gix::actor::Signature {
         &self.inner.author
     }
     fn message(&self) -> Cow<'_, BStr> {
-        Cow::Owned(commit::strip_conflict_markers(self.inner.message.as_ref()))
+        Cow::Borrowed(self.inner.message.as_ref())
     }
 }
 
@@ -78,9 +73,6 @@ impl<T: ChangesetCommit + ?Sized> ChangesetCommit for &T {
     }
     fn first_parent_id(&self) -> Option<gix::ObjectId> {
         (**self).first_parent_id()
-    }
-    fn change_id(&self) -> Option<ChangeId> {
-        (**self).change_id()
     }
     fn author(&self) -> &gix::actor::Signature {
         (**self).author()
@@ -110,32 +102,26 @@ pub fn compute_upstream_commits_lut(
     )
 }
 
-/// Match each of `workspace_commit_ids` against `upstream_lut`, returning the matched upstream
-/// commit id keyed by the workspace commit id.
+/// Match each of `commit_ids` against `upstream_lut`, returning the matched upstream
+/// commit id keyed by the id of the matching commit in `commit_ids`.
 ///
-/// The matches use the same cheap and expensive checks as the per-segment similarity used for
-/// upstream integration: change IDs are skipped, while commit data and changeset IDs are
-/// considered.
+/// The matches use both the cheap commit-data and the expensive changeset-id checks.
 pub fn identify_matching_content(
     repo: &gix::Repository,
     upstream_lut: &Identity,
-    workspace_commit_ids: &[gix::ObjectId],
+    commit_ids: &[gix::ObjectId],
 ) -> anyhow::Result<HashMap<gix::ObjectId, gix::ObjectId>> {
     let mut time_used = std::time::Duration::default();
-    let mut matches_by_workspace_commit = HashMap::new();
-    for workspace_commit_id in workspace_commit_ids {
-        let commit = Commit::from_id(workspace_commit_id.attach(repo))?;
+    let mut matches_by_commit = HashMap::new();
+    for commit_id in commit_ids {
+        let commit = Commit::from_id(commit_id.attach(repo))?;
         let expensive = changeset_identifier(repo, Some(&commit), &mut time_used)?;
-        if let Some(upstream_commit_id) = lookup_similar(
-            upstream_lut,
-            &commit,
-            expensive.as_ref(),
-            ChangeIdMode::Skip,
-        ) {
-            matches_by_workspace_commit.insert(*workspace_commit_id, *upstream_commit_id);
+        if let Some(upstream_commit_id) = lookup_similar(upstream_lut, &commit, expensive.as_ref())
+        {
+            matches_by_commit.insert(*commit_id, *upstream_commit_id);
         }
     }
-    Ok(matches_by_workspace_commit)
+    Ok(matches_by_commit)
 }
 
 /// Detect a squash integration: compute the changeset id of the virtual squash commit spanning
@@ -181,29 +167,16 @@ pub fn changeset_identifier<C: ChangesetCommit>(
     Ok(res.map(Identifier::ChangesetId))
 }
 
-/// Whether change-ids should be considered when looking up a similar commit.
-pub enum ChangeIdMode {
-    /// ChangeIDs should be used for remotes, where we can always
-    /// push changes back and see commits as containers
-    Use,
-    /// We'd want to skip the change-ids for integrated commits,
-    /// where we go with changeset ids instead (computed).
-    Skip,
-}
-
-/// Look up the commit in `map` most similar to `commit`, trying change-id, commit data, and
+/// Look up the commit in `map` most similar to `commit`, trying commit data and
 /// (if provided) the `expensive` changeset id, in that order.
 pub fn lookup_similar<'a, C: ChangesetCommit>(
     map: &'a Identity,
     commit: &C,
     expensive: Option<&Identifier>,
-    change_id: ChangeIdMode,
 ) -> Option<&'a gix::ObjectId> {
-    commit
-        .change_id()
-        .filter(|_| matches!(change_id, ChangeIdMode::Use))
-        .and_then(|cid| map.get(&Identifier::ChangeId(cid)))
-        .or_else(|| commit_data_id(commit).ok().and_then(|id| map.get(&id)))
+    commit_data_id(commit)
+        .ok()
+        .and_then(|id| map.get(&id))
         .or_else(|| map.get(expensive?))
 }
 
@@ -249,9 +222,6 @@ pub fn create_similarity_lut<C: ChangesetCommit>(
     if num_threads <= 1 || !expensive {
         let mut expensive = expensive.then(std::time::Instant::now);
         for (idx, commit) in commits.enumerate() {
-            if let Some(change_id) = commit.change_id() {
-                insert_or_expell_ambiguous(Identifier::ChangeId(change_id), commit.id());
-            }
             insert_or_expell_ambiguous(commit_data_id(&commit)?, commit.id());
 
             if let Some(start) = expensive {
@@ -273,7 +243,7 @@ pub fn create_similarity_lut<C: ChangesetCommit>(
             let (out_tx, out_rx) = flume::unbounded();
             for tid in 0..num_threads {
                 std::thread::Builder::new()
-                    .name(format!("GitButler::compute-changeset({tid})"))
+                    .name(format!("gitcthulhu::compute-changeset({tid})"))
                     .spawn({
                         let in_rx = in_rx.clone();
                         let out_tx = out_tx.clone();
@@ -304,9 +274,6 @@ pub fn create_similarity_lut<C: ChangesetCommit>(
             "BUG: multi-threading is only for expensive checks"
         );
         for (idx, commit) in commits.enumerate() {
-            if let Some(change_id) = commit.change_id() {
-                insert_or_expell_ambiguous(Identifier::ChangeId(change_id), commit.id());
-            }
             insert_or_expell_ambiguous(commit_data_id(&commit)?, commit.id());
 
             in_tx
@@ -502,18 +469,9 @@ pub fn id_for_tree_diff(
     Ok(Some(hasher.try_finalize()?))
 }
 
-// TODO: use `peel_to_tree()` once special conflict commits aren't needed anymore.
-/// Resolve `id` to its tree, transparently handling GitButler conflict commits.
+/// Resolve the commit or tree `id` to its tree.
 pub fn id_to_tree(repo: &gix::Repository, id: gix::ObjectId) -> anyhow::Result<gix::Tree<'_>> {
-    let object = repo.find_object(id)?;
-    if object.kind == gix::object::Kind::Commit {
-        let commit = Commit::from_id(object.peel_to_commit()?.id())?;
-        let tree = commit.tree_id_or_kind(TreeKind::AutoResolution)?;
-        let tree = repo.find_tree(tree)?;
-        Ok(tree)
-    } else {
-        Ok(object.peel_to_tree()?)
-    }
+    Ok(repo.find_object(id)?.peel_to_tree()?)
 }
 
 fn hash_change_state(h: &mut gix::hash::Hasher, ChangeState { id, kind }: ChangeState) {
@@ -530,8 +488,6 @@ fn hash_change_state(h: &mut gix::hash::Hasher, ChangeState { id, kind }: Change
 /// One of the identities a commit can be matched by, from cheapest to most expensive.
 #[derive(Debug, Hash, Clone, Eq, PartialEq)]
 pub enum Identifier {
-    /// The GitButler change-id.
-    ChangeId(ChangeId),
     /// A hash over select commit data (author + message).
     CommitData(CommitDataId),
     /// The changeset id, i.e. the content of the changes the commit introduces.
@@ -564,9 +520,7 @@ fn commit_data_id<C: ChangesetCommit>(c: &C) -> anyhow::Result<Identifier> {
 
     hasher.update(b"M");
     // Trim trailing line endings before hashing so that messages differing
-    // only in trailing newlines still match.  This is needed because
-    // `strip_conflict_markers` may consume trailing newlines that the
-    // original message had; the remote copy retains them.
+    // only in trailing newlines still match.
     let message = c.message();
     let msg = message.trim_end_with(|c| c == '\n' || c == '\r');
     hasher.update(msg);

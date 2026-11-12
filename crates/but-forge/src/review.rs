@@ -11,9 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{forge::ForgeName, resolve_account};
 
-pub const STACKING_FOOTER_BOUNDARY_TOP: &str = "<!-- GitButler Footer Boundary Top -->";
-pub const STACKING_FOOTER_BOUNDARY_BOTTOM: &str = "<!-- GitButler Footer Boundary Bottom -->";
-
 /// Get a list of available review template paths for a project
 ///
 /// The paths are relative to the root path
@@ -180,16 +177,12 @@ fn is_valid_review_template_path_azure(_path: &path::Path) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeReviewLabel {
     pub name: String,
     pub description: Option<String>,
     pub color: Option<String>,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewLabel);
 
 impl From<but_github::GitHubPrLabel> for ForgeReviewLabel {
     fn from(label: but_github::GitHubPrLabel) -> Self {
@@ -212,7 +205,6 @@ impl From<but_gitlab::GitLabLabel> for ForgeReviewLabel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 /// Represents a user from a forge platform (e.g., GitHub, GitLab).
 ///
@@ -232,9 +224,6 @@ pub struct ForgeReviewUser {
     /// Indicates whether this account is a bot account
     pub is_bot: bool,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewUser);
 
 impl Display for ForgeReviewUser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -287,7 +276,6 @@ impl From<but_bitbucket::BitbucketUser> for ForgeReviewUser {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 /// Represents a review (pull request/merge request) from a forge platform (GitHub, GitLab, etc.).
 ///
@@ -345,9 +333,6 @@ pub struct ForgeReview {
     /// The timestamp when this review was last fetched from the forge.
     pub last_sync_at: chrono::NaiveDateTime,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReview);
 
 impl ForgeReview {
     /// Whether the review is still open (not merged or closed)
@@ -498,7 +483,6 @@ impl From<but_bitbucket::BitbucketPullRequest> for ForgeReview {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 pub enum CacheConfig {
     CacheOnly,
     CacheWithFallback {
@@ -507,9 +491,6 @@ pub enum CacheConfig {
     #[default]
     NoCache,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CacheConfig);
 
 /// List the open reviews (e.g. pull requests) for a given forge repository.
 ///
@@ -877,7 +858,6 @@ async fn get_forge_review_inner(
 /// merge-button hint and comment count without forcing every review
 /// consumer to subscribe to those expensive fields.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewMergeStatus {
     /// Forge-reported merge state. GitHub strings: `clean`, `dirty`,
@@ -896,7 +876,6 @@ pub struct ReviewMergeStatus {
 /// from the forge; not cached. Diff-anchored review comments are not
 /// part of this type.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeReviewComment {
     /// Forge-assigned identifier of the comment.
@@ -915,22 +894,15 @@ pub struct ForgeReviewComment {
     pub reactions: Vec<ForgeReviewReactionCount>,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewComment);
-
 /// One reaction kind's tally. `kind` is the forge's native reaction name
 /// (GitHub: `+1`, `laugh`, …) — an open set, since forges like GitLab
 /// allow arbitrary award emoji.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeReviewReactionCount {
     pub kind: String,
     pub count: i64,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewReactionCount);
 
 fn github_reaction_counts(
     reactions: but_github::CommentReactions,
@@ -970,7 +942,6 @@ impl From<but_github::PullRequestComment> for ForgeReviewComment {
 
 /// The verdict a submitted review carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum ForgeReviewSubmissionState {
     Approved,
@@ -979,14 +950,10 @@ pub enum ForgeReviewSubmissionState {
     Dismissed,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewSubmissionState);
-
 /// A submitted review (approval, change request, or review comment) on a
 /// review. Fetched fresh from the forge; not cached. The caller's own
 /// unsubmitted (pending) drafts are excluded.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeReviewSubmission {
     /// Forge-assigned identifier of the submission.
@@ -1004,9 +971,6 @@ pub struct ForgeReviewSubmission {
     /// The reactions left on the submission, with who left each.
     pub reactions: Vec<ForgeReviewReaction>,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewSubmission);
 
 /// Map GitHub's review-state string to the forge-agnostic verdict.
 /// `PENDING` (the caller's own unsubmitted draft) and unknown future states
@@ -1103,21 +1067,16 @@ pub async fn list_review_comments(
 /// the pre-image, `new` in the post-image. Same axis as a local diff
 /// comment, so both can be anchored the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ForgeReviewThreadSide {
     Old,
     New,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewThreadSide);
-
 /// A diff-anchored conversation on a review: where in the diff it hangs,
 /// whether it has been resolved, and the comments left in it. Fetched
 /// fresh from the forge; not cached.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeReviewThread {
     /// The forge's thread identifier, opaque and only meaningful to it.
@@ -1138,12 +1097,8 @@ pub struct ForgeReviewThread {
     pub comments: Vec<ForgeReviewThreadComment>,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewThread);
-
 /// One comment inside a review thread.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeReviewThreadComment {
     /// Forge-assigned identifier of the comment.
@@ -1163,9 +1118,6 @@ pub struct ForgeReviewThreadComment {
     /// files it under a verdict rather than standing on its own.
     pub review_id: Option<i64>,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewThreadComment);
 
 impl From<but_github::PullRequestReviewThread> for ForgeReviewThread {
     fn from(thread: but_github::PullRequestReviewThread) -> Self {
@@ -1242,16 +1194,12 @@ pub async fn list_review_threads(
 /// open set; unknown kinds pass through rather than being dropped.
 /// Fetched fresh; not cached.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeReviewReaction {
     pub id: i64,
     pub kind: String,
     pub user: Option<ForgeReviewUser>,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewReaction);
 
 /// List the reactions on a review's description, oldest first. Each call
 /// hits the forge fresh (no DB cache).
@@ -1295,9 +1243,6 @@ fn github_reaction(reaction: but_github::Reaction) -> ForgeReviewReaction {
         user: reaction.user.map(ForgeReviewUser::from),
     }
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ReviewMergeStatus);
 
 /// Canonical clone URL for a review's base repo (the repo the PR
 /// targets). `None` for forges without a URL-based fork model.
@@ -1424,7 +1369,6 @@ pub async fn get_forge_review(
 /// other forges fall back to their default merge strategy when the
 /// caller asks for `Squash`/`Rebase`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ReviewMergeMethod {
     #[default]
@@ -1432,9 +1376,6 @@ pub enum ReviewMergeMethod {
     Squash,
     Rebase,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ReviewMergeMethod);
 
 impl From<&ReviewMergeMethod> for but_github::MergeMethod {
     fn from(value: &ReviewMergeMethod) -> Self {
@@ -1574,15 +1515,11 @@ pub async fn update_review(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ReviewState {
     Open,
     Closed,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ReviewState);
 
 impl ReviewState {
     fn as_github_str(&self) -> &'static str {
@@ -1923,852 +1860,6 @@ pub async fn create_forge_review(
             "Creating reviews for forge {forge:?} is not implemented yet.",
         ))),
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct ForgeReviewUpdate {
-    /// The unique identifier number for this review within its repository. This can be a PR or MR number.
-    pub number: i64,
-    /// The current body/description of the review, which may be None if no description is set.
-    pub body: Option<String>,
-    /// Whether the description should be synchronized. If false, the current description is
-    /// fetched from the forge before applying the configured stacking policy.
-    #[serde(default = "default_update_description")]
-    pub update_description: bool,
-    /// The platform-specific symbol for this review type (e.g., "#" for GitHub pull requests and "!" for MRs).
-    pub unit_symbol: String,
-    /// If set, update the base/target branch of this review to the given value.
-    pub target_branch: Option<String>,
-}
-
-fn default_update_description() -> bool {
-    true
-}
-
-/// The best-effort result of synchronizing review descriptions and target branches after a
-/// durable operation such as a push or review creation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "status", rename_all = "camelCase")]
-pub enum ReviewSyncOutcome {
-    /// There were no remote ref updates or no associated reviews in the selected ref slice.
-    NotNeeded,
-    /// Every associated review in the selected ref slice was synchronized.
-    Succeeded,
-    /// The durable operation succeeded, but one or more review updates failed.
-    Failed { message: String },
-}
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ReviewSyncOutcome);
-
-/// A newly-created review together with the best-effort stack synchronization result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct PublishReviewOutcome {
-    pub review: ForgeReview,
-    pub review_sync: ReviewSyncOutcome,
-}
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(PublishReviewOutcome);
-
-/// Controls the managed GitButler stack block in review descriptions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewStackingDescription {
-    Bottom,
-    Top,
-    Disabled,
-}
-
-/// Controls whether same-repository GitHub reviews use GitHub's native stacks API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitHubStackingMode {
-    /// Use native stacks when the repository supports them, description metadata otherwise.
-    Auto,
-    Disabled,
-    Native,
-}
-
-/// Remove native GitHub stack membership before changing review target branches.
-///
-/// The caller temporarily flattens reordered reviews onto trunk before pushing their refs. GitHub
-/// refuses to change the base branch of any stacked pull request — even when membership and
-/// ordering stay the same — so every native stack containing these reviews is dissolved first.
-///
-/// Returns the ordered memberships of the dissolved stacks so a failed push can restore them via
-/// [`restore_native_stacks`]. After a successful push, regular synchronization re-registers the
-/// desired membership.
-pub async fn prepare_review_target_updates(
-    preferred_forge_user: &Option<crate::ForgeUser>,
-    forge_repo_info: &crate::forge::ForgeRepoInfo,
-    forge_push_repo_info: &Option<crate::forge::ForgeRepoInfo>,
-    reviews: &[ForgeReviewUpdate],
-    storage: &but_forge_storage::Controller,
-    github_stacking_mode: GitHubStackingMode,
-) -> Result<Vec<Vec<i64>>> {
-    let crate::forge::ForgeRepoInfo {
-        forge, owner, repo, ..
-    } = forge_repo_info;
-    if *forge != ForgeName::GitHub
-        || github_stacking_mode == GitHubStackingMode::Disabled
-        || reviews.is_empty()
-    {
-        return Ok(Vec::new());
-    }
-
-    let (_, head_repo) = github_head_owner_and_repo(forge_repo_info, forge_push_repo_info);
-    if head_repo.is_some() {
-        return Ok(Vec::new());
-    }
-
-    let preferred_forge_user = resolve_account(preferred_forge_user, forge_repo_info, storage)?;
-    let preferred_account = preferred_forge_user.as_ref().and_then(|user| user.github());
-    let pr_numbers = reviews
-        .iter()
-        .map(|review| review.number)
-        .collect::<Vec<_>>();
-    let dissolved =
-        but_github::stacks::dissolve(preferred_account, owner, repo, &pr_numbers, storage).await?;
-    let but_github::stacks::Availability::Supported(stacks) = dissolved else {
-        return Ok(Vec::new());
-    };
-    // GitHub keeps closed pull requests as stack members but refuses to register a stack
-    // containing one, so they are dropped from the rollback snapshot. A stack needs two open
-    // members to be restorable at all.
-    Ok(stacks
-        .into_iter()
-        .filter_map(|stack| {
-            let open: Vec<i64> = stack
-                .pull_requests
-                .into_iter()
-                .filter(|review| !review.is_closed())
-                .map(|review| review.number)
-                .collect();
-            (open.len() >= 2).then_some(open)
-        })
-        .collect())
-}
-
-/// Re-register native stacks dissolved by [`prepare_review_target_updates`] after a failed push.
-///
-/// Call this only after the affected review target branches have been restored, so the recreated
-/// stacks match the bases GitHub sees.
-pub async fn restore_native_stacks(
-    preferred_forge_user: &Option<crate::ForgeUser>,
-    forge_repo_info: &crate::forge::ForgeRepoInfo,
-    stacks: &[Vec<i64>],
-    storage: &but_forge_storage::Controller,
-) -> Result<()> {
-    if stacks.is_empty() {
-        return Ok(());
-    }
-    if forge_repo_info.forge != ForgeName::GitHub {
-        anyhow::bail!(
-            "Restoring native stacks for forge {:?} is not implemented yet.",
-            forge_repo_info.forge
-        );
-    }
-    let crate::forge::ForgeRepoInfo { owner, repo, .. } = forge_repo_info;
-    let preferred_forge_user = resolve_account(preferred_forge_user, forge_repo_info, storage)?;
-    let preferred_account = preferred_forge_user.as_ref().and_then(|user| user.github());
-    let mut errors = Vec::new();
-    for pull_requests in stacks {
-        if let Err(err) =
-            but_github::stacks::create(preferred_account, owner, repo, pull_requests, storage).await
-        {
-            errors.push(format!("{err:#}"));
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "Could not restore native GitHub stack membership after the push failed:\n{}",
-            errors.join("\n")
-        )
-    }
-}
-
-async fn github_review_bodies(
-    preferred_account: Option<&but_github::GithubAccountIdentifier>,
-    owner: &str,
-    repo: &str,
-    reviews: &[ForgeReviewUpdate],
-    storage: &but_forge_storage::Controller,
-) -> Result<(Vec<Option<Option<String>>>, Vec<String>)> {
-    let mut bodies = Vec::with_capacity(reviews.len());
-    let mut errors = Vec::new();
-    for review in reviews {
-        if review.update_description {
-            bodies.push(Some(review.body.clone()));
-            continue;
-        }
-        match but_github::pr::get(
-            preferred_account,
-            owner,
-            repo,
-            review.number.try_into()?,
-            storage,
-        )
-        .await
-        {
-            Ok(review) => bodies.push(Some(review.body)),
-            Err(err) => {
-                errors.push(format!("PR #{} description: {err}", review.number));
-                bodies.push(None);
-            }
-        }
-    }
-    Ok((bodies, errors))
-}
-
-async fn sync_github_reviews_with_descriptions(
-    preferred_account: Option<&but_github::GithubAccountIdentifier>,
-    owner: &str,
-    repo: &str,
-    reviews: &[ForgeReviewUpdate],
-    storage: &but_forge_storage::Controller,
-    description_mode: ReviewStackingDescription,
-    update_bases: bool,
-) -> Result<Vec<String>> {
-    let pr_numbers: Vec<i64> = reviews.iter().map(|review| review.number).collect();
-    let (bodies, mut errors) =
-        github_review_bodies(preferred_account, owner, repo, reviews, storage).await?;
-    for (review, current_body) in reviews.iter().zip(bodies) {
-        let updated_body = current_body.map(|body| {
-            update_body_with_mode(
-                body.as_deref(),
-                review.number,
-                &pr_numbers,
-                "#",
-                description_mode,
-            )
-        });
-        let params = but_github::UpdatePullRequestParams {
-            owner,
-            repo,
-            pr_number: review.number,
-            title: None,
-            body: updated_body.as_deref(),
-            base: if update_bases {
-                review.target_branch.as_deref()
-            } else {
-                None
-            },
-            state: None,
-        };
-        if let Err(err) = but_github::pr::update(preferred_account, params, storage).await {
-            errors.push(format!("PR #{}: {err}", review.number));
-        }
-    }
-    Ok(errors)
-}
-
-async fn sync_github_native_reviews(
-    preferred_account: Option<&but_github::GithubAccountIdentifier>,
-    owner: &str,
-    repo: &str,
-    reviews: &[ForgeReviewUpdate],
-    storage: &but_forge_storage::Controller,
-) -> Result<but_github::stacks::Availability<Vec<String>>> {
-    let pr_numbers: Vec<i64> = reviews.iter().map(|review| review.number).collect();
-    let prepared =
-        but_github::stacks::prepare(preferred_account, owner, repo, &pr_numbers, storage).await?;
-    let but_github::stacks::Availability::Supported(mut prepared) = prepared else {
-        return Ok(but_github::stacks::Availability::Unsupported);
-    };
-
-    // A surviving stack pins every member's base except the bottom one, whose base is the
-    // stack's target branch. That base can still be stale — e.g. the workspace target changed
-    // while pre-push flattening was skipped for lack of cached current targets. Skipping it as
-    // locked would report success and mask the drift, so verify it and rebuild on mismatch.
-    if !prepared.locked.is_empty()
-        && let Some(bottom) = reviews.first()
-        && let Some(desired_target) = bottom.target_branch.as_deref()
-    {
-        let current = but_github::pr::get(
-            preferred_account,
-            owner,
-            repo,
-            bottom.number.try_into()?,
-            storage,
-        )
-        .await?;
-        if current.target_branch != desired_target {
-            but_github::stacks::dissolve(preferred_account, owner, repo, &pr_numbers, storage)
-                .await?;
-            prepared = but_github::stacks::PreparedPlan {
-                plan: but_github::stacks::ReconcilePlan::Create {
-                    desired: pr_numbers.clone(),
-                },
-                locked: Vec::new(),
-            };
-        }
-    }
-
-    let (bodies, mut errors) =
-        github_review_bodies(preferred_account, owner, repo, reviews, storage).await?;
-
-    // Rebuilds have to dissolve the old native membership before GitHub will accept reordered
-    // target branches. Legacy footers remain in place until the new native shape is durable.
-    but_github::stacks::unstack_conflicting(
-        preferred_account,
-        owner,
-        repo,
-        &prepared.plan,
-        storage,
-    )
-    .await?;
-
-    let mut target_errors = Vec::new();
-    for review in reviews {
-        let Some(target_branch) = review.target_branch.as_deref() else {
-            continue;
-        };
-        // GitHub rejects base updates for current stack members, even when the base is
-        // unchanged. Surviving members keep the bases the stack already enforces.
-        if prepared.locked.contains(&review.number) {
-            continue;
-        }
-        let params = but_github::UpdatePullRequestParams {
-            owner,
-            repo,
-            pr_number: review.number,
-            title: None,
-            body: None,
-            base: Some(target_branch),
-            state: None,
-        };
-        if let Err(err) = but_github::pr::update(preferred_account, params, storage).await {
-            target_errors.push(format!("PR #{} target: {err}", review.number));
-        }
-    }
-    if !target_errors.is_empty() {
-        // Dissolved membership stays dissolved here; the next successful synchronization sees
-        // no registered stacks and recreates the desired one.
-        anyhow::bail!(
-            "Could not update all PR targets before native stack registration:\n{}",
-            target_errors.join("\n")
-        );
-    }
-
-    but_github::stacks::finish(preferred_account, owner, repo, &prepared.plan, storage).await?;
-
-    // GitHub now renders the native stack, so GitButler's description footer is redundant.
-    // Strip any existing footers regardless of the configured description mode, which only
-    // applies to footer-based stacking. User text is preserved, and reviews whose body would
-    // not change are skipped entirely — unless the caller supplied a new description to push.
-    for (review, current_body) in reviews.iter().zip(bodies) {
-        let Some(current_body) = current_body else {
-            continue;
-        };
-        let updated_body = update_body_with_mode(
-            current_body.as_deref(),
-            review.number,
-            &pr_numbers,
-            "#",
-            ReviewStackingDescription::Disabled,
-        );
-        if !review.update_description && current_body.as_deref().unwrap_or("") == updated_body {
-            continue;
-        }
-        let params = but_github::UpdatePullRequestParams {
-            owner,
-            repo,
-            pr_number: review.number,
-            title: None,
-            body: Some(&updated_body),
-            base: None,
-            state: None,
-        };
-        if let Err(err) = but_github::pr::update(preferred_account, params, storage).await {
-            errors.push(format!("PR #{} description: {err}", review.number));
-        }
-    }
-    Ok(but_github::stacks::Availability::Supported(errors))
-}
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeReviewUpdate);
-
-impl From<ForgeReview> for ForgeReviewUpdate {
-    fn from(review: ForgeReview) -> Self {
-        ForgeReviewUpdate {
-            number: review.number,
-            body: review.body,
-            update_description: true,
-            unit_symbol: review.unit_symbol,
-            target_branch: Some(review.target_branch),
-        }
-    }
-}
-
-impl From<ForgeReviewTargetUpdate> for ForgeReviewUpdate {
-    fn from(update: ForgeReviewTargetUpdate) -> Self {
-        ForgeReviewUpdate {
-            number: update.number,
-            body: None,
-            update_description: false,
-            unit_symbol: String::new(),
-            target_branch: Some(update.target_branch),
-        }
-    }
-}
-
-/// Update reviews: description footers and, optionally, target/base branches.
-///
-/// Per-review failures are collected rather than aborting the batch.
-pub async fn sync_reviews(
-    preferred_forge_user: &Option<crate::ForgeUser>,
-    forge_repo_info: &crate::forge::ForgeRepoInfo,
-    forge_push_repo_info: &Option<crate::forge::ForgeRepoInfo>,
-    reviews: &[ForgeReviewUpdate],
-    storage: &but_forge_storage::Controller,
-    description_mode: ReviewStackingDescription,
-    github_stacking_mode: GitHubStackingMode,
-) -> Result<()> {
-    let crate::forge::ForgeRepoInfo {
-        forge, owner, repo, ..
-    } = forge_repo_info;
-    if reviews.is_empty() && *forge != ForgeName::Azure {
-        return Ok(());
-    }
-    let preferred_forge_user = resolve_account(preferred_forge_user, forge_repo_info, storage)?;
-
-    let mut errors: Vec<String> = Vec::new();
-
-    match forge {
-        ForgeName::GitHub => {
-            let preferred_account = preferred_forge_user.as_ref().and_then(|user| user.github());
-            let pr_numbers: Vec<i64> = reviews.iter().map(|r| r.number).collect();
-            let (_, head_repo) = github_head_owner_and_repo(forge_repo_info, forge_push_repo_info);
-            let use_native = github_stacking_mode != GitHubStackingMode::Disabled
-                && head_repo.is_none()
-                && !reviews.is_empty();
-            if use_native {
-                match sync_github_native_reviews(preferred_account, owner, repo, reviews, storage)
-                    .await
-                {
-                    Ok(but_github::stacks::Availability::Supported(native_errors)) => {
-                        errors.extend(native_errors);
-                    }
-                    Ok(but_github::stacks::Availability::Unsupported) => {
-                        // Under `Auto` an unenrolled repository is the expected case, not an error.
-                        if github_stacking_mode == GitHubStackingMode::Native {
-                            errors.push(
-                                "GitHub native stacks are not enabled for this repository"
-                                    .to_string(),
-                            );
-                        }
-                        errors.extend(
-                            sync_github_reviews_with_descriptions(
-                                preferred_account,
-                                owner,
-                                repo,
-                                reviews,
-                                storage,
-                                description_mode,
-                                true,
-                            )
-                            .await?,
-                        );
-                    }
-                    Err(err) => {
-                        errors.push(format!("GitHub native stack: {err}"));
-                        // Some reviews may still be native stack members, and GitHub rejects
-                        // base updates for members, so sync only descriptions. Because this
-                        // function returns an error, the caller does not cache the desired
-                        // targets, and the next synchronization still sees the drift and
-                        // reconciles bases and membership.
-                        errors.extend(
-                            sync_github_reviews_with_descriptions(
-                                preferred_account,
-                                owner,
-                                repo,
-                                reviews,
-                                storage,
-                                description_mode,
-                                false,
-                            )
-                            .await?,
-                        );
-                    }
-                }
-            } else {
-                if github_stacking_mode == GitHubStackingMode::Disabled
-                    && head_repo.is_none()
-                    && !reviews.is_empty()
-                    && let Err(err) = but_github::stacks::dissolve(
-                        preferred_account,
-                        owner,
-                        repo,
-                        &pr_numbers,
-                        storage,
-                    )
-                    .await
-                {
-                    errors.push(format!("GitHub native stack removal: {err}"));
-                }
-                errors.extend(
-                    sync_github_reviews_with_descriptions(
-                        preferred_account,
-                        owner,
-                        repo,
-                        reviews,
-                        storage,
-                        description_mode,
-                        true,
-                    )
-                    .await?,
-                );
-            }
-        }
-        ForgeName::GitLab => {
-            let project_id = GitLabProjectId::new(owner, repo);
-            let preferred_account = preferred_forge_user.as_ref().and_then(|user| user.gitlab());
-            let mr_iids: Vec<i64> = reviews.iter().map(|r| r.number).collect();
-
-            for review in reviews {
-                let current_body = if !review.update_description {
-                    match but_gitlab::mr::get(
-                        preferred_account,
-                        project_id.clone(),
-                        review.number.try_into()?,
-                        storage,
-                    )
-                    .await
-                    {
-                        Ok(review) => Some(review.description),
-                        Err(err) => {
-                            errors.push(format!("MR !{} description: {err}", review.number));
-                            None
-                        }
-                    }
-                } else {
-                    Some(review.body.clone())
-                };
-                let updated_body = current_body.map(|body| {
-                    update_body_with_mode(
-                        body.as_deref(),
-                        review.number,
-                        &mr_iids,
-                        "!",
-                        description_mode,
-                    )
-                });
-
-                let params = but_gitlab::UpdateMergeRequestParams {
-                    project_id: project_id.clone(),
-                    mr_iid: review.number,
-                    title: None,
-                    description: updated_body.as_deref(),
-                    target_branch: review.target_branch.as_deref(),
-                    state_event: None,
-                };
-
-                if let Err(err) = but_gitlab::mr::update(preferred_account, params, storage).await {
-                    errors.push(format!("MR !{}: {err}", review.number));
-                }
-            }
-        }
-        ForgeName::Bitbucket => {
-            let preferred_account = preferred_forge_user
-                .as_ref()
-                .and_then(|user| user.bitbucket());
-            let pr_ids: Vec<i64> = reviews.iter().map(|r| r.number).collect();
-
-            for review in reviews {
-                let current_body = if !review.update_description {
-                    match but_bitbucket::pr::get(
-                        preferred_account,
-                        owner,
-                        repo,
-                        review.number.try_into()?,
-                        storage,
-                    )
-                    .await
-                    {
-                        Ok(review) => Some(review.description),
-                        Err(err) => {
-                            errors.push(format!("PR #{} description: {err}", review.number));
-                            None
-                        }
-                    }
-                } else {
-                    Some(review.body.clone())
-                };
-                let updated_body = current_body.map(|body| {
-                    update_body_with_mode(
-                        body.as_deref(),
-                        review.number,
-                        &pr_ids,
-                        "#",
-                        description_mode,
-                    )
-                });
-
-                let params = but_bitbucket::UpdatePullRequestParams {
-                    workspace: owner,
-                    repo_slug: repo,
-                    id: review.number,
-                    title: None,
-                    description: updated_body.as_deref(),
-                    target_branch: review.target_branch.as_deref(),
-                };
-
-                if let Err(err) =
-                    but_bitbucket::pr::update(preferred_account, params, storage).await
-                {
-                    errors.push(format!("PR #{}: {err}", review.number));
-                }
-            }
-        }
-        _ => {
-            return Err(Error::msg(format!(
-                "Updating reviews for forge {forge:?} is not implemented yet.",
-            )));
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::msg(format!(
-            "Some reviews failed to update:\n{}",
-            errors.join("\n")
-        )))
-    }
-}
-
-/// A target branch update for a single review (PR/MR).
-#[derive(Debug, Clone)]
-pub struct ForgeReviewTargetUpdate {
-    pub number: i64,
-    pub target_branch: String,
-}
-
-/// Compute the expected target branch for each review in a stack.
-/// Walks branches bottom-to-top; each review targets the preceding reviewed branch
-/// (or `base_branch` for the bottom-most review). Branches without reviews are skipped:
-/// they are part of the Git stack, but cannot be valid forge review targets.
-pub fn compute_review_target_updates(
-    heads: &[(String, Option<i64>)],
-    base_branch: &str,
-) -> Vec<ForgeReviewTargetUpdate> {
-    let mut updates = Vec::new();
-    let mut current_target = base_branch;
-    // heads are expected bottom-to-top (base branch first).
-    for (branch_name, review_number) in heads {
-        if let Some(number) = review_number {
-            updates.push(ForgeReviewTargetUpdate {
-                number: *number,
-                target_branch: current_target.to_string(),
-            });
-            current_target = branch_name;
-        }
-    }
-    updates
-}
-
-/// Replaces or inserts a new footer into an existing body of text.
-///
-/// If there is only one PR in the stack, no footer is appended and any existing
-/// footer is removed.
-///
-/// # Arguments
-/// * `body` - The existing PR body text (may be None or empty)
-/// * `pr_number` - The PR number for which to update the body
-/// * `all_pr_numbers` - All PR numbers in the stack (ordered from base to top)
-/// * `symbol` - The symbol to use before the PR number (e.g., "#" or "!")
-///
-/// # Returns
-/// The updated body with the footer replaced, inserted, or removed
-#[cfg(test)]
-fn update_body(body: Option<&str>, pr_number: i64, all_pr_numbers: &[i64], symbol: &str) -> String {
-    update_body_with_mode(
-        body,
-        pr_number,
-        all_pr_numbers,
-        symbol,
-        ReviewStackingDescription::Bottom,
-    )
-}
-
-fn update_body_with_mode(
-    body: Option<&str>,
-    pr_number: i64,
-    all_pr_numbers: &[i64],
-    symbol: &str,
-    mode: ReviewStackingDescription,
-) -> String {
-    let body = body.unwrap_or("");
-    let user_body = match strip_managed_footers(body) {
-        ManagedFooter::Complete { user_body } => user_body,
-        ManagedFooter::Malformed => {
-            // Never infer a boundary from incomplete or out-of-order markers: they may be user
-            // content. In particular, don't add another managed block alongside them.
-            return body.to_string();
-        }
-        ManagedFooter::Absent => {
-            return match (all_pr_numbers.len(), mode) {
-                (0 | 1, _) | (_, ReviewStackingDescription::Disabled) => body.to_string(),
-                (_, ReviewStackingDescription::Bottom) => compose_body(
-                    body,
-                    &generate_footer_with_mode(
-                        pr_number,
-                        all_pr_numbers,
-                        symbol,
-                        ReviewStackingDescription::Bottom,
-                    ),
-                    "",
-                ),
-                (_, ReviewStackingDescription::Top) => compose_body(
-                    "",
-                    &generate_footer_with_mode(
-                        pr_number,
-                        all_pr_numbers,
-                        symbol,
-                        ReviewStackingDescription::Top,
-                    ),
-                    body,
-                ),
-            };
-        }
-    };
-
-    if all_pr_numbers.len() <= 1 || mode == ReviewStackingDescription::Disabled {
-        return user_body;
-    }
-
-    let footer = generate_footer_with_mode(pr_number, all_pr_numbers, symbol, mode);
-    match mode {
-        ReviewStackingDescription::Bottom => compose_body(&user_body, &footer, ""),
-        ReviewStackingDescription::Top => compose_body("", &footer, &user_body),
-        ReviewStackingDescription::Disabled => unreachable!("handled above"),
-    }
-}
-
-enum ManagedFooter {
-    Absent,
-    Complete { user_body: String },
-    Malformed,
-}
-
-fn strip_managed_footers(body: &str) -> ManagedFooter {
-    let mut remainder = body;
-    let mut user_parts = Vec::new();
-    let mut found = false;
-
-    loop {
-        let top = remainder.find(STACKING_FOOTER_BOUNDARY_TOP);
-        let bottom = remainder.find(STACKING_FOOTER_BOUNDARY_BOTTOM);
-        match (top, bottom) {
-            (None, None) => {
-                if !found {
-                    return ManagedFooter::Absent;
-                }
-                user_parts.push(remainder);
-                return ManagedFooter::Complete {
-                    user_body: user_parts
-                        .into_iter()
-                        .map(str::trim)
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
-                };
-            }
-            (None, Some(_)) => return ManagedFooter::Malformed,
-            (Some(top), Some(bottom)) if bottom < top => {
-                return ManagedFooter::Malformed;
-            }
-            (Some(top), _) => {
-                let after_top = top + STACKING_FOOTER_BOUNDARY_TOP.len();
-                let Some(bottom) = remainder[after_top..]
-                    .find(STACKING_FOOTER_BOUNDARY_BOTTOM)
-                    .map(|bottom| bottom + after_top)
-                else {
-                    return ManagedFooter::Malformed;
-                };
-                user_parts.push(&remainder[..top]);
-                remainder = &remainder[bottom + STACKING_FOOTER_BOUNDARY_BOTTOM.len()..];
-                found = true;
-            }
-        }
-    }
-}
-
-fn compose_body(head: &str, footer: &str, tail: &str) -> String {
-    [head.trim(), footer.trim(), tail.trim()]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// Generates a footer for use in pull request descriptions when part of a stack.
-///
-/// # Arguments
-/// * `for_pr_number` - The PR number for which to generate the footer
-/// * `all_pr_numbers` - All PR numbers in the stack (ordered from base to top)
-/// * `symbol` - The symbol to use before the PR number (e.g., "#" or "!")
-///
-/// # Returns
-/// A formatted markdown footer string with stack information
-#[cfg(test)]
-fn generate_footer(for_pr_number: i64, all_pr_numbers: &[i64], symbol: &str) -> String {
-    generate_footer_with_mode(
-        for_pr_number,
-        all_pr_numbers,
-        symbol,
-        ReviewStackingDescription::Bottom,
-    )
-}
-
-fn generate_footer_with_mode(
-    for_pr_number: i64,
-    all_pr_numbers: &[i64],
-    symbol: &str,
-    mode: ReviewStackingDescription,
-) -> String {
-    let stack_length = all_pr_numbers.len();
-    let stack_index = all_pr_numbers
-        .iter()
-        .position(|&n| n == for_pr_number)
-        .unwrap_or(0);
-    let nth = stack_index + 1;
-
-    let mut footer = String::new();
-    footer.push_str(STACKING_FOOTER_BOUNDARY_TOP);
-    footer.push('\n');
-    if mode == ReviewStackingDescription::Bottom {
-        footer.push_str("---\n");
-    }
-    footer.push_str(&format!(
-        "This is **part {nth} of {stack_length} in a stack** made with GitButler:\n"
-    ));
-
-    for (i, &pr_number) in all_pr_numbers.iter().rev().enumerate() {
-        let current = pr_number == for_pr_number;
-        let indicator = if current { "👈 " } else { "" };
-        footer.push_str(&format!(
-            "- <kbd>&nbsp;{}&nbsp;</kbd> {}{}{}{}\n",
-            stack_length - i,
-            symbol,
-            pr_number,
-            if current { " " } else { "" },
-            indicator
-        ));
-    }
-
-    if mode == ReviewStackingDescription::Top {
-        footer.push_str("---\n");
-    }
-    footer.push_str(STACKING_FOOTER_BOUNDARY_BOTTOM);
-    footer
 }
 
 #[cfg(test)]
@@ -3216,485 +2307,5 @@ mod tests {
         assert!(is_review_template_gitlab(
             ".gitlab\\merge_request_templates\\Default.md"
         ));
-    }
-
-    #[test]
-    fn test_generate_footer_single_pr() {
-        let footer = generate_footer(123, &[123], "#");
-        assert!(footer.contains(STACKING_FOOTER_BOUNDARY_TOP));
-        assert!(footer.contains(STACKING_FOOTER_BOUNDARY_BOTTOM));
-        assert!(footer.contains("part 1 of 1 in a stack"));
-        assert!(footer.contains("#123"));
-        assert!(footer.contains("👈"));
-    }
-
-    #[test]
-    fn test_generate_footer_multiple_prs() {
-        let all_prs = vec![100, 101, 102];
-        let footer = generate_footer(101, &all_prs, "#");
-
-        assert!(footer.contains("part 2 of 3 in a stack"));
-        assert!(footer.contains("#100"));
-        assert!(footer.contains("#101"));
-        assert!(footer.contains("#102"));
-
-        // The current PR (101) should have the pointing emoji
-        let lines: Vec<&str> = footer.lines().collect();
-        let pr_101_line = lines.iter().find(|l| l.contains("#101")).unwrap();
-        assert!(pr_101_line.contains("👈"));
-
-        // Other PRs should not have the emoji
-        let pr_100_line = lines.iter().find(|l| l.contains("#100")).unwrap();
-        assert!(!pr_100_line.contains("👈"));
-    }
-
-    #[test]
-    fn test_generate_footer_with_custom_symbol() {
-        let footer = generate_footer(42, &[41, 42, 43], "!");
-        assert!(footer.contains("!41"));
-        assert!(footer.contains("!42"));
-        assert!(footer.contains("!43"));
-    }
-
-    #[test]
-    fn test_generate_footer_numbering() {
-        let all_prs = vec![100, 101, 102, 103];
-        let footer = generate_footer(101, &all_prs, "#");
-
-        let lines: Vec<&str> = footer.lines().collect();
-
-        // Check that numbering goes from top (4) to bottom (1)
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("<kbd>&nbsp;1&nbsp;</kbd>") && l.contains("#100"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("<kbd>&nbsp;2&nbsp;</kbd>") && l.contains("#101"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("<kbd>&nbsp;3&nbsp;</kbd>") && l.contains("#102"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("<kbd>&nbsp;4&nbsp;</kbd>") && l.contains("#103"))
-        );
-    }
-
-    #[test]
-    fn test_update_body_none() {
-        let result = update_body(None, 123, &[123, 124], "#");
-        assert!(result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-        assert!(result.contains(STACKING_FOOTER_BOUNDARY_BOTTOM));
-        assert!(result.contains("#123"));
-    }
-
-    #[test]
-    fn test_update_body_empty() {
-        let result = update_body(Some(""), 123, &[123, 124], "#");
-        assert!(result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-        assert!(result.contains(STACKING_FOOTER_BOUNDARY_BOTTOM));
-        assert!(result.contains("#123"));
-    }
-
-    #[test]
-    fn test_update_body_with_existing_content() {
-        let body = "This is my PR description.\n\nIt has multiple lines.";
-        let result = update_body(Some(body), 123, &[123, 124], "#");
-
-        assert!(result.starts_with("This is my PR description.\n\nIt has multiple lines."));
-        assert!(result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-        assert!(result.contains(STACKING_FOOTER_BOUNDARY_BOTTOM));
-        assert!(result.contains("#123"));
-    }
-
-    #[test]
-    fn test_footer_ordering_base_to_top() {
-        // PRs should be listed from base (oldest) at bottom to top (newest) at top
-        let all_prs = vec![100, 101, 102, 103]; // base to top order
-        let footer = generate_footer(102, &all_prs, "#");
-
-        let lines: Vec<&str> = footer.lines().collect();
-
-        // Find the indices of each PR in the footer
-        let pr_100_idx = lines.iter().position(|l| l.contains("#100")).unwrap();
-        let pr_101_idx = lines.iter().position(|l| l.contains("#101")).unwrap();
-        let pr_102_idx = lines.iter().position(|l| l.contains("#102")).unwrap();
-        let pr_103_idx = lines.iter().position(|l| l.contains("#103")).unwrap();
-
-        // The top PR (103) should appear first, base PR (100) should appear last
-        assert!(pr_103_idx < pr_102_idx);
-        assert!(pr_102_idx < pr_101_idx);
-        assert!(pr_101_idx < pr_100_idx);
-    }
-
-    #[test]
-    fn test_footer_position_indicator_first_pr() {
-        let all_prs = vec![100, 101, 102];
-        let footer = generate_footer(100, &all_prs, "#");
-
-        let lines: Vec<&str> = footer.lines().collect();
-        let pr_100_line = lines.iter().find(|l| l.contains("#100")).unwrap();
-
-        assert!(pr_100_line.contains("👈"));
-        assert!(pr_100_line.contains("<kbd>&nbsp;1&nbsp;</kbd>"));
-    }
-
-    #[test]
-    fn test_footer_position_indicator_last_pr() {
-        let all_prs = vec![100, 101, 102];
-        let footer = generate_footer(102, &all_prs, "#");
-
-        let lines: Vec<&str> = footer.lines().collect();
-        let pr_102_line = lines.iter().find(|l| l.contains("#102")).unwrap();
-
-        assert!(pr_102_line.contains("👈"));
-        assert!(pr_102_line.contains("<kbd>&nbsp;3&nbsp;</kbd>"));
-    }
-
-    #[test]
-    fn test_update_body_multiple_prs_to_single_pr() {
-        let old_footer = generate_footer(123, &[122, 123, 124], "#");
-        let body = format!("Description\n\n{old_footer}");
-
-        // Update to a single PR stack
-        let result = update_body(Some(&body), 123, &[123], "#");
-
-        assert_eq!(result, "Description");
-        assert!(!result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-    }
-
-    #[test]
-    fn test_update_body_maintains_proper_spacing() {
-        let body = "First paragraph\n\nSecond paragraph";
-        let result = update_body(Some(body), 100, &[100, 101], "#");
-
-        // Should have proper spacing between description and footer
-        assert!(result.contains("First paragraph\n\nSecond paragraph\n\n"));
-        assert!(result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-    }
-
-    #[test]
-    fn test_generate_footer_large_stack() {
-        let all_prs: Vec<i64> = (1..=10).collect();
-        let footer = generate_footer(5, &all_prs, "#");
-
-        assert!(footer.contains("part 5 of 10 in a stack"));
-
-        // Verify all PRs are listed
-        for pr in &all_prs {
-            assert!(footer.contains(&format!("#{pr}")));
-        }
-    }
-
-    #[test]
-    fn test_footer_part_number_matches_position_badge() {
-        let all_prs = vec![100, 101, 102, 103, 104];
-        for (idx, &pr) in all_prs.iter().enumerate() {
-            let footer = generate_footer(pr, &all_prs, "#");
-            let position = idx + 1;
-
-            assert!(
-                footer.contains(&format!("part {position} of {}", all_prs.len())),
-                "PR #{pr} (base position {position}) should be \"part {position}\":\n{footer}"
-            );
-
-            let current_line = footer
-                .lines()
-                .find(|l| l.contains(&format!("#{pr}")) && l.contains("👈"))
-                .unwrap_or_else(|| panic!("no current line for #{pr}:\n{footer}"));
-            assert!(
-                current_line.contains(&format!("<kbd>&nbsp;{position}&nbsp;</kbd>")),
-                "PR #{pr} badge should be {position}:\n{current_line}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_update_body_with_tail_and_multiple_newlines() {
-        let old_footer = generate_footer(100, &[100, 101], "#");
-        let body = format!("Head\n\n{old_footer}\n\n\n\nTail with gaps");
-
-        let result = update_body(Some(&body), 100, &[100, 101, 102], "#");
-
-        assert!(result.contains("Head"));
-        assert!(result.contains("Tail with gaps"));
-        assert!(result.contains("#102"));
-    }
-
-    #[test]
-    fn test_update_body_replaces_existing_footer() {
-        let old_footer = generate_footer(123, &[123], "#");
-        let body = format!("My description\n\n{old_footer}\n\nSome trailing content");
-
-        let result = update_body(Some(&body), 123, &[123, 124], "#");
-
-        // Should contain the original description
-        assert!(result.contains("My description"));
-        // Should contain the trailing content
-        assert!(result.contains("Some trailing content"));
-        // Should have the new footer with both PRs
-        assert!(result.contains("#123"));
-        assert!(result.contains("#124"));
-        // Should only have one footer (not duplicated)
-        let boundary_count = result.matches(STACKING_FOOTER_BOUNDARY_TOP).count();
-        assert_eq!(boundary_count, 1);
-    }
-
-    #[test]
-    fn test_update_body_preserves_head_and_tail() {
-        let body = format!(
-            "Head content\n\n{STACKING_FOOTER_BOUNDARY_TOP}\n---\nOld footer\n{STACKING_FOOTER_BOUNDARY_BOTTOM}\n\nTail content"
-        );
-
-        let result = update_body(Some(&body), 456, &[456, 457], "!");
-
-        assert!(result.starts_with("Head content"));
-        assert!(result.contains("Head content\n\nTail content"));
-        assert!(result.ends_with(STACKING_FOOTER_BOUNDARY_BOTTOM));
-        assert!(result.contains("!456"));
-        assert!(result.contains("!457"));
-        assert!(!result.contains("Old footer"));
-    }
-
-    #[test]
-    fn test_update_body_trims_whitespace() {
-        let body = "  Content with spaces  ";
-        let result = update_body(Some(body), 100, &[100, 101], "#");
-
-        assert!(result.starts_with("Content with spaces"));
-        assert!(!result.starts_with("  Content"));
-    }
-
-    #[test]
-    fn test_update_body_single_pr_no_footer() {
-        let body = "This is my PR description.";
-        let result = update_body(Some(body), 123, &[123], "#");
-
-        // Should contain the description
-        assert_eq!(result, "This is my PR description.");
-        // Should NOT contain any footer
-        assert!(!result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-        assert!(!result.contains(STACKING_FOOTER_BOUNDARY_BOTTOM));
-        assert!(!result.contains("#123"));
-    }
-
-    #[test]
-    fn test_update_body_single_pr_removes_existing_footer() {
-        let old_footer = generate_footer(123, &[123, 124], "#");
-        let body = format!("My description\n\n{old_footer}\n\nSome trailing content");
-
-        // Now updating with just one PR should remove the footer
-        let result = update_body(Some(&body), 123, &[123], "#");
-
-        assert!(result.contains("My description"));
-        assert!(result.contains("Some trailing content"));
-        assert!(!result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-        assert!(!result.contains(STACKING_FOOTER_BOUNDARY_BOTTOM));
-    }
-
-    #[test]
-    fn test_update_body_single_pr_empty_body() {
-        let result = update_body(None, 123, &[123], "#");
-
-        // Should return empty string (or just whitespace)
-        assert!(result.is_empty() || result.trim().is_empty());
-        assert!(!result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-    }
-
-    #[test]
-    fn test_update_body_single_pr_with_tail() {
-        let old_footer = generate_footer(123, &[123], "#");
-        let body = format!("Head content\n\n{old_footer}\n\nTail content");
-
-        let result = update_body(Some(&body), 123, &[123], "#");
-
-        assert_eq!(result, "Head content\n\nTail content");
-        assert!(!result.contains(STACKING_FOOTER_BOUNDARY_TOP));
-    }
-
-    #[test]
-    fn update_body_top_places_footer_before_user_content() {
-        let result = update_body_with_mode(
-            Some("User description"),
-            101,
-            &[100, 101],
-            "#",
-            ReviewStackingDescription::Top,
-        );
-
-        assert!(
-            result.starts_with(STACKING_FOOTER_BOUNDARY_TOP),
-            "top mode places the managed block first"
-        );
-        assert!(
-            result.ends_with("User description"),
-            "top mode preserves user content after the managed block"
-        );
-    }
-
-    #[test]
-    fn update_body_bottom_produces_stack_information_after_user_content() {
-        let result = update_body_with_mode(
-            Some("User description"),
-            101,
-            &[100, 101],
-            "#",
-            ReviewStackingDescription::Bottom,
-        );
-
-        assert_eq!(
-            result,
-            "User description\n\n\
-             <!-- GitButler Footer Boundary Top -->\n\
-             ---\n\
-             This is **part 2 of 2 in a stack** made with GitButler:\n\
-             - <kbd>&nbsp;2&nbsp;</kbd> #101 👈 \n\
-             - <kbd>&nbsp;1&nbsp;</kbd> #100\n\
-             <!-- GitButler Footer Boundary Bottom -->",
-            "bottom mode separates user content from the complete stack information section"
-        );
-    }
-
-    #[test]
-    fn update_body_top_produces_stack_information_before_user_content() {
-        let result = update_body_with_mode(
-            Some("User description"),
-            101,
-            &[100, 101],
-            "#",
-            ReviewStackingDescription::Top,
-        );
-
-        assert_eq!(
-            result,
-            "<!-- GitButler Footer Boundary Top -->\n\
-             This is **part 2 of 2 in a stack** made with GitButler:\n\
-             - <kbd>&nbsp;2&nbsp;</kbd> #101 👈 \n\
-             - <kbd>&nbsp;1&nbsp;</kbd> #100\n\
-             ---\n\
-             <!-- GitButler Footer Boundary Bottom -->\n\n\
-             User description",
-            "top mode puts the separator below the complete stack information section"
-        );
-    }
-
-    #[test]
-    fn update_body_relocates_footer_between_bottom_and_top() {
-        let bottom = update_body_with_mode(
-            Some("User description"),
-            100,
-            &[100, 101],
-            "#",
-            ReviewStackingDescription::Bottom,
-        );
-        let top = update_body_with_mode(
-            Some(&bottom),
-            100,
-            &[100, 101],
-            "#",
-            ReviewStackingDescription::Top,
-        );
-        let bottom_again = update_body_with_mode(
-            Some(&top),
-            100,
-            &[100, 101],
-            "#",
-            ReviewStackingDescription::Bottom,
-        );
-
-        assert!(
-            top.starts_with(STACKING_FOOTER_BOUNDARY_TOP),
-            "changing to top relocates the existing block"
-        );
-        assert!(
-            bottom_again.starts_with("User description"),
-            "changing back to bottom restores user content first"
-        );
-        assert_eq!(
-            bottom_again.matches(STACKING_FOOTER_BOUNDARY_TOP).count(),
-            1,
-            "mode changes keep exactly one managed block"
-        );
-    }
-
-    #[test]
-    fn update_body_disabled_removes_footer_and_preserves_user_content() {
-        let body = format!("Head\n\n{}\n\nTail", generate_footer(100, &[100, 101], "#"));
-        let result = update_body_with_mode(
-            Some(&body),
-            100,
-            &[100, 101],
-            "#",
-            ReviewStackingDescription::Disabled,
-        );
-
-        assert_eq!(result, "Head\n\nTail");
-    }
-
-    #[test]
-    fn update_body_leaves_malformed_boundaries_untouched() {
-        let cases = [
-            format!("Intro\n\n{STACKING_FOOTER_BOUNDARY_TOP}\ndangling"),
-            format!("dangling\n{STACKING_FOOTER_BOUNDARY_BOTTOM}\n\nTail"),
-            format!("{STACKING_FOOTER_BOUNDARY_BOTTOM}\ntext\n{STACKING_FOOTER_BOUNDARY_TOP}"),
-        ];
-
-        for body in cases {
-            let result = update_body_with_mode(
-                Some(&body),
-                100,
-                &[100, 101],
-                "#",
-                ReviewStackingDescription::Bottom,
-            );
-            assert_eq!(
-                result, body,
-                "incomplete or out-of-order boundaries may be user content"
-            );
-        }
-    }
-
-    #[test]
-    fn update_body_is_idempotent_for_each_mode() {
-        for mode in [
-            ReviewStackingDescription::Bottom,
-            ReviewStackingDescription::Top,
-            ReviewStackingDescription::Disabled,
-        ] {
-            let once = update_body_with_mode(Some("Description"), 100, &[100, 101], "#", mode);
-            let twice = update_body_with_mode(Some(&once), 100, &[100, 101], "#", mode);
-            assert_eq!(twice, once, "repeating {mode:?} does not rewrite the body");
-        }
-    }
-
-    #[test]
-    fn update_body_collapses_duplicate_managed_blocks() {
-        let first = generate_footer(100, &[100, 101], "#");
-        let second = generate_footer(100, &[100, 101, 102], "#");
-        let body = format!("Head\n\n{first}\n\nMiddle\n\n{second}\n\nTail");
-
-        let result = update_body_with_mode(
-            Some(&body),
-            100,
-            &[100, 101, 102],
-            "#",
-            ReviewStackingDescription::Bottom,
-        );
-
-        assert!(
-            result.starts_with("Head\n\nMiddle\n\nTail"),
-            "content around duplicate blocks is preserved in order"
-        );
-        assert_eq!(
-            result.matches(STACKING_FOOTER_BOUNDARY_TOP).count(),
-            1,
-            "synchronization repairs duplicate managed blocks"
-        );
     }
 }

@@ -55,47 +55,6 @@ EOF
 }
 
 
-# can only be called once per test setup
-function create_workspace_commit_once() {
-  local workspace_commit_subject="GitButler Workspace Commit"
-
-  if [ $# == 1 ]; then
-    local current_branch=$(git rev-parse --abbrev-ref HEAD)
-    if [[ "$current_branch" != "$1" ]]; then
-      echo "BUG: Must assure the current branch is the branch passed as argument: $current_branch != $1"
-      return 42
-    fi
-  fi
-
-  git checkout -b gitbutler/workspace
-  if [ $# == 1 ] || [ $# == 0 ]; then
-    git commit --allow-empty -m "$workspace_commit_subject"
-  else
-    git merge --no-ff -m "$workspace_commit_subject" "${@}"
-  fi
-}
-
-# can only be called once per test setup, and definitely doesn't do anything smart like the above version.
-# TODO: Both yield different results due to the way the merge is done, so that's maybe something to double-check as well.
-function create_workspace_commit_aggressively() {
-  local workspace_commit_subject="GitButler Workspace Commit"
-
-  if [ $# == 1 ]; then
-    local current_branch=$(git rev-parse --abbrev-ref HEAD)
-    if [[ "$current_branch" != "$1" ]]; then
-      echo "BUG: Must assure the current branch is the branch passed as argument: $current_branch != $1"
-      return 42
-    fi
-  fi
-
-  git checkout -b gitbutler/workspace main
-  if [ $# == 1 ] || [ $# == 0 ]; then
-    git commit --allow-empty -m "$workspace_commit_subject"
-  else
-    git merge --no-ff --strategy octopus -m "$workspace_commit_subject" "${@}"
-  fi
-}
-
 function add_main_remote_setup() {
   cat <<EOF >>.git/config
 [remote "origin"]
@@ -117,27 +76,6 @@ function commit-file() {
   local name="${1:?First argument is the filename}"
   local content=${2:-$1}
   echo $content >$name && git add $name && git commit -m "add $content"
-}
-
-function add_change_id_to_given_commit() {
-  local a="00000000-0000-0000-0000-000000000000"
-  local b="${1:?first argument is the single-digit number of the change-id}"
-  local change_id="${a:0:${#a}-${#b}}${b}"
-
-   # Insert the GitButler header lines at the first blank line (before the commit message).
-   git cat-file -p "${2:?second argument is the commit to add a changeid to}" \
-   | awk -v cid="$change_id" '
-     BEGIN { injected = 0 }
-     /^$/ && !injected {
-       print "gitbutler-headers-version 2"
-       print "gitbutler-change-id " cid
-       print ""
-       injected = 1
-       next
-     }
-     { print }
-     ' \
-   | git hash-object -wt commit --stdin
 }
 
 function write_ref_safely() {

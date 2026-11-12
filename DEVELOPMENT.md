@@ -29,11 +29,16 @@ cargo fmt
 ## Debugging
 
 - Logs honour `RUST_LOG`.
-- `but-path` decides where app data, config and cache live; tests redirect it to throw-away directories.
+- App data, config and cache live under the `gitcthulhu` identity (`crates/gitcthulhu/src/paths.rs`, mirrored by
+  `but-path`); `GITCTHULHU_HOME` redirects all of them, which the tests use for throw-away directories.
 - `.cargo/config.toml` sets `--cfg tokio_unstable` for Tokio diagnostics.
 
 ## Installer and updater
 
-`but-installer` (with `scripts/install.sh`) and `but-update` are kept as crates but still point at GitButler's
-release endpoints (`app.gitbutler.com`, `releases.gitbutler.com`) and the macOS installer expects an app bundle
-containing the old desktop binary plus the askpass helper. Re-pointing them at GitCthulhu releases is future work.
+`but-installer` (with `scripts/install.sh`) and `but-update` have no built-in endpoints. The installer needs
+`GITCTHULHU_RELEASE_URL` (release API base URL) and `GITCTHULHU_RELEASE_PUBLIC_KEY` (minisign key of the releases),
+the bootstrap script additionally `GITCTHULHU_INSTALLER_URL`; release information is only accepted from the
+configured host, downloads also from its subdomains, always over HTTPS. The macOS installer expects a
+`GitCthulhu.app` bundle with `Contents/MacOS/{gitcthulhu,gitcthulhu-askpass,gitcthulhu-editor}`, the Linux one a
+`gitcthulhu` binary (plus `gitcthulhu.sig`) next to the platform download. The release pipeline that publishes these
+is future work.

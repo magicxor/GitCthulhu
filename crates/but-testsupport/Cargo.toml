@@ -17,12 +17,10 @@ snapbox = ["dep:snapbox"]
 
 [dependencies]
 but-core.workspace = true
-but-db.workspace = true
 
 gix-testtools.workspace = true
 gix = { workspace = true, features = ["revision"] }
 anyhow.workspace = true
-temp-env = "0.3"
 termtree = "0.5.1"
 regex = { workspace = true }
 snapbox = { workspace = true, optional = true, features = ["regex"] }

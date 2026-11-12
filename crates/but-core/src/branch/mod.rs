@@ -8,6 +8,9 @@ type WorktreePathByRef = BTreeMap<gix::refs::FullName, Vec<PathBuf>>;
 mod normalize;
 pub use normalize::normalize_short_name;
 
+mod tracking;
+pub use tracking::{LocalRefName, LocalTrackingBranchMatch, find_local_tracking_branch};
+
 mod generate;
 pub use generate::{
     canned_refname, find_unique_refname, find_unique_refname_excluding, refuse_colliding_refname,

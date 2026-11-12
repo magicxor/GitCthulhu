@@ -1,10 +1,8 @@
 use anyhow::Result;
 use but_forge::{
-    CacheConfig, ForgeName, ForgeRepoInfo, ForgeReview, ForgeReviewTargetUpdate, ForgeReviewThread,
-    ForgeReviewThreadComment, ForgeReviewThreadSide, ForgeReviewUpdate, GitHubStackingMode,
-    ReviewStackingDescription, ReviewState, ReviewUpdatePayload, compute_review_target_updates,
-    list_cached_forge_reviews, list_forge_reviews_with_cache, prepare_review_target_updates,
-    restore_native_stacks, sync_reviews, update_review,
+    CacheConfig, ForgeName, ForgeRepoInfo, ForgeReview, ForgeReviewThread,
+    ForgeReviewThreadComment, ForgeReviewThreadSide, ReviewState, ReviewUpdatePayload,
+    list_cached_forge_reviews, list_forge_reviews_with_cache, update_review,
 };
 
 /// Run `future` to completion; the code under test is async, the tests are not.
@@ -154,7 +152,7 @@ fn unusable_storage(tmp: &tempfile::TempDir) -> but_forge_storage::Controller {
 }
 
 #[test]
-fn cached_reviews_and_empty_sync_do_not_require_accounts() -> Result<()> {
+fn cached_reviews_do_not_require_accounts() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let storage = unusable_storage(&tmp);
     let mut db = but_db::DbHandle::new_in_directory(tmp.path())?;
@@ -183,19 +181,6 @@ fn cached_reviews_and_empty_sync_do_not_require_accounts() -> Result<()> {
         );
     }
     tokio::runtime::Runtime::new()?.block_on(async {
-        for forge in [ForgeName::GitHub, ForgeName::GitLab, ForgeName::Bitbucket] {
-            repo.forge = forge;
-            sync_reviews(
-                &None,
-                &repo,
-                &None,
-                &[],
-                &storage,
-                ReviewStackingDescription::Bottom,
-                GitHubStackingMode::Auto,
-            )
-            .await?;
-        }
         repo.forge = ForgeName::Bitbucket;
         update_review(
             &None,
@@ -221,25 +206,6 @@ fn cached_reviews_and_empty_sync_do_not_require_accounts() -> Result<()> {
                 error.to_string(),
                 "Bitbucket does not support reopening a declined pull request via the API.",
                 "reopening must fail before account storage or metadata updates are attempted"
-            );
-        }
-        repo.forge = ForgeName::GitHub;
-        restore_native_stacks(&None, &repo, &[], &storage).await?;
-        let reviews = [ForgeReviewUpdate::from(cached_review(1, None, None))];
-        for (reviews, push, mode) in [
-            (&[][..], None, GitHubStackingMode::Auto),
-            (&reviews[..], None, GitHubStackingMode::Disabled),
-            (
-                &reviews[..],
-                Some(repo_info("fork-owner", "repo")),
-                GitHubStackingMode::Auto,
-            ),
-        ] {
-            let stacks =
-                prepare_review_target_updates(&None, &repo, &push, reviews, &storage, mode).await?;
-            assert!(
-                stacks.is_empty(),
-                "empty, disabled and fork stacking must not read account storage"
             );
         }
         Ok(())
@@ -295,125 +261,6 @@ fn gitlab_review_preserves_source_project_clone_urls() {
         review.head_repo_is_fork,
         "GitLab fork MRs should preserve that the source project differs from the target"
     );
-}
-
-// --- compute_review_target_updates tests ---
-
-fn heads(specs: &[(&str, Option<i64>)]) -> Vec<(String, Option<i64>)> {
-    specs
-        .iter()
-        .map(|(name, id)| (name.to_string(), *id))
-        .collect()
-}
-
-#[test]
-fn target_updates_empty_stack() {
-    let result = compute_review_target_updates(&[], "main");
-    assert!(result.is_empty());
-}
-
-#[test]
-fn target_updates_no_reviews() {
-    let h = heads(&[("branch-a", None), ("branch-b", None)]);
-    let result = compute_review_target_updates(&h, "main");
-    assert!(result.is_empty());
-}
-
-#[test]
-fn target_updates_single_branch_with_review() {
-    let h = heads(&[("branch-a", Some(1))]);
-    let result = compute_review_target_updates(&h, "main");
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].number, 1);
-    assert_eq!(result[0].target_branch, "main");
-}
-
-#[test]
-fn target_updates_stacked_reviews_point_to_parent() {
-    // bottom-to-top: branch-a -> branch-b -> branch-c
-    let h = heads(&[
-        ("branch-a", Some(1)),
-        ("branch-b", Some(2)),
-        ("branch-c", Some(3)),
-    ]);
-    let result = compute_review_target_updates(&h, "main");
-    assert_eq!(result.len(), 3);
-    assert_eq!(result[0].number, 1);
-    assert_eq!(result[0].target_branch, "main");
-    assert_eq!(result[1].number, 2);
-    assert_eq!(result[1].target_branch, "branch-a");
-    assert_eq!(result[2].number, 3);
-    assert_eq!(result[2].target_branch, "branch-b");
-}
-
-#[test]
-fn target_updates_request_remote_description_hydration() {
-    let update: ForgeReviewUpdate = ForgeReviewTargetUpdate {
-        number: 42,
-        target_branch: "parent".to_string(),
-    }
-    .into();
-
-    assert!(
-        !update.update_description,
-        "target-only updates ask sync_reviews to hydrate the remote description"
-    );
-    assert_eq!(update.body, None);
-    assert_eq!(update.target_branch.as_deref(), Some("parent"));
-}
-
-#[test]
-fn review_update_defaults_to_description_sync_when_field_is_omitted() {
-    let omitted: ForgeReviewUpdate = serde_json::from_value(serde_json::json!({
-        "number": 42,
-        "body": "Caller-provided description",
-        "unitSymbol": "#",
-        "targetBranch": null
-    }))
-    .expect("an update from an older caller should deserialize");
-    let explicit_false: ForgeReviewUpdate = serde_json::from_value(serde_json::json!({
-        "number": 42,
-        "body": null,
-        "updateDescription": false,
-        "unitSymbol": "",
-        "targetBranch": "parent"
-    }))
-    .expect("a target-only update should deserialize");
-
-    assert!(
-        omitted.update_description,
-        "older callers that omit the field should synchronize their provided description"
-    );
-    assert!(
-        !explicit_false.update_description,
-        "target-only callers should still be able to request remote hydration"
-    );
-}
-
-#[test]
-fn target_updates_skips_branches_without_reviews() {
-    // branch-a has no review, so branch-b must target the trunk.
-    let h = heads(&[("branch-a", None), ("branch-b", Some(5))]);
-    let result = compute_review_target_updates(&h, "main");
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].number, 5);
-    assert_eq!(result[0].target_branch, "main");
-}
-
-#[test]
-fn target_updates_gap_in_middle() {
-    // a(PR) -> b(no PR) -> c(PR): c should skip b and target a.
-    let h = heads(&[
-        ("branch-a", Some(1)),
-        ("branch-b", None),
-        ("branch-c", Some(3)),
-    ]);
-    let result = compute_review_target_updates(&h, "main");
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].number, 1);
-    assert_eq!(result[0].target_branch, "main");
-    assert_eq!(result[1].number, 3);
-    assert_eq!(result[1].target_branch, "branch-a");
 }
 
 #[test]

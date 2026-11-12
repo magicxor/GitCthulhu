@@ -18,7 +18,7 @@ use super::{Detached, Kept, Size, Status};
 /// them, so nothing is left on disk, and the write end of a pipe to say they were taken on,
 /// which a build from before has none of. Exec keeps the pid, and a build started to take over
 /// has it as its parent; another process given the variable finds it's neither.
-pub(super) const HANDED: &str = "GITBUTLER_GPUI_TERMINALS";
+pub(super) const HANDED: &str = "GITCTHULHU_TERMINALS";
 
 /// A terminal as listed, with `label` saying where the app showed it.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -101,7 +101,7 @@ pub fn hand_over<T: Serialize>(
         })
         .collect();
     let mut keep: Vec<RawFd> = terminals.iter().map(|written| written.master).collect();
-    let path = std::env::temp_dir().join(format!("gitbutler-gpui-{}", process::id()));
+    let path = std::env::temp_dir().join(format!("gitcthulhu-terminals-{}", process::id()));
     fs::remove_file(&path).ok();
     let mut file = (OpenOptions::new().read(true).write(true))
         .create_new(true)

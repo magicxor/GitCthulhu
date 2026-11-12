@@ -11,19 +11,6 @@ pub struct Outcome<'repo> {
     ///
     /// It's `None` if there were no index-only changes.
     pub index: Option<gix::index::State>,
-    /// Reference edits that when applied in a transaction will set the workspace back to where it was. Only available
-    /// if it was part of the snapshot to begin with.
-    pub workspace_references: Option<Vec<gix::refs::transaction::RefEdit>>,
-    /// The metadata to be applied to the ref-metadata store.
-    pub metadata: Option<MetadataEdits>,
-}
-
-/// Edits for application to the [reference metadata store](crate::RefMetadata).
-pub struct MetadataEdits {
-    /// The workspace metadata stored in the snapshot.
-    pub workspace: (gix::refs::FullName, crate::ref_metadata::Workspace),
-    /// The branch metadata stored in snapshots.
-    pub branches: Vec<(gix::refs::FullName, crate::ref_metadata::Branch)>,
 }
 
 /// Options for use in [super::resolve_tree()].
@@ -55,8 +42,6 @@ pub(super) mod function {
     /// * …cherry-pick the worktree changes onto the `target_worktree_tree_id`, which is assumed to represent the future working directory state
     ///   and which either contains the worktree changes or *preferably* is the `HEAD^{tree}` as the working directory is clean.
     /// * …reconstruct the index to write into `.git/index` (including conflicts), assuming that the current `.git/index` is clean, *or* is the index from which the snapshot was taken.
-    /// * …produce reference edits to put the workspace refs back into place with.
-    /// * …produce metadata that if set will represent the metadata of the entire workspace.
     ///
     /// Note that none of this data is actually manifested in the repository or working tree, they only exists as objects in the Git database,
     /// assuming in-memory objects aren't used in the repository.
@@ -126,8 +111,6 @@ pub(super) mod function {
         Ok(Outcome {
             worktree_cherry_pick,
             index,
-            workspace_references: None,
-            metadata: None,
         })
     }
 

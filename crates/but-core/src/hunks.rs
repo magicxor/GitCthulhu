@@ -7,10 +7,8 @@ use crate::{DiffSpec, HunkHeader, TreeChange, UnifiedPatch};
 
 /// A single hunk of an uncommitted change, identified by its `path` and `hunk_header`.
 ///
-/// Unlike `but_hunk_assignment::HunkAssignment` this carries no assignment state. It is a
-/// pure function of the diff, so it needs no database and is meaningful in any checkout.
+/// It is a pure function of the diff, so it needs no database and is meaningful in any checkout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SingleHunk {
     /// The hunk within `path`.
@@ -20,10 +18,6 @@ pub struct SingleHunk {
     pub hunk_header: Option<HunkHeader>,
     /// The worktree-relative path of the file this hunk belongs to.
     #[serde(rename = "pathBytes")]
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::bstring_bytes")
-    )]
     pub path: BString,
     /// The hunk's unified-diff text, for internal use only.
     ///
@@ -32,8 +26,6 @@ pub struct SingleHunk {
     #[serde(skip)]
     pub diff: Option<BString>,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(SingleHunk);
 
 impl SingleHunk {
     /// Split `change` into the hunks of `patch`.
@@ -154,7 +146,7 @@ fn line_nums_from_hunk(diff: &BString, old_start: u32, new_start: u32) -> (Vec<u
 /// `context_lines` of context in each patch.
 ///
 /// Hunks are a pure function of the diff, so this needs no database and works for any
-/// checkout, not just the one a workspace is on. Callers that already hold the worktree
+/// checkout. Callers that already hold the worktree
 /// changes should use [`hunks_from_changes()`] to avoid diffing the worktree twice.
 pub fn worktree_hunks(
     repo: &gix::Repository,

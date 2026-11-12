@@ -9,9 +9,6 @@ rust-version.workspace = true
 [lib]
 doctest = false
 
-[features]
-legacy = []
-
 [dependencies]
 serde.workspace = true
 anyhow.workspace = true

@@ -16,8 +16,7 @@ mod on_demand_cache;
 pub use on_demand::OnDemand;
 pub use on_demand_cache::OnDemandCache;
 
-#[cfg(feature = "legacy")]
-mod legacy {
+mod storage {
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -90,8 +89,7 @@ mod legacy {
         }
     }
 }
-#[cfg(feature = "legacy")]
-pub use legacy::Storage;
+pub use storage::Storage;
 
 // Returns an ordered list of relative paths for files inside a directory recursively.
 pub fn list_files<P: AsRef<Path>>(

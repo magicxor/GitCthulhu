@@ -16,8 +16,6 @@ pub struct State {
     /// It is *not* error if there is no match, as there can be snapshots without working tree changes, but with other changes.
     /// It's up to the caller to check for that via [`Outcome::is_empty()`].
     pub selection: BTreeSet<BString>,
-    /// If `true`, store the current `HEAD` reference, i.e. its target, as well as the targets of all refs it's pointing to by symbolic link.
-    pub head: bool,
 }
 
 /// Contains all state that the snapshot contains.
@@ -35,13 +33,6 @@ pub struct Outcome {
     /// A tree with files in a custom storage format to allow keeping conflicting blobs reachable, along with detailed conflict information
     /// to allow restoring the conflict entries in the index.
     pub index_conflicts: Option<gix::ObjectId>,
-    /// The tree representing the reference targets of all references within the *workspace*.
-    pub workspace_references: Option<gix::ObjectId>,
-    /// The tree representing the reference targets of all references reachable from `HEAD`, so typically `HEAD` itself, and the
-    /// target object of the reference it is pointing to.
-    pub head_references: Option<gix::ObjectId>,
-    /// The tree representing the metadata of all references within the *workspace*.
-    pub metadata: Option<gix::ObjectId>,
 }
 
 impl Outcome {
@@ -67,10 +58,6 @@ pub(super) mod function {
     /// make this an empty tree if the `HEAD` is unborn.
     /// It's valid to have no changes to write, which is when the snapshot won't contain any worktree information
     /// to the point where it may be entirely [empty](Outcome::is_empty()).
-    ///
-    /// If `workspace_and_meta` is not `None`, the workspace and metadata to store in the snapshot.
-    /// We will only store reference positions, and assume that their commits are safely stored in the reflog to not
-    /// be garbage collected. Metadata is only stored for the references that are included in the `workspace`.
     ///
     /// Note that objects will be written into the repository behind `head_tree_id` unless it's configured
     /// to keep everything in memory.
@@ -100,11 +87,7 @@ pub(super) mod function {
     #[instrument(skip(changes), err(Debug))]
     pub fn create_tree(
         head_tree_id: gix::Id<'_>,
-        State {
-            changes,
-            selection,
-            head: _to_be_implemented,
-        }: State,
+        State { changes, selection }: State,
     ) -> anyhow::Result<Outcome> {
         // Assure this is a tree early.
         let head_tree = head_tree_id.object()?.into_tree();
@@ -176,9 +159,6 @@ pub(super) mod function {
             worktree,
             index,
             index_conflicts,
-            workspace_references: None,
-            head_references: None,
-            metadata: None,
         })
     }
 

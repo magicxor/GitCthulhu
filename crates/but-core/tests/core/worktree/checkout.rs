@@ -311,7 +311,7 @@ fn no_op_trees_never_touch_worktree() -> anyhow::Result<()> {
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
         snapbox::str![[r#"
-* 4e26689 (HEAD -> main) init
+* 08d4f13 (HEAD -> main) init
 
 "#]]
     );
@@ -354,7 +354,7 @@ Outcome {
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
         snapbox::str![[r#"
-* 4e26689 (HEAD -> main) init
+* 08d4f13 (HEAD -> main) init
 
 "#]]
     );
@@ -379,37 +379,6 @@ Outcome {
 
 "#]]
     );
-    Ok(())
-}
-
-#[test]
-fn conflicted_commits_cannot_be_checked_out() -> anyhow::Result<()> {
-    let repo = crate::commit::conflict_repo("normal-and-artificial")?;
-    let conflicted = repo.rev_parse_single("conflicted")?.detach();
-
-    let err = safe_checkout_from_head(conflicted, &repo, Default::default())
-        .expect_err("safe_checkout must reject GitButler-conflicted commits");
-    assert_eq!(
-        err.to_string(),
-        "Refusing to check out conflicted commit 84503317a1e1464381fcff65ece14bc1f4315b7c",
-        "the rejection retains its descriptive message"
-    );
-    assert_eq!(
-        err.downcast_ref::<but_error::Code>(),
-        Some(&but_error::Code::ConflictedCommitCheckout),
-        "callers can classify the rejection without matching its message"
-    );
-
-    safe_checkout_from_head(
-        conflicted,
-        &repo,
-        checkout::Options {
-            allow_conflicted_commit_checkout: true,
-            ..Default::default()
-        },
-    )
-    .expect("internal callers can explicitly opt into conflicted commit checkout");
-
     Ok(())
 }
 
@@ -453,7 +422,7 @@ fn pure_deletion_checkout_does_not_restore_unrelated_worktree_deletions() -> any
         out.to_debug(),
         snapbox::str![[r#"
 Outcome {
-    head_update: "Update refs/heads/main to Some(Object(Sha1(5eedd314adfb480212989a303c7651717062a9b2)))",
+    head_update: "Update refs/heads/main to Some(Object(Sha1(ded1b624dc61a9b35fa0bae1a715bb48da2efb09)))",
 }
 
 "#]]
@@ -1517,7 +1486,7 @@ fn checkout_cleans_a_file_once_however_many_files_replace_it() -> anyhow::Result
         .args([
             "config",
             "filter.log.clean",
-            r#"sh -c 'if ls -d "$GIT_DIR"/gitbutler/.gitbutler-checkout-* >/dev/null 2>&1; then echo "$1" >> "$GIT_DIR/cleaned"; fi; cat' -- %f"#,
+            r#"sh -c 'if ls -d "$GIT_DIR"/gitcthulhu/.gitcthulhu-checkout-* >/dev/null 2>&1; then echo "$1" >> "$GIT_DIR/cleaned"; fi; cat' -- %f"#,
         ])
         .run();
     let new_commit = commit_files(
@@ -1813,14 +1782,14 @@ fn checkout_replaces_a_file_whose_name_has_the_longest_length_allowed() -> anyho
 fn checkout_keeps_a_file_it_adds_under_the_name_it_moves_a_replaced_file_to() -> anyhow::Result<()>
 {
     // While checkout replaces a file, the old one waits under a name like this one.
-    check_out_a_change_and_an_addition_named(".gitbutler-replaced-0")
+    check_out_a_change_and_an_addition_named(".gitcthulhu-replaced-0")
 }
 
 #[test]
 #[cfg(unix)]
 fn checkout_keeps_a_file_it_adds_under_the_name_it_moves_a_replaced_file_to_in_another_case()
 -> anyhow::Result<()> {
-    check_out_a_change_and_an_addition_named(".GITBUTLER-REPLACED-0")
+    check_out_a_change_and_an_addition_named(".GITCTHULHU-REPLACED-0")
 }
 
 /// Check out a commit that changes `a` and adds `added`, and assert both end up in the worktree.
@@ -2902,6 +2871,7 @@ fn repo_state(repo: &gix::Repository) -> anyhow::Result<RepoState> {
 }
 
 /// Check out `commit` in `repo` on another thread, failing if it doesn't finish in time.
+#[cfg(unix)]
 fn check_out_in_time(repo: &gix::Repository, commit: gix::ObjectId) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let repo = repo.clone();
@@ -2915,6 +2885,7 @@ fn check_out_in_time(repo: &gix::Repository, commit: gix::ObjectId) -> anyhow::R
 }
 
 /// The untracked files in the worktree of `repo`, as `git status` lists them.
+#[cfg(unix)]
 fn untracked(repo: &gix::Repository) -> anyhow::Result<Vec<String>> {
     let status = git(repo)
         .args(["status", "--porcelain", "--untracked-files=all"])
@@ -3251,7 +3222,7 @@ fn checkout_replaces_an_empty_read_only_directory_like_git() -> anyhow::Result<(
     assert!(
         !names
             .iter()
-            .any(|name| name.starts_with(".gitbutler-checkout-")),
+            .any(|name| name.starts_with(".gitcthulhu-checkout-")),
         "nothing is left of the directory: {names:?}"
     );
     Ok(())
@@ -3425,7 +3396,7 @@ fn unrelated_additions_do_not_affect_worktree_changes() -> anyhow::Result<()> {
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
         snapbox::str![[r#"
-* 4e26689 (HEAD -> main) init
+* 08d4f13 (HEAD -> main) init
 
 "#]]
     );
@@ -3464,7 +3435,7 @@ fn unrelated_additions_do_not_affect_worktree_changes() -> anyhow::Result<()> {
         out.to_debug(),
         snapbox::str![[r#"
 Outcome {
-    head_update: "Update refs/heads/main to Some(Object(Sha1(7add6cadcf636e5b3a6c15c75e82abbec97d6eef)))",
+    head_update: "Update refs/heads/main to Some(Object(Sha1(b34099f6d498d4c684313b65daf7fe55feb09b06)))",
 }
 
 "#]]
@@ -3473,8 +3444,8 @@ Outcome {
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
         snapbox::str![[r#"
-* 7add6ca (HEAD -> main) add unrelated file
-* 4e26689 init
+* b34099f (HEAD -> main) add unrelated file
+* 08d4f13 init
 
 "#]]
     );

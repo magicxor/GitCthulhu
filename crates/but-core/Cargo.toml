@@ -5,19 +5,13 @@ edition.workspace = true
 authors.workspace = true
 publish = false
 rust-version.workspace = true
-description = "A leaf-crate with core algorithms and types"
+description = "A leaf-crate with core Git algorithms and types"
 
 [lib]
 doctest = false
 
-[features]
-export-schema = ["dep:schemars", "dep:but-schemars"]
-## Make legacy functionality available.
-legacy = []
-
 [dependencies]
 but-error.workspace = true
-but-project-handle.workspace = true
 but-serde.workspace = true
 
 
@@ -36,9 +30,6 @@ gix = { workspace = true, features = [
     "merge",
     "worktree-mutation",
 ] }
-smallvec.workspace = true
-# for V1 conflict commits
-toml.workspace = true
 chardetng = "0.1.17"
 
 # for `id`
@@ -55,11 +46,6 @@ flume = "0.11.1"
 # for `sync`
 fslock = "0.2.1"
 parking_lot = { workspace = true, features = ["arc_lock"] }
-schemars = { workspace = true, optional = true }
-but-schemars = { workspace = true, optional = true }
-
-# For generating change-ids
-rand.workspace = true
 
 [dev-dependencies]
 but-testsupport.workspace = true

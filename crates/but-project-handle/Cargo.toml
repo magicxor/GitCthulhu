@@ -4,31 +4,19 @@ version = "0.0.0"
 edition.workspace = true
 authors.workspace = true
 publish = false
-description = "Temporary home for ProjectHandle until gitbutler-project is removed and the types can merge back into but-ctx"
+description = "A self-describing, path-based identifier of a repository on disk"
 rust-version.workspace = true
 
 [lib]
 doctest = false
 
-[features]
-legacy = []
-## Generate JSON schemas for TypeScript type generation via schemars.
-export-schema = ["dep:schemars", "dep:but-schemars"]
-
 [dependencies]
-but-path.workspace = true
-
 anyhow.workspace = true
 gix.workspace = true
 serde.workspace = true
-uuid.workspace = true
 base64 = "0.22.1"
-tracing.workspace = true
-schemars = { workspace = true, optional = true }
-but-schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
-but-testsupport.workspace = true
 serde_json.workspace = true
 
 [lints]

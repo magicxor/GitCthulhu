@@ -347,46 +347,6 @@ first | two
     }
 
     #[test]
-    fn branch_order_migration_tolerates_existing_table_without_version_row() -> anyhow::Result<()> {
-        let mut db = rusqlite::Connection::open_in_memory()?;
-        db.execute_batch(
-            "CREATE TABLE `branch_order`(
-                `branch_ref_name` TEXT NOT NULL PRIMARY KEY,
-                `parent_ref_name` TEXT UNIQUE,
-                CHECK (`parent_ref_name` IS NULL OR `branch_ref_name` != `parent_ref_name`)
-            );",
-        )?;
-
-        migration::run(&mut db, but_db::migration::ours())?;
-
-        let version_was_recorded: bool = db.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM __diesel_schema_migrations WHERE version = '20260626120100'
-            )",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(
-            version_was_recorded,
-            "existing branch_order table should still be marked as migrated"
-        );
-
-        let index_exists: bool = db.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'index' AND name = 'idx_branch_order_parent_ref_name'
-            )",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(
-            index_exists,
-            "existing branch_order table should still receive the branch-order index"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn run_ours() -> anyhow::Result<()> {
         // See all of our schema combined in the latest version, along with
         // all migration versions we ran to get there.
@@ -401,24 +361,6 @@ CREATE TABLE __diesel_schema_migrations (
        version VARCHAR(50) PRIMARY KEY NOT NULL,
        run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
--- table branch_order
-CREATE TABLE `branch_order`(
-    `branch_ref_name` TEXT NOT NULL PRIMARY KEY,
-    `parent_ref_name` TEXT UNIQUE,
-    CHECK (`parent_ref_name` IS NULL OR `branch_ref_name` != `parent_ref_name`)
-);
-
--- table butler_actions
-CREATE TABLE `butler_actions`(
-	`id` TEXT NOT NULL PRIMARY KEY,
-	`created_at` TIMESTAMP NOT NULL,
-	`handler` TEXT NOT NULL,
-	`snapshot_before` TEXT NOT NULL,
-	`snapshot_after` TEXT NOT NULL,
-	`response` TEXT,
-	`error` TEXT
-, `external_summary` TEXT NOT NULL, `external_prompt` TEXT, `source` TEXT);
 
 -- table ci_checks
 CREATE TABLE `ci_checks`(
@@ -441,45 +383,12 @@ CREATE TABLE `ci_checks`(
 	`struct_version` INTEGER NOT NULL
 );
 
--- table claude_messages
-CREATE TABLE `claude_messages`(
-	`id` TEXT NOT NULL PRIMARY KEY,
-	`session_id` TEXT NOT NULL REFERENCES claude_sessions(id),
-	`created_at` TIMESTAMP NOT NULL,
-	`content_type` TEXT NOT NULL,
-	`content` TEXT NOT NULL
-);
-
--- table claude_permission_requests
-CREATE TABLE `claude_permission_requests`(
-	`id` TEXT NOT NULL PRIMARY KEY,
-	`created_at` TIMESTAMP NOT NULL,
-	`updated_at` TIMESTAMP NOT NULL,
-	`tool_name` TEXT NOT NULL,
-	`input` TEXT NOT NULL,
-	`decision` TEXT, `use_wildcard` BOOLEAN NOT NULL DEFAULT 0);
-
--- table claude_sessions
-CREATE TABLE `claude_sessions`(
-	`id` TEXT NOT NULL PRIMARY KEY,
-	`current_id` TEXT NOT NULL UNIQUE,
-	`created_at` TIMESTAMP NOT NULL,
-	`updated_at` TIMESTAMP NOT NULL
-, in_gui BOOLEAN NOT NULL DEFAULT FALSE, session_ids TEXT NOT NULL DEFAULT '[]', approved_permissions TEXT NOT NULL DEFAULT '[]', denied_permissions TEXT NOT NULL DEFAULT '[]');
-
 -- table fetch_status
 CREATE TABLE `fetch_status`(
 	`singleton` INTEGER NOT NULL PRIMARY KEY CHECK (`singleton` = 1),
 	`last_attempted_ms` INTEGER NOT NULL,
 	`last_successful_ms` INTEGER,
 	`last_error` TEXT
-);
-
--- table file_write_locks
-CREATE TABLE `file_write_locks`(
-	`path` TEXT NOT NULL PRIMARY KEY,
-	`created_at` TIMESTAMP NOT NULL,
-	`owner` TEXT NOT NULL
 );
 
 -- table forge_reviews
@@ -504,177 +413,14 @@ CREATE TABLE `forge_reviews`(
 	`reviewers` TEXT NOT NULL,
 	`unit_symbol` TEXT NOT NULL,
 	`last_sync_at` TIMESTAMP NOT NULL,
-	`struct_version` INTEGER NOT NULL
-, `head_repo_is_fork` BOOL NOT NULL DEFAULT FALSE, `integration_commit_shas` TEXT NOT NULL DEFAULT '[]', `auto_merge_enabled` BOOL NOT NULL DEFAULT FALSE);
-
--- table gerrit_metadata
-CREATE TABLE `gerrit_metadata`(
-	`change_id` TEXT NOT NULL PRIMARY KEY,
-	`commit_id` TEXT NOT NULL,
-	`review_url` TEXT NOT NULL,
-	`created_at` TIMESTAMP NOT NULL,
-	`updated_at` TIMESTAMP NOT NULL
+	`struct_version` INTEGER NOT NULL,
+	`head_repo_is_fork` BOOL NOT NULL DEFAULT FALSE,
+	`integration_commit_shas` TEXT NOT NULL DEFAULT '[]',
+	`auto_merge_enabled` BOOL NOT NULL DEFAULT FALSE
 );
-
--- table hunk_assignments
-CREATE TABLE `hunk_assignments`(
-	`hunk_header` TEXT,
-	`path` TEXT NOT NULL,
-	`path_bytes` BINARY NOT NULL,
-	`stack_id` TEXT,
-	`id` TEXT, `branch_ref` BINARY,
-	PRIMARY KEY(`path`, `hunk_header`)
-);
-
--- table obs_marker_meta
-CREATE TABLE `obs_marker_meta`(
-    `marker_id` BLOB NOT NULL,
-    `key` BLOB NOT NULL,
-    `value` BLOB NOT NULL,
-    PRIMARY KEY (`marker_id`, `key`),
-    FOREIGN KEY (`marker_id`) REFERENCES `obs_markers`(`id`)
-);
-
--- table obs_marker_parents
-CREATE TABLE `obs_marker_parents`(
-    `marker_id` BLOB NOT NULL,
-    `position` INTEGER NOT NULL,
-    `parent` BLOB NOT NULL,
-    PRIMARY KEY (`marker_id`, `position`),
-    FOREIGN KEY (`marker_id`) REFERENCES `obs_markers`(`id`)
-);
-
--- table obs_marker_succs
-CREATE TABLE `obs_marker_succs`(
-    `marker_id` BLOB NOT NULL,
-    `position` INTEGER NOT NULL,
-    `succ` BLOB NOT NULL,
-    PRIMARY KEY (`marker_id`, `position`),
-    FOREIGN KEY (`marker_id`) REFERENCES `obs_markers`(`id`)
-);
-
--- table obs_markers
-CREATE TABLE `obs_markers`(
-    `id` BLOB NOT NULL PRIMARY KEY,
-    `prec` BLOB NOT NULL,
-    `date_seconds` INTEGER NOT NULL,
-    `date_offset` INTEGER NOT NULL,
-    `parents_recorded` INTEGER NOT NULL
-);
-
--- table vb_branch_targets
-CREATE TABLE `vb_branch_targets`(
-	`stack_id` TEXT NOT NULL PRIMARY KEY,
-	`remote_name` TEXT NOT NULL,
-	`branch_name` TEXT NOT NULL,
-	`remote_url` TEXT NOT NULL,
-	`sha` TEXT NOT NULL,
-	`push_remote_name` TEXT,
-	FOREIGN KEY(`stack_id`) REFERENCES `vb_stacks`(`id`) ON DELETE CASCADE
-);
-
--- table vb_stack_heads
-CREATE TABLE `vb_stack_heads`(
-	`stack_id` TEXT NOT NULL,
-	`position` INTEGER NOT NULL,
-	`name` TEXT NOT NULL,
-	`head_sha` TEXT NOT NULL,
-	`pr_number` INTEGER,
-	`archived` INTEGER NOT NULL DEFAULT 0,
-	`review_id` TEXT,
-	PRIMARY KEY(`stack_id`, `position`),
-	FOREIGN KEY(`stack_id`) REFERENCES `vb_stacks`(`id`) ON DELETE CASCADE
-);
-
--- table vb_stacks
-CREATE TABLE `vb_stacks`(
-	`id` TEXT NOT NULL PRIMARY KEY,
-	`source_refname` TEXT,
-	`upstream_remote_name` TEXT,
-	`upstream_branch_name` TEXT,
-	`sort_order` INTEGER NOT NULL,
-	`in_workspace` INTEGER NOT NULL,
-	`legacy_name` TEXT NOT NULL DEFAULT '',
-	`legacy_notes` TEXT NOT NULL DEFAULT '',
-	`legacy_ownership` TEXT NOT NULL DEFAULT '',
-	`legacy_allow_rebasing` INTEGER NOT NULL DEFAULT 1,
-	`legacy_post_commits` INTEGER NOT NULL DEFAULT 0,
-	`legacy_tree_sha` TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000',
-	`legacy_head_sha` TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000',
-	`legacy_created_timestamp_ms` TEXT NOT NULL DEFAULT '0',
-	`legacy_updated_timestamp_ms` TEXT NOT NULL DEFAULT '0'
-);
-
--- table vb_state
-CREATE TABLE `vb_state`(
-	`id` INTEGER PRIMARY KEY CHECK (`id` = 1),
-	`initialized` INTEGER NOT NULL DEFAULT 0,
-	`default_target_remote_name` TEXT,
-	`default_target_branch_name` TEXT,
-	`default_target_remote_url` TEXT,
-	`default_target_sha` TEXT,
-	`default_target_push_remote_name` TEXT,
-	`last_pushed_base_sha` TEXT,
-	`toml_last_seen_mtime_ns` INTEGER,
-	`toml_last_seen_sha256` TEXT
-);
-
--- table workflows
-CREATE TABLE `workflows`(
-	`id` TEXT NOT NULL PRIMARY KEY,
-	`created_at` TIMESTAMP NOT NULL,
-	`kind` TEXT NOT NULL,
-	`triggered_by` TEXT NOT NULL,
-	`status` TEXT NOT NULL,
-	`input_commits` TEXT NOT NULL,
-	`output_commits` TEXT NOT NULL,
-	`summary` TEXT
-);
-
--- table worktree_adoption
-CREATE TABLE `worktree_adoption`(
-	`id` INTEGER PRIMARY KEY CHECK (`id` = 1),
-	`adopted_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- table worktree_meta
-CREATE TABLE `worktree_meta`(
-	`name` BLOB NOT NULL PRIMARY KEY,
-	`archived` BOOL NOT NULL DEFAULT FALSE
-);
-
--- index idx_branch_order_parent_ref_name
-CREATE INDEX `idx_branch_order_parent_ref_name` ON `branch_order`(`parent_ref_name`);
-
--- index idx_butler_actions_created_at
-CREATE INDEX `idx_butler_actions_created_at` ON `butler_actions`(`created_at`);
 
 -- index idx_ci_checks_reference
 CREATE INDEX `idx_ci_checks_reference` ON `ci_checks`(`reference`);
-
--- index idx_obs_marker_succs_succ
-CREATE INDEX `idx_obs_marker_succs_succ` ON `obs_marker_succs`(`succ`);
-
--- index idx_obs_markers_prec
-CREATE INDEX `idx_obs_markers_prec` ON `obs_markers`(`prec`);
-
--- index idx_vb_stack_heads_stack_id
-CREATE INDEX `idx_vb_stack_heads_stack_id` ON `vb_stack_heads`(`stack_id`);
-
--- index idx_vb_stacks_in_workspace
-CREATE INDEX `idx_vb_stacks_in_workspace` ON `vb_stacks`(`in_workspace`);
-
--- index idx_vb_stacks_sort_order
-CREATE INDEX `idx_vb_stacks_sort_order` ON `vb_stacks`(`sort_order`);
-
--- index index_claude_messages_on_created_at
-CREATE INDEX index_claude_messages_on_created_at ON claude_messages (created_at);
-
--- index index_claude_messages_on_session_id
-CREATE INDEX index_claude_messages_on_session_id ON claude_messages (session_id);
-
--- index index_claude_sessions_on_current_id
-CREATE INDEX index_claude_sessions_on_current_id ON claude_sessions (current_id);
 
 
 "#]]
@@ -685,67 +431,9 @@ CREATE INDEX index_claude_sessions_on_current_id ON claude_sessions (current_id)
             snapbox::str![[r#"
 Table: __diesel_schema_migrations
 version
-Text("20250526145725")
-Text("20250529110746")
-Text("20250530112246")
-Text("20250603111503")
-Text("20250607113323")
-Text("20250616090656")
-Text("20250619181700")
-Text("20250619192246")
-Text("20250703203544")
-Text("20250704130757")
-Text("20250717150441")
-Text("20250811130145")
-Text("20250812093543")
-Text("20250817195624")
-Text("20250821095340")
-Text("20250821142109")
-Text("20251013092749")
-Text("20251014144801")
-Text("20251015105125")
-Text("20251015212443")
-Text("20251017092314")
-Text("20251106102333")
-Text("20251107134016")
-Text("20251110103940")
-Text("20260101223932")
-Text("20260105095934")
-Text("20260219130000")
-Text("20260407120000")
-Text("20260618093000")
-Text("20260624170000")
-Text("20260626120000")
-Text("20260626120100")
-Text("20260715120000")
-Text("20260715161258")
-Text("20260716175500")
-Text("20260805120000")
-Text("20261102120000")
-
-Table: hunk_assignments
-hunk_header | path | path_bytes | stack_id | id | branch_ref
-
-Table: butler_actions
-id | created_at | handler | snapshot_before | snapshot_after | response | error | external_summary | external_prompt | source
-
-Table: workflows
-id | created_at | kind | triggered_by | status | input_commits | output_commits | summary
-
-Table: file_write_locks
-path | created_at | owner
-
-Table: claude_sessions
-id | current_id | created_at | updated_at | in_gui | session_ids | approved_permissions | denied_permissions
-
-Table: claude_messages
-id | session_id | created_at | content_type | content
-
-Table: claude_permission_requests
-id | created_at | updated_at | tool_name | input | decision | use_wildcard
-
-Table: gerrit_metadata
-change_id | commit_id | review_url | created_at | updated_at
+Text("20261112000001")
+Text("20261112000002")
+Text("20261112000003")
 
 Table: forge_reviews
 html_url | number | title | body | author | labels | draft | source_branch | target_branch | sha | created_at | modified_at | merged_at | closed_at | repository_ssh_url | repository_https_url | repo_owner | reviewers | unit_symbol | last_sync_at | struct_version | head_repo_is_fork | integration_commit_shas | auto_merge_enabled
@@ -753,41 +441,8 @@ html_url | number | title | body | author | labels | draft | source_branch | tar
 Table: ci_checks
 id | name | output_summary | output_text | output_title | started_at | status_type | status_conclusion | status_completed_at | head_sha | url | html_url | details_url | pull_requests | reference | last_sync_at | struct_version
 
-Table: vb_state
-id | initialized | default_target_remote_name | default_target_branch_name | default_target_remote_url | default_target_sha | default_target_push_remote_name | last_pushed_base_sha | toml_last_seen_mtime_ns | toml_last_seen_sha256
-
-Table: vb_stacks
-id | source_refname | upstream_remote_name | upstream_branch_name | sort_order | in_workspace | legacy_name | legacy_notes | legacy_ownership | legacy_allow_rebasing | legacy_post_commits | legacy_tree_sha | legacy_head_sha | legacy_created_timestamp_ms | legacy_updated_timestamp_ms
-
-Table: vb_stack_heads
-stack_id | position | name | head_sha | pr_number | archived | review_id
-
-Table: vb_branch_targets
-stack_id | remote_name | branch_name | remote_url | sha | push_remote_name
-
-Table: branch_order
-branch_ref_name | parent_ref_name
-
 Table: fetch_status
 singleton | last_attempted_ms | last_successful_ms | last_error
-
-Table: worktree_meta
-name | archived
-
-Table: worktree_adoption
-id | adopted_at
-
-Table: obs_markers
-id | prec | date_seconds | date_offset | parents_recorded
-
-Table: obs_marker_succs
-marker_id | position | succ
-
-Table: obs_marker_parents
-marker_id | position | parent
-
-Table: obs_marker_meta
-marker_id | key | value
 
 
 "#]]

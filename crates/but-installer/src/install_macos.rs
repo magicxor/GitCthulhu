@@ -6,7 +6,6 @@ use std::{
     io::Read,
     os::unix::fs as unix_fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,7 +15,7 @@ use tar::Archive;
 use crate::{
     config::{Channel, InstallerConfig},
     download::download_file,
-    install::{validate_installed_binary, verify_signature},
+    install::{APP_BINARY_NAME, validate_installed_binary, verify_signature},
     release::{PlatformInfo, Release, validate_download_url},
     ui::{info, success, warn},
 };
@@ -35,11 +34,12 @@ pub fn download_and_install_app(
         )
     })?;
 
-    validate_download_url(download_url)?;
+    let trusted_host = config.source.host();
+    validate_download_url(download_url, trusted_host)?;
     info(&format!("Download URL: {download_url}"));
 
     let temp_dir = tempfile::Builder::new()
-        .prefix("gitbutler-install.")
+        .prefix("gitcthulhu-install.")
         .tempdir()?;
 
     let filename = download_url
@@ -48,13 +48,18 @@ pub fn download_and_install_app(
         .ok_or_else(|| anyhow::anyhow!("Failed to extract filename from download URL"))?;
     let tarball_path = temp_dir.path().join(filename);
 
-    info(&format!("Downloading GitButler {}...", release.version));
-    download_file(download_url, &tarball_path)?;
+    info(&format!("Downloading GitCthulhu {}...", release.version));
+    download_file(download_url, &tarball_path, trusted_host)?;
 
     validate_tarball(&tarball_path)?;
     success("Download completed successfully");
 
-    verify_signature(&tarball_path, &platform_info.signature, temp_dir.path())?;
+    verify_signature(
+        &tarball_path,
+        &platform_info.signature,
+        &config.source.public_key,
+        temp_dir.path(),
+    )?;
 
     info("Extracting archive...");
     let app_dir = extract_tarball(&tarball_path, temp_dir.path())?;
@@ -66,6 +71,9 @@ pub fn download_and_install_app(
 
     Ok(())
 }
+
+/// The application binary inside the app bundle.
+const BUNDLE_BINARY: &str = "Contents/MacOS/gitcthulhu";
 
 pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Channel>) -> Result<()> {
     let app_basename = app_dir
@@ -111,20 +119,20 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
     let bin_dir = home_dir.join(".local/bin");
     fs::create_dir_all(&bin_dir)?;
 
-    // Check for existing 'but' and detect channel switching
-    let but_symlink = bin_dir.join("but");
-    let but_new = bin_dir.join("but.new");
+    // Check for an existing binary and detect channel switching
+    let but_symlink = bin_dir.join(APP_BINARY_NAME);
+    let but_new = bin_dir.join(format!("{APP_BINARY_NAME}.new"));
 
     if but_symlink.exists() && !but_symlink.is_symlink() {
-        // 'but' exists but is not a symlink
+        // The binary exists but is not a symlink
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let timestamp = format!("{now}");
-        let but_backup = bin_dir.join(format!("but.backup.{timestamp}"));
+        let but_backup = bin_dir.join(format!("{APP_BINARY_NAME}.backup.{timestamp}"));
         warn(&format!(
-            "A 'but' binary already exists at {} (not a symlink)",
+            "A '{APP_BINARY_NAME}' binary already exists at {} (not a symlink)",
             but_symlink.display()
         ));
         warn(&format!(
@@ -133,7 +141,7 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
         ));
         fs::rename(&but_symlink, &but_backup)?;
         info(&format!(
-            "Your original 'but' has been saved to: {}",
+            "Your original '{APP_BINARY_NAME}' has been saved to: {}",
             but_backup.display()
         ));
     } else if but_symlink.is_symlink() {
@@ -143,7 +151,7 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
         // Detect channel switching
         let previous_channel = if existing_target_str.contains("Nightly") {
             Some(Channel::Nightly)
-        } else if existing_target_str.contains("/GitButler.app/") {
+        } else if existing_target_str.contains("/GitCthulhu.app/") {
             Some(Channel::Release)
         } else {
             None
@@ -151,33 +159,27 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
 
         if previous_channel.is_none() {
             warn(&format!(
-                "Found existing 'but' symlink pointing to: {existing_target_str}"
+                "Found existing '{APP_BINARY_NAME}' symlink pointing to: {existing_target_str}"
             ));
-            warn("This will be replaced with GitButler's 'but' command");
+            warn("This will be replaced with the GitCthulhu application");
             info(
-                "Note: Your custom symlink setup will be overwritten. The original target is not a GitButler installation.",
+                "Note: Your custom symlink setup will be overwritten. The original target is not a GitCthulhu installation.",
             );
         }
     }
 
     // Create temporary symlink to test the new installation
-    let new_app_macos_dir = install_app_new.join("Contents/MacOS/gitbutler-tauri");
+    let new_app_macos_dir = install_app_new.join(BUNDLE_BINARY);
     let _ = fs::remove_file(&but_new);
 
     unix_fs::symlink(&new_app_macos_dir, &but_new)?;
 
-    // Verify the new installation works
-    let verify_status = Command::new(&but_new)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    if !verify_status.map(|s| s.success()).unwrap_or(false) {
+    // Verify the new installation is in place (the GUI binary isn't run, as it would open a window)
+    if !validate_installed_binary(&but_new) {
         fs::remove_dir_all(&install_app_new)?;
         fs::remove_file(&but_new)?;
         bail!(
-            "New installation verification failed - 'but' binary cannot run (may be corrupted or blocked by macOS)"
+            "New installation verification failed - '{APP_BINARY_NAME}' is not an executable file (the download may be corrupted)"
         );
     }
 
@@ -223,7 +225,7 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
     }
 
     // Update the symlink to point to the new installation
-    let final_target = install_app.join("Contents/MacOS/gitbutler-tauri");
+    let final_target = install_app.join(BUNDLE_BINARY);
     let _ = fs::remove_file(&but_symlink);
 
     // Try to create symlink and verify - if either fails, rollback
@@ -245,7 +247,7 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
             }
             fs::rename(&install_app_backup, &install_app)?;
 
-            let restored_target = install_app.join("Contents/MacOS/gitbutler-tauri");
+            let restored_target = install_app.join(BUNDLE_BINARY);
             let _ = fs::remove_file(&but_symlink);
             let _ = unix_fs::symlink(&restored_target, &but_symlink);
 
@@ -262,7 +264,7 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
             fs::remove_dir_all(&install_app)?;
             fs::rename(&install_app_backup, &install_app)?;
 
-            let restored_target = install_app.join("Contents/MacOS/gitbutler-tauri");
+            let restored_target = install_app.join(BUNDLE_BINARY);
             let _ = fs::remove_file(&but_symlink);
             unix_fs::symlink(&restored_target, &but_symlink)?;
 
@@ -271,7 +273,7 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
                 bail!("Installation failed but your previous installation was restored");
             } else {
                 bail!(
-                    "Installation failed and backup restoration also failed - 'but' command may not work"
+                    "Installation failed and backup restoration also failed - '{APP_BINARY_NAME}' may not work"
                 );
             }
         } else {
@@ -285,8 +287,6 @@ pub(crate) fn install_app(app_dir: &Path, home_dir: &Path, channel: Option<Chann
     ));
     // Remove backup on success
     let _ = fs::remove_dir_all(&install_app_backup);
-
-    success("GitButler CLI (but) installed successfully");
 
     Ok(())
 }
@@ -341,7 +341,7 @@ pub(crate) fn verify_app_structure(app_dir: &Path) -> Result<()> {
         );
     }
 
-    let required_binaries = ["gitbutler-git-askpass", "gitbutler-tauri"];
+    let required_binaries = ["gitcthulhu", "gitcthulhu-askpass", "gitcthulhu-editor"];
 
     for binary in &required_binaries {
         let binary_path = binaries_dir.join(binary);

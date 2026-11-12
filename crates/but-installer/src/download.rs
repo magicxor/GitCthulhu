@@ -6,9 +6,10 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::http::create_client;
 
-/// Download a URL and return its contents as a string.
+/// Download a URL and return its contents as a string, refusing redirects away from
+/// `trusted_host` and its subdomains.
 #[cfg(target_os = "linux")]
-pub(crate) fn download_to_string(url: &str) -> Result<String> {
+pub(crate) fn download_to_string(url: &str, trusted_host: &str) -> Result<String> {
     let mut easy = create_client()?;
 
     easy.url(url)
@@ -42,13 +43,14 @@ pub(crate) fn download_to_string(url: &str) -> Result<String> {
         .context("Failed to get effective URL")?
         .ok_or_else(|| anyhow!("Effective URL is missing"))?;
 
-    crate::release::validate_download_url(effective_url)
+    crate::release::validate_download_url(effective_url, trusted_host)
         .with_context(|| format!("Download was redirected to an untrusted URL: {effective_url}"))?;
 
     String::from_utf8(buf.into_inner()).context("Signature file is not valid UTF-8")
 }
 
-pub(crate) fn download_file(url: &str, dest: &Path) -> Result<()> {
+/// Download `url` to `dest`, refusing redirects away from `trusted_host` and its subdomains.
+pub(crate) fn download_file(url: &str, dest: &Path, trusted_host: &str) -> Result<()> {
     let mut easy = create_client()?;
 
     easy.url(url)
@@ -123,7 +125,7 @@ pub(crate) fn download_file(url: &str, dest: &Path) -> Result<()> {
         .context("Failed to get response code")?;
     if response_code == 403 {
         bail!(
-            "Download failed, the download artifact could not be found. Most likely, the but CLI has not been published for the requested version."
+            "Download failed, the download artifact could not be found. Most likely, it has not been published for the requested version."
         )
     } else if response_code != 200 {
         bail!("Download failed with HTTP status: {response_code}");
@@ -136,7 +138,7 @@ pub(crate) fn download_file(url: &str, dest: &Path) -> Result<()> {
         .context("Failed to get effective URL")?
         .ok_or_else(|| anyhow!("Effective URL is missing"))?;
 
-    crate::release::validate_download_url(effective_url)
+    crate::release::validate_download_url(effective_url, trusted_host)
         .with_context(|| format!("Download was redirected to an untrusted URL: {effective_url}"))?;
 
     Ok(())

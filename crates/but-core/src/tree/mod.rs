@@ -11,7 +11,6 @@ pub mod create_tree {
 
     /// Provide a description of why a [`crate::DiffSpec`] was rejected for application to the tree of a commit.
     #[derive(Default, Debug, Copy, Clone, PartialEq, serde::Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub enum RejectionReason {
         /// All changes were applied, but they didn't end up effectively change the tree to something differing from the target tree.
@@ -22,11 +21,6 @@ pub mod create_tree {
         NoEffectiveChanges,
         /// The final cherry-pick to bring the new tree down onto the target tree (merge it in) failed with a conflict.
         CherryPickMergeConflict,
-        /// The final merge of the workspace commit failed with a conflict.
-        WorkspaceMergeConflict,
-        /// The final merge of the workspace commit failed with a conflict,
-        /// but the involved file wasn't anything the user provided as diff-spec.
-        WorkspaceMergeConflictOfUnrelatedFile,
         /// This is just a theoretical possibility that *could* happen if somebody deletes a file that was there before *right after* we checked its
         /// metadata and found that it still exists.
         /// So if you see this, you could also have won the lottery.
@@ -47,9 +41,6 @@ pub mod create_tree {
         /// However, at least one hunk was not fully contained.
         MissingDiffSpecAssociation,
     }
-
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(RejectionReason);
 }
 use create_tree::RejectionReason;
 
@@ -58,8 +49,8 @@ use crate::worktree::worktree_file_to_git_in_buf;
 /// Additional information about the outcome of a [`create_tree()`] call.
 #[derive(Debug)]
 pub struct CreateTreeOutcome {
-    /// Changes that were removed from `new_tree` because they caused conflicts when rebasing dependent commits,
-    /// when merging the workspace commit, or because the specified hunks didn't match exactly due to changes
+    /// Changes that were removed from `new_tree` because they caused conflicts when cherry-picking them onto the
+    /// target tree, or because the specified hunks didn't match exactly due to changes
     /// that happened in the meantime, or if a file without a change was specified.
     pub rejected_specs: Vec<(RejectionReason, DiffSpec)>,
     /// The newly created seen from tree that acts as the destination of the changes, or `None` if no tree could be

@@ -3,20 +3,14 @@
 pub struct CommitDetails {
     /// The fully decoded commit.
     pub commit: crate::CommitOwned,
-    /// Whether [`commit`](Self::commit) is conflicted, per [`crate::Commit::is_conflicted()`],
-    /// captured here as the detached commit cannot determine it anymore.
-    pub has_conflicts: bool,
     /// The changes between the tree of the first parent and this commit.
     pub diff_with_first_parent: Vec<crate::TreeChange>,
     /// The stats of the changes, which are computed only when explicitly requested.
     pub line_stats: Option<LineStats>,
-    /// Represents what was causing a particular commit to conflict when rebased.
-    pub conflict_entries: Option<crate::commit::ConflictEntries>,
 }
 
 /// Line statistics obtained from diffing the blobs of one or more [TreeChange](crate::TreeChange).
 #[derive(Default, Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, serde::Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct LineStats {
     /// The total amount of lines added in the between blobs of the two trees.
@@ -26,8 +20,6 @@ pub struct LineStats {
     /// The number of files that contributed to these statistics as they were added, removed or modified.
     pub files_changed: u64,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(LineStats);
 
 /// Lifecycle
 impl CommitDetails {
@@ -44,14 +36,10 @@ impl CommitDetails {
             .transpose()?;
 
         let commit = crate::Commit::try_from(commit)?;
-        let has_conflicts = commit.is_conflicted();
-        let conflict_entries = commit.conflict_entries()?;
         Ok(CommitDetails {
             commit: commit.detach(),
-            has_conflicts,
             diff_with_first_parent: changes.into_tree_changes(),
             line_stats: line_stats.map(Into::into),
-            conflict_entries,
         })
     }
 }

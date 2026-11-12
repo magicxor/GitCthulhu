@@ -44,7 +44,6 @@ pub async fn get_repo_info(
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct RepoInfo {
     pub permissions: Option<RepoPermissions>,
@@ -59,11 +58,7 @@ pub struct RepoInfo {
     pub delete_branch_on_merge: Option<bool>,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(RepoInfo);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct RepoPermissions {
     pub admin: bool,
@@ -72,9 +67,6 @@ pub struct RepoPermissions {
     pub triage: bool,
     pub pull: bool,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(RepoPermissions);
 
 impl From<but_github::GitHubRepository> for RepoInfo {
     fn from(value: but_github::GitHubRepository) -> Self {

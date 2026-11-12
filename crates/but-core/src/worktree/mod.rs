@@ -1,4 +1,4 @@
-/// Functions related to workspace checkouts.
+/// Functions related to worktree checkouts.
 pub mod checkout;
 
 use std::{io::Read, path::Path};

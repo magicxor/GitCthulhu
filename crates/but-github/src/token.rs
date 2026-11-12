@@ -60,15 +60,12 @@ pub fn clear_all_github_accounts(storage: &but_forge_storage::Controller) -> Res
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", tag = "type", content = "info")]
 pub enum GithubAccountIdentifier {
     OAuthUsername { username: String },
     PatUsername { username: String },
     Enterprise { username: String, host: String },
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(GithubAccountIdentifier);
 
 impl GithubAccountIdentifier {
     pub fn oauth(username: &str) -> Self {

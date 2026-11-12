@@ -802,9 +802,7 @@ impl GitHubClient {
         Ok(comment.into())
     }
 
-    /// Update the information of a given PR.
-    ///
-    /// This is used e.g. to update the description footers for stacked reviews.
+    /// Update the title, body, state or base branch of a given PR.
     pub async fn update_pull_request(
         &self,
         params: &UpdatePullRequestParams<'_>,

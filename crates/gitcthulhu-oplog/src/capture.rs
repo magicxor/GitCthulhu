@@ -300,11 +300,7 @@ fn capture_files(
 
     let out = create_tree(
         head_tree.attach(repo),
-        create_tree::State {
-            changes,
-            selection,
-            head: false,
-        },
+        create_tree::State { changes, selection },
     )?;
 
     let index = repo.index_or_empty()?;

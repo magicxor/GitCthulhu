@@ -29,7 +29,6 @@ pub(super) fn checkout(
     let options = Options {
         skip_head_update: true,
         merge_base_override: Some(base),
-        allow_conflicted_commit_checkout: false,
         allow_uncommitted_changes_to_conflict_with_new_head: false,
         untracked_size_limit: Some(untracked_file_limit),
     };

@@ -664,7 +664,7 @@ fn private_file_next_to(dest: &Path, executable: bool) -> std::io::Result<tempfi
 /// A builder of checkout's private files and directories, which are named alike.
 fn private_builder() -> tempfile::Builder<'static, 'static> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".gitbutler-checkout-");
+    builder.prefix(".gitcthulhu-checkout-");
     builder
 }
 
@@ -787,7 +787,7 @@ fn checkout_index(
 
 /// A new staging directory in the Git directory.
 fn staging_dir(repo: &gix::Repository) -> anyhow::Result<tempfile::TempDir> {
-    let in_git_dir = repo.git_dir().join("gitbutler");
+    let in_git_dir = repo.git_dir().join("gitcthulhu");
     std::fs::create_dir_all(&in_git_dir)?;
     Ok(private_builder().tempdir_in(in_git_dir)?)
 }

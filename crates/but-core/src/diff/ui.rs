@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 use bstr::ByteSlice;
 
 use crate::{
-    Commit, IgnoredWorktreeTreeChangeStatus,
-    commit::ConflictEntries,
+    IgnoredWorktreeTreeChangeStatus,
     ui::{TreeChanges, WorktreeChanges},
 };
 
@@ -72,16 +71,6 @@ pub fn commit_changes_with_line_stats_by_worktree_dir(
     let (changes, stats) = super::tree_changes_with_line_stats(repo, parent_id, commit_id)
         .map(|(c, s)| (c.into_iter().map(Into::into).collect(), s.into()))?;
     Ok(TreeChanges { changes, stats })
-}
-
-/// If the commit is conflicted, it will return the entries that are in fact
-/// conflicted.
-pub fn conflicted_changes(
-    repo: &gix::Repository,
-    commit_id: gix::ObjectId,
-) -> anyhow::Result<Option<ConflictEntries>> {
-    let commit = Commit::from_id(commit_id.attach(repo))?;
-    commit.conflict_entries()
 }
 
 /// See [`super::tree_changes()`].

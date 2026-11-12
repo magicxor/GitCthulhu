@@ -6,38 +6,14 @@ use rusqlite::ErrorCode;
 ///
 /// ### Usage
 ///
-/// Caches work the same as [`crate::table`]s.
-/// They are made more usable by providing a mutable instance through a shared reference
-/// when obtaining it from the `but-ctx::Context`.
+/// Caches work the same as [`crate::table`]s, but a cache that can't be opened or migrated is
+/// replaced by an in-memory database instead of failing.
 use crate::M;
 
 mod handle;
 mod table;
 
-#[rustfmt::skip]
-pub use table::{
-    agent_skill_notice::AgentSkillNotice,
-    update::{CachedCheckResult, CheckUpdateStatus},
-};
-
-/// Just like [`crate::SchemaVersion`], but for project caches. Note that caches can always be created though
-/// as they are generated in memory in the worst case, particularly on migration failure.
-///
-/// The same rule applies: stay on the current version and leave stale columns or tables
-/// in place — bump only for a planned, coordinated break, never routine cleanup.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum SchemaVersion {
-    /// The current forward-compatible schema line.
-    ///
-    /// Keep using `Zero` for migrations that older binaries can still tolerate after the
-    /// migration runs, such as adding tables or columns that they don't require.
-    ///
-    /// Switch to `One` only once a migration makes the database unsafe for binaries that only
-    /// understand `Zero`, such as removing or reinterpreting persisted data they still use.
-    Zero = 0,
-    /// Needed for the removal of ChangeID/Commit associations.
-    One = 1,
-}
+pub use table::update::{CachedCheckResult, CheckUpdateStatus};
 
 /// Open `url` with migrations applied. However, we don't retry as:
 /// - if the database is locked, and we'd need to run migrations, we fall back to an in-memory DB just this time

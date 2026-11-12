@@ -8,7 +8,7 @@ git init
 
 git config gpg.format ssh
 git config user.signingKey "$PWD/signature.key"
-git config GitButler.signCommits true
+git config commit.gpgsign true
 echo "*.key*" >.gitignore
 
 # Appended to git's command-scope config, which outranks the harness's commit.gpgsign=false

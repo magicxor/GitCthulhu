@@ -5,7 +5,7 @@ use rusqlite::OptionalExtension;
 use crate::{DbHandle, M, SchemaVersion, Transaction};
 
 pub(crate) const M: &[M<'static>] = &[M::up(
-    20260715120000,
+    2026_11_12__00_00_03,
     SchemaVersion::Zero,
     "CREATE TABLE `fetch_status`(
 	`singleton` INTEGER NOT NULL PRIMARY KEY CHECK (`singleton` = 1),

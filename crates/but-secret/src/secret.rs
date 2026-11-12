@@ -160,14 +160,11 @@ pub fn delete(handle: &str, namespace: Namespace) -> Result<()> {
 pub fn set_application_namespace(identifier: impl Into<String>) {
     *NAMESPACE.lock().unwrap() = identifier.into();
 
-    // In debug builds, use a git-credential based implementation when platform keychains are
-    // either noisy (macOS rebuild prompts) or unavailable (headless e2e Linux containers).
-    // Release builds keep using the platform keychain.
+    // In debug builds on macOS, use a git-credential based implementation as the platform keychain
+    // prompts again after every rebuild. Release builds keep using the platform keychain.
     // HACK: we do this here because it's always called by client binaries, and we want it to work
     //       equally there and automatically.
-    if cfg!(debug_assertions)
-        && (cfg!(target_os = "macos") || std::env::var_os("E2E_TEST_APP_DATA_DIR").is_some())
-    {
+    if cfg!(debug_assertions) && cfg!(target_os = "macos") {
         git_credentials::setup().ok();
     }
 }

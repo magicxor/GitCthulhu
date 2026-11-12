@@ -295,7 +295,6 @@ pub mod json {
     /// The credential is stored by the backend as part of the call, so the caller is told
     /// who authenticated and nothing more. Field names are camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct GitlabAuthStatusResponse {
         pub username: String,
@@ -324,15 +323,11 @@ pub mod json {
         }
     }
 
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(GitlabAuthStatusResponse);
-
     /// Serializable version of [`AuthenticatedUser`] with exposed access token.
     ///
     /// This struct represents an authenticated GitLab user with their credentials
     /// exposed as plain strings for API responses. Field names are converted to camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct GitlabAuthenticatedUserSensitive {
         /// The GitLab access token as a plain string (sensitive data).
@@ -366,9 +361,6 @@ pub mod json {
             }
         }
     }
-
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(GitlabAuthenticatedUserSensitive);
 }
 
 #[cfg(test)]

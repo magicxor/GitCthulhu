@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use but_project_handle::{ProjectHandle, ProjectHandleOrLegacyProjectId};
+use but_project_handle::ProjectHandle;
 
 #[test]
 fn round_trip() -> anyhow::Result<()> {
@@ -26,10 +26,28 @@ fn from_path_and_decode_round_trip() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An absolute path on the platform the tests run on (`/tmp` alone is relative on Windows).
+fn absolute(path: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!("C:{path}"))
+    } else {
+        PathBuf::from(path)
+    }
+}
+
 #[test]
 fn from_str_round_trip() -> anyhow::Result<()> {
-    let handle: ProjectHandle = "L3RtcC9yZWFkIG1l".parse()?;
-    assert_eq!(handle.to_path()?, PathBuf::from("/tmp/read me"));
+    let encoded = if cfg!(windows) {
+        "QzovdG1wL3JlYWQgbWU" // C:/tmp/read me
+    } else {
+        "L3RtcC9yZWFkIG1l" // /tmp/read me
+    };
+    let handle: ProjectHandle = encoded.parse()?;
+    assert_eq!(
+        handle.to_path()?,
+        absolute("/tmp/read me"),
+        "the handle decodes to the path it encodes"
+    );
     Ok(())
 }
 
@@ -78,51 +96,26 @@ fn display_and_debug_print() -> anyhow::Result<()> {
 }
 
 #[test]
-fn project_handle_or_legacy_project_id_deserializes_project_handle() -> anyhow::Result<()> {
-    let value: ProjectHandleOrLegacyProjectId = serde_json::from_str(r#""L3RtcA""#)?;
-    match value {
-        ProjectHandleOrLegacyProjectId::ProjectHandle(handle) => {
-            assert_eq!(handle.to_string(), "L3RtcA");
-        }
-        #[cfg_attr(not(feature = "legacy"), allow(unreachable_patterns))]
-        other => unreachable!("expected project handle variant, got {other:?}"),
-    }
-    Ok(())
-}
-
-#[test]
-fn project_handle_or_legacy_project_id_round_trips_project_handle() -> anyhow::Result<()> {
-    let value: ProjectHandleOrLegacyProjectId = serde_json::from_str(r#""L3RtcA""#)?;
-    let serialized = serde_json::to_string(&value)?;
-    assert_eq!(serialized, r#""L3RtcA""#);
-    let decoded: ProjectHandleOrLegacyProjectId = serde_json::from_str(&serialized)?;
-    assert_eq!(decoded, value);
-    Ok(())
-}
-
-#[test]
-#[cfg(feature = "legacy")]
-fn project_handle_or_legacy_project_id_deserializes_legacy_project_id() -> anyhow::Result<()> {
-    let expected = "00000000-0000-0000-0000-000000000000";
-    let value: ProjectHandleOrLegacyProjectId = serde_json::from_str(&format!(r#""{expected}""#))?;
-    match value {
-        ProjectHandleOrLegacyProjectId::LegacyProjectId(project_id) => {
-            assert_eq!(project_id.to_string(), expected);
-        }
-        other => panic!("expected legacy project id variant, got {other:?}"),
-    }
-    Ok(())
-}
-
-#[test]
-#[cfg(feature = "legacy")]
-fn project_handle_or_legacy_project_id_round_trips_legacy_project_id() -> anyhow::Result<()> {
-    let expected = "00000000-0000-0000-0000-000000000000";
-    let expected_json = format!(r#""{expected}""#);
-    let value: ProjectHandleOrLegacyProjectId = serde_json::from_str(&expected_json)?;
-    let serialized = serde_json::to_string(&value)?;
-    assert_eq!(serialized, expected_json);
-    let decoded: ProjectHandleOrLegacyProjectId = serde_json::from_str(&serialized)?;
-    assert_eq!(decoded, value);
+fn deserializes_from_a_json_string() -> anyhow::Result<()> {
+    let encoded = if cfg!(windows) {
+        "QzovdG1w" // C:/tmp
+    } else {
+        "L3RtcA" // /tmp
+    };
+    let handle: ProjectHandle = serde_json::from_str(&format!("\"{encoded}\""))?;
+    assert_eq!(
+        handle.to_string(),
+        encoded,
+        "the handle is its encoded string"
+    );
+    assert_eq!(
+        handle.to_path()?,
+        absolute("/tmp"),
+        "and decodes to its path"
+    );
+    assert!(
+        serde_json::from_str::<ProjectHandle>(r#""00000000-0000-0000-0000-000000000000""#).is_err(),
+        "a UUID is not a project handle"
+    );
     Ok(())
 }

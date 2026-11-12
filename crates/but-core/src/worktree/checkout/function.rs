@@ -11,7 +11,6 @@ use super::{Options, Outcome, UncommittedChangesInTheWay, write};
 ///
 /// If `new_head_id` is a *commit*, we will also set `HEAD` (or the ref it points to if symbolic) to the `new_head_id`.
 /// We will also update the `.git/index` to match the `new_head_id^{tree}`.
-/// GitButler-conflicted commits are rejected by default before any worktree, index, or ref update.
 ///
 /// We will always handle changes in the worktree safely to avoid loss of uncommitted information. This also means that deletions
 /// never cause us to conflict. Conflicted files that would be checked out will cause an error.
@@ -28,22 +27,11 @@ pub fn safe_checkout_from_head(
     Options {
         skip_head_update,
         merge_base_override,
-        allow_conflicted_commit_checkout,
         allow_uncommitted_changes_to_conflict_with_new_head,
         untracked_size_limit,
     }: Options,
 ) -> anyhow::Result<Outcome> {
     let new_object = new_head_id.attach(repo).object()?;
-    if !allow_conflicted_commit_checkout
-        && new_object.kind.is_commit()
-        && crate::Commit::from_id(new_head_id.attach(repo))?.is_conflicted()
-    {
-        return Err(
-            anyhow::anyhow!(but_error::Code::ConflictedCommitCheckout).context(format!(
-                "Refusing to check out conflicted commit {new_head_id}"
-            )),
-        );
-    }
 
     let head_tree = repo.head_tree_id_or_empty()?.detach();
     let old_tree = match merge_base_override {
@@ -83,7 +71,7 @@ pub fn safe_checkout_from_head(
                 Target::Object(new_head_id),
                 true,
                 "safe checkout",
-                "GitButler".into(),
+                "GitCthulhu".into(),
                 new_object.into_commit().parent_ids().count(),
             )?;
             head_update = Some(edits);

@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 publish = false
 rust-version.workspace = true
-description = "GitButler installation binary"
+description = "GitCthulhu installation binary"
 
 [lib]
 doctest = true

@@ -14,8 +14,6 @@ mod bash;
 pub use bash::{
     BASH_OVERRIDE_ENV_VAR, bash_program, path_with_bash_dir, prepare_fixture_environment,
 };
-mod in_memory_meta;
-pub use in_memory_meta::{InMemoryRefMetadata, InMemoryRefMetadataHandle, StackState};
 
 /// Choose a slightly more obvious, yet easy to type syntax than a function with 4 parameters.
 /// i.e. `hunk_header("-1,10", "+1,10")`.
@@ -108,24 +106,6 @@ pub fn open_repo(path: &Path) -> anyhow::Result<gix::Repository> {
     Ok(repo)
 }
 
-/// An empty in-memory database standing in for the repository's own project database.
-///
-/// Only for repositories from *shared read-only* fixtures: writing a real database
-/// into the shared extraction would leak state across tests and runs. Fixtures the
-/// test owns should use [`project_db()`] instead.
-pub fn in_memory_db() -> but_db::DbHandle {
-    but_db::DbHandle::new_at_path(":memory:").expect("in-memory database always opens")
-}
-
-/// The project database of `repo`, at the same location GitButler itself stores it.
-///
-/// Only for writable fixtures, whose storage lives and dies with the fixture's
-/// temporary directory; shared read-only fixtures use [`in_memory_db()`].
-pub fn project_db(repo: &gix::Repository) -> anyhow::Result<but_db::DbHandle> {
-    use but_core::RepositoryExt as _;
-    but_db::DbHandle::new_in_directory(repo.gitbutler_storage_path()?)
-}
-
 /// Return isolated configuration with a basic setup to run read-only and read-write tests.
 /// This includes the author configuration in particular.
 pub fn open_repo_config() -> anyhow::Result<gix::open::Options> {
@@ -143,7 +123,6 @@ pub fn open_repo_config() -> anyhow::Result<gix::open::Options> {
                 .validated_assignment("2000-01-01 00:00:00 +0000".into())?,
             gix::config::tree::gitoxide::Commit::COMMITTER_DATE
                 .validated_assignment("2000-01-02 00:00:00 +0000".into())?,
-            "gitbutler.testing.changeId=content-hash".to_owned().into(),
         ]);
     Ok(config)
 }
@@ -151,41 +130,6 @@ pub fn open_repo_config() -> anyhow::Result<gix::open::Options> {
 /// turn a 40 byte hex-id into an object ID or panic.
 pub fn hex_to_id(hex: &str) -> gix::ObjectId {
     gix::ObjectId::from_hex(hex.as_bytes()).expect("statically known to be valid")
-}
-
-/// Sets up an environment that assures commits are reproducible. This is particularly
-/// needed for `GITBUTLER_CHANGE_ID`.
-/// This needs the `testing` feature enabled in `but-core` as well to work.
-/// **This changes the process environment, be aware.**
-///
-/// ### DEPRECATION WARNING
-///
-/// Do not use this function unless it's interfacing with old code. Prefer [`open_repo()`] for instance.
-pub fn deprecated_stable_env_vars() {
-    let env = gix_testtools::Env::new()
-        // TODO(gix): once everything is ported, all these can be configured on `gix::Repository`.
-        //            CHANGE_ID now works with a single value.
-        //            Call `but_testsupport::open_repo()` for basic settings.
-        .set("GIT_AUTHOR_DATE", "2000-01-01 00:00:00 +0000")
-        .set("GIT_AUTHOR_EMAIL", "author@example.com")
-        .set("GIT_AUTHOR_NAME", "author (From Env)")
-        .set("GIT_COMMITTER_DATE", "2000-01-02 00:00:00 +0000")
-        .set("GIT_COMMITTER_EMAIL", "committer@example.com")
-        .set("GIT_COMMITTER_NAME", "committer (From Env)")
-        .set("GITBUTLER_CHANGE_ID", "change-id");
-    // assure it doesn't get racy.
-    _ = std::mem::ManuallyDrop::new(env);
-}
-
-/// Run `f` with `E2E_TEST_APP_DATA_DIR` pointing at a temporary directory, so code that
-/// resolves application-wide directories via `but_path` cannot read or write user-level files.
-///
-/// Use this when testing code that loads `AppSettings` from the default location.
-/// Calls are serialized process-wide via `temp_env`'s global mutex, so concurrent
-/// use from parallel tests is safe.
-pub fn isolated_app_data_dir<R>(f: impl FnOnce() -> R) -> R {
-    let tmp = gix_testtools::tempfile::TempDir::new().unwrap();
-    temp_env::with_var("E2E_TEST_APP_DATA_DIR", Some(tmp.path()), f)
 }
 
 /// Utilities for the [`git()`] command.

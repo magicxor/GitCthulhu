@@ -4,14 +4,14 @@ use but_db::DbHandle;
 fn basic_usage() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let db = DbHandle::new_in_directory(tmp.path())?;
-    assert!(db.hunk_assignments().list_all()?.is_empty());
+    assert!(db.forge_reviews().list_all()?.is_empty());
 
     // Two handles at the same time.
     let other_db = DbHandle::new_in_directory(tmp.path())?;
-    assert!(other_db.hunk_assignments().list_all()?.is_empty());
+    assert!(other_db.forge_reviews().list_all()?.is_empty());
 
     assert!(
-        tmp.path().join("but.sqlite").exists(),
+        tmp.path().join("gitcthulhu.sqlite").exists(),
         "The database file is well-known and is auto-created"
     );
     Ok(())
@@ -22,7 +22,7 @@ fn in_nonexisting_dir() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let db = DbHandle::new_in_directory(tmp.path().join("does-not-exist"))?;
     assert!(
-        db.hunk_assignments().list_all()?.is_empty(),
+        db.forge_reviews().list_all()?.is_empty(),
         "directories are created on demand, otherwise initialization fails, fair enough"
     );
     Ok(())
@@ -39,7 +39,7 @@ fn read_only_does_not_create_missing_database() -> anyhow::Result<()> {
         "missing databases should not be created by read-only opens"
     );
     assert!(
-        !tmp.path().join("but.sqlite").exists(),
+        !tmp.path().join("gitcthulhu.sqlite").exists(),
         "read-only opens should leave the filesystem untouched"
     );
     Ok(())
@@ -50,17 +50,18 @@ fn read_only_observes_existing_database() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     {
         let mut db = DbHandle::new_in_directory(tmp.path())?;
-        db.branch_order_mut()?
-            .set_order(&["refs/heads/A".to_owned(), "refs/heads/B".to_owned()])?;
+        db.fetch_status_mut().record_failure(42, "offline")?;
     }
 
     let db = DbHandle::open_existing_read_only_in_directory(tmp.path())?
         .expect("database was created before read-only open");
 
     assert_eq!(
-        db.branch_order().order_for_reference("refs/heads/B")?,
-        Some(vec!["refs/heads/A".to_owned(), "refs/heads/B".to_owned()]),
-        "read-only handles should see existing branch order"
+        db.fetch_status()
+            .get()?
+            .map(|status| status.last_attempted_ms),
+        Some(42),
+        "read-only handles should see existing data"
     );
     Ok(())
 }
@@ -76,7 +77,7 @@ fn in_parallel_with_threads() -> anyhow::Result<()> {
                 barrier.wait();
                 for _round in 0..10 {
                     let handle = DbHandle::new_in_directory(tmp.path())?;
-                    assert!(handle.hunk_assignments().list_all()?.is_empty());
+                    assert!(handle.forge_reviews().list_all()?.is_empty());
                 }
                 Ok(())
             });

@@ -41,9 +41,6 @@ Outcome {
         Sha1(7f802e9e3d48d97a7ca7bc4cbf7e0168bd587eed),
     ),
     index_conflicts: None,
-    workspace_references: None,
-    head_references: None,
-    metadata: None,
 }
 
 "#]]
@@ -69,12 +66,6 @@ Outcome {
 100755:86daf54 untracked-exe
 
 "#]]
-    );
-
-    assert!(res_out.metadata.is_none());
-    assert!(
-        res_out.workspace_references.is_none(),
-        "didn't ask to store this"
     );
 
     state.selection.clear();
@@ -122,9 +113,6 @@ Outcome {
     index_conflicts: Some(
         Sha1(189678eb92add4601574a23c96a7c8d40bd9d154),
     ),
-    workspace_references: None,
-    head_references: None,
-    metadata: None,
 }
 
 "#]]
@@ -150,12 +138,6 @@ Outcome {
 100644:e33f5e9 file:3
 
 "#]]
-    );
-
-    assert!(res_out.metadata.is_none());
-    assert!(
-        res_out.workspace_references.is_none(),
-        "didn't ask to store this"
     );
 
     state.selection.clear();
@@ -200,9 +182,6 @@ Outcome {
         Sha1(3fd7ead2468a4def3db4c946c0f3b933eb8f2682),
     ),
     index_conflicts: None,
-    workspace_references: None,
-    head_references: None,
-    metadata: None,
 }
 
 "#]]
@@ -224,10 +203,5 @@ Outcome {
 "#]]
     );
 
-    assert!(res_out.metadata.is_none());
-    assert!(
-        res_out.workspace_references.is_none(),
-        "didn't ask to store this"
-    );
     Ok(())
 }

@@ -1,6 +1,6 @@
 use tracing::instrument;
 
-use crate::{M, SchemaVersion, cache};
+use crate::{M, SchemaVersion};
 
 /// The error produced when running migrations.
 pub type Error = crate::Error;
@@ -181,21 +181,6 @@ impl<'a> M<'a> {
     pub const fn up(
         created_at_for_sorting: u64,
         schema_version: SchemaVersion,
-        up_sql: &'a str,
-    ) -> Self {
-        M {
-            up: up_sql,
-            up_created_at: created_at_for_sorting,
-            schema_version: schema_version as u32,
-        }
-    }
-
-    /// Create a new migration with `created_at_for_sorting` in a format like `20250529110746`,
-    /// a documented forward-compatibility `schema_version`, and the `up_sql` which is Sqlite
-    /// compatible SQL to create or update tables.
-    pub const fn up_project_cache(
-        created_at_for_sorting: u64,
-        schema_version: cache::SchemaVersion,
         up_sql: &'a str,
     ) -> Self {
         M {

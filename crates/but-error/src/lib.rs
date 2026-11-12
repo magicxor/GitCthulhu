@@ -136,9 +136,7 @@ macro_rules! bail_precondition {
 /// **Only add variants if a consumer, like the *frontend*, is actually using them**.
 /// Remove variants when no longer in use.
 ///
-/// In practice, it should match its [frontend counterpart](https://github.com/gitbutlerapp/gitbutler/blob/fa973fd8f1ae8807621f47601803d98b8a9cf348/app/src/lib/backend/ipc.ts#L5).
 #[derive(Debug, Default, Copy, Clone, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 pub enum Code {
     /// Much like a catch-all error code. It shouldn't be attached explicitly unless
     /// a message is provided as well as part of a [`Context`].
@@ -147,10 +145,8 @@ pub enum Code {
     Validation,
     RepoOwnership,
     ProjectGitAuth,
-    DefaultTargetNotFound,
     CommitSigningFailed,
     CommitMergeConflictFailure,
-    ConflictedCommitCheckout,
     ProjectMissing,
     AuthorMissing,
     BranchNotFound,
@@ -163,10 +159,6 @@ pub enum Code {
     NetworkError,
     ProjectDatabaseIncompatible,
     DefaultTerminalNotFound,
-    /// The user dismissed the macOS admin-privileges prompt when installing
-    /// the `but` CLI. Not a real failure — the frontend swaps it for a
-    /// neutral info toast.
-    CliInstallCancelled,
     /// The GitHub access token was rejected. Currently only synthesized by
     /// the frontend when an Octokit response message starts with
     /// "Not Found -" — kept here so the wire-level `Code` enum is the
@@ -181,7 +173,7 @@ pub enum Code {
     /// The self-hosted GitLab host is not an absolute URL, so no request could be built.
     GitLabInvalidHost,
     /// A GitHub organization has enabled OAuth App access restrictions and
-    /// blocked the GitButler OAuth app. Terminal until the org approves the
+    /// blocked the OAuth app. Terminal until the org approves the
     /// app or the user switches credentials — retrying won't help.
     GitHubOrgOAuthRestricted,
     /// A GitHub organization requires SAML SSO authorization for the
@@ -226,14 +218,7 @@ pub enum Code {
     /// exists with a non-zero status code. Allows callers to detect that and show a different
     /// error message.
     EditorExitedWithNonZeroStatus,
-    /// The project's target is a remote branch, as an older GitButler stored it, and no single
-    /// local branch tracks it. Choosing a local target branch replaces it; the message says why
-    /// it didn't resolve.
-    UnresolvedLegacyTarget,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(Code);
 
 impl std::fmt::Display for Code {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

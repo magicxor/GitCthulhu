@@ -1,5 +1,5 @@
 #![deny(missing_docs)]
-//! The basic primitives that GitButler is built around.
+//! The basic Git primitives that GitCthulhu's backend crates build on.
 //!
 //! It also is a catch-all for code until it's worth putting it into its own crate, *as long as it doesn't come with more dependencies*.
 //! As such, this is very much intended to **be a leaf crate**, i.e. a crate that can be used in many places for basic functionality.
@@ -13,14 +13,13 @@
 //! * **Try hard to do write all the 'right' tests**
 //!    - Tests should challenge the implementation, try hard to break it.
 //!    - capture *all* business requirements
-//!    - Try to avoid doing read-only filesystem fixtures with `tempdir`, instead use `gitbutler-testtools::readonly`.
+//!    - Try to avoid doing read-only filesystem fixtures with `tempdir`, instead use `but_testsupport::read_only_in_memory_scenario()`.
 //! * **minimal dependencies**
 //!    - both for the *crate* and for *parameters* of functions as well.
 //!         - i.e. try to avoid 'God' structures so the function only has access to what it needs to.
-//!    - don't introduce dependencies towards legacy crates (e.g. prefixed withn "gitbutler-")
 //! * **The filesystem is `Sync` but we don't have atomic operations**
 //!    - Let's be very careful about changes to the filesystem, must at least be on the level of Git which means `.lock` files instead of direct writes.
-//!    - If only one part of the application is supposed to change the worktree, let's protect the Application from itself by using `gitbutler::access` just like we do now.
+//!    - If only one part of the application is supposed to change the worktree, protect the application from itself with the locks in [`sync`].
 //! * **Implement `Serialize` on utility types to facilitate transfer to the frontend**
 //!     - But don't make bigger types frontend-specific. If that is needed, create a new type in the frontend-crate that uses frontend types.
 //!     - `BString` has a `BStringForFrontend` counterpart.
@@ -33,9 +32,6 @@
 //!
 //! * **Worktree**
 //!     - A git worktree, i.e. the checkout of a tree that makes the tree accessible on disk.
-//! * **Workspace**
-//!     - A GitButler concept of the combination of one or more branches into one worktree. This allows
-//!       multiple branches to be perceived in one worktree, by merging multiple branches together.
 //! * **TreeChange**
 //!     - A change to a path contained in a Git tree.
 //!     - The change may have various sources, like an actual Git tree, or the worktree.
@@ -44,18 +40,11 @@
 //!     - A list of patches in unified diff format, with easily accessible line number information. It isn't baked into the patch string itself.
 //!
 
-use std::{
-    any::Any,
-    ops::{Deref, DerefMut},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use boolean_enums::gen_boolean_enum;
 use bstr::{BString, ByteSlice};
-use gix::{
-    object::tree::EntryKind, refs::FullNameRef,
-    status::plumbing::index_as_worktree::ConflictIndexEntry,
-};
+use gix::{object::tree::EntryKind, status::plumbing::index_as_worktree::ConflictIndexEntry};
 use serde::Serialize;
 
 /// Functions to obtain changes between various items.
@@ -90,9 +79,6 @@ pub mod ui;
 mod id;
 pub use id::Id;
 
-mod change_id;
-pub use change_id::ChangeId;
-
 /// utility types
 pub mod unified_diff;
 
@@ -105,7 +91,6 @@ pub mod hooks;
 /// Various settings
 pub mod settings;
 pub use settings::git::types::GitConfigSettings;
-pub use settings::git::ui::{GitHubStackingMode, ReviewStackingDescription};
 
 pub mod snapshot;
 
@@ -115,10 +100,6 @@ pub mod worktree;
 /// Utilities to create Git trees.
 pub mod tree;
 
-/// Various types
-pub mod ref_metadata;
-use crate::ref_metadata::ValueInfo;
-
 /// Utilities to sync project access.
 pub mod sync;
 
@@ -127,21 +108,6 @@ pub use ext::ObjectStorageExt;
 
 mod repo_ext;
 pub use repo_ext::{RepositoryExt, update_head_reference};
-
-/// The legacy single-workspace reference used by GitButler.
-pub const WORKSPACE_REF_NAME: &str = "refs/heads/gitbutler/workspace";
-
-/// Return `true` if `ref_name` looks like the standard GitButler workspace.
-///
-/// Note that in the future, ideally we won't rely on the name at all, but instead
-/// check for the presence of workspace ref-metadata.
-///
-/// TODO: no special handling by branch-name should be needed, it's all in the ref-metadata.
-///
-/// `but_db::worktrees` keeps a hand-copy of this to stay off but-core; change both.
-pub fn is_workspace_ref_name(ref_name: &FullNameRef) -> bool {
-    ref_name == WORKSPACE_REF_NAME || ref_name == "refs/heads/gitbutler/integration"
-}
 
 /// A utility to extract the name of the remote from a remote tracking ref with `ref_name`,
 /// along with the short name of the branch that remains after stripping the remote name.
@@ -181,142 +147,7 @@ pub fn extract_remote_name_and_short_name(
     Some((longest_remote.to_string(), short_name.to_owned()))
 }
 
-/// A trait to associate arbitrary metadata with any *Git reference name*.
-/// Note that a single reference name can have multiple distinct pieces of metadata associated with it.
-pub trait RefMetadata {
-    /// An implementation-defined wrapper for all data to keep additional information that it might need
-    /// to more easily store the data.
-    type Handle<T>: Deref<Target = T> + DerefMut + ref_metadata::ValueInfo + AsRef<FullNameRef>;
-
-    /// Traverse all available metadata entries and see if their names still exist in the Git ref database.
-    ///
-    /// If not, they are dangling, and can then be downcast to their actual type to deal with them in some way,
-    /// either by [removing](Self::remove) them, or by re-associating them with an existing reference.
-    fn iter(&self) -> impl Iterator<Item = anyhow::Result<(gix::refs::FullName, Box<dyn Any>)>>;
-
-    /// Retrieve workspace metadata for `ref_name` or create it if it wasn't present yet.
-    fn workspace(
-        &self,
-        ref_name: &gix::refs::FullNameRef,
-    ) -> anyhow::Result<Self::Handle<ref_metadata::Workspace>>;
-
-    /// Retrieve branch metadata for `ref_name` or create it if it wasn't present yet.
-    fn branch(
-        &self,
-        ref_name: &gix::refs::FullNameRef,
-    ) -> anyhow::Result<Self::Handle<ref_metadata::Branch>>;
-
-    /// Like [`branch()`](Self::branch()), but instead of possibly returning default values, return an
-    /// optional branch instead.
-    ///
-    /// This means the returned branch data is never the default value.
-    fn branch_opt(
-        &self,
-        ref_name: &gix::refs::FullNameRef,
-    ) -> anyhow::Result<Option<Self::Handle<ref_metadata::Branch>>> {
-        let branch = self.branch(ref_name)?;
-        Ok(if branch.is_default() {
-            None
-        } else {
-            Some(branch)
-        })
-    }
-
-    /// Like [`workspace()`](Self::workspace()), but instead of possibly returning default values, return an
-    /// optional workspace instead.
-    ///
-    /// This means the returned workspace data is never the default value.
-    fn workspace_opt(
-        &self,
-        ref_name: &gix::refs::FullNameRef,
-    ) -> anyhow::Result<Option<Self::Handle<ref_metadata::Workspace>>> {
-        let ws = self.workspace(ref_name)?;
-        Ok(if ws.is_default() { None } else { Some(ws) })
-    }
-
-    /// Set workspace metadata to match `value`.
-    fn set_workspace(
-        &mut self,
-        value: &Self::Handle<ref_metadata::Workspace>,
-    ) -> anyhow::Result<()>;
-
-    /// Set branch metadata to match `value`.
-    fn set_branch(&mut self, value: &Self::Handle<ref_metadata::Branch>) -> anyhow::Result<()>;
-
-    /// Return the ordered local branch refs in the same stack as `ref_name`, from tip to base.
-    ///
-    /// Implementations that don't persist branch stack order can return `Ok(None)`.
-    ///
-    /// This is best-effort: the returned refs may include entries for branches that no longer
-    /// exist if pruning hasn't run since they were deleted (see
-    /// [`Self::remove_missing_branch_stack_order_references`]). Callers must treat the result as a
-    /// hint and validate each ref against the repository, ignoring any that don't resolve, rather
-    /// than assuming every entry is live.
-    fn branch_stack_order(
-        &self,
-        _ref_name: &gix::refs::FullNameRef,
-    ) -> anyhow::Result<Option<Vec<gix::refs::FullName>>> {
-        Ok(None)
-    }
-
-    /// Persist the ordered local branch refs for an ad-hoc/single-branch stack, from tip to base.
-    ///
-    /// Implementations that don't persist branch stack order should return an error.
-    fn set_branch_stack_order(&mut self, _branches: &[gix::refs::FullName]) -> anyhow::Result<()> {
-        anyhow::bail!("This metadata backend doesn't support branch stack order")
-    }
-
-    /// Return `true` if this backend can persist ad-hoc/single-branch stack order.
-    fn can_persist_branch_stack_order(&self) -> bool {
-        false
-    }
-
-    /// Rename a local branch ref in persisted ad-hoc/single-branch stack order metadata.
-    ///
-    /// Implementations that don't persist branch stack order can ignore this.
-    fn rename_branch_stack_order_reference(
-        &mut self,
-        _old_ref_name: &gix::refs::FullNameRef,
-        _new_ref_name: &gix::refs::FullNameRef,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Remove persisted ad-hoc/single-branch stack order entries for refs that no longer exist.
-    ///
-    /// `existing_ref_names` must contain the complete set of existing local branch refs.
-    /// Implementations that don't persist branch stack order can ignore this.
-    fn remove_missing_branch_stack_order_references(
-        &mut self,
-        _existing_ref_names: &[gix::refs::FullName],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Delete the metadata associated with the given `ref_name` and return `true` if it existed, or `false` otherwise.
-    ///
-    /// It is OK to delete something that doesn't exist.
-    fn remove(&mut self, ref_name: &gix::refs::FullNameRef) -> anyhow::Result<bool>;
-
-    /// Move all metadata associated with `old_ref_name` over to `new_ref_name`.
-    ///
-    /// This carries over any per-branch metadata blob and renames the persisted branch-stack-order
-    /// entry (see [`rename_branch_stack_order_reference`](Self::rename_branch_stack_order_reference)).
-    ///
-    /// It is OK to rename a `ref_name` that has no metadata, and renaming onto itself is a no-op.
-    ///
-    /// There is deliberately no default implementation: a generic one built from `branch` +
-    /// `set_branch` + `remove` would copy per-branch metadata into a *new* standalone stack and tear
-    /// the branch out of its existing one, fragmenting managed stacks. Each backend must move its
-    /// metadata in place instead.
-    fn rename(
-        &mut self,
-        old_ref_name: &gix::refs::FullNameRef,
-        new_ref_name: &gix::refs::FullNameRef,
-    ) -> anyhow::Result<()>;
-}
-
-/// A decoded commit object with easy access to additional GitButler information.
+/// A decoded commit object along with its id.
 #[derive(Debug, Clone)]
 pub struct Commit<'repo> {
     /// The id of the commit itself.
@@ -325,7 +156,7 @@ pub struct Commit<'repo> {
     pub inner: gix::objs::Commit,
 }
 
-/// A decoded commit object with easy access to additional GitButler information, without repo reference.
+/// A decoded commit object along with its id, without repo reference.
 #[derive(Debug, Clone)]
 pub struct CommitOwned {
     /// The id of the commit itself.
@@ -337,7 +168,6 @@ pub struct CommitOwned {
 /// A patch in unified diff format to show how a resource changed or now looks like (in case it was newly added),
 /// or how it previously looked like in case of a deletion.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject")]
 pub enum UnifiedPatch {
     /// The resource was a binary and couldn't be diffed.
@@ -361,30 +191,6 @@ pub enum UnifiedPatch {
         /// The total amount of lines removed.
         lines_removed: u32,
     },
-}
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(UnifiedPatch);
-
-/// Either git reference or a virtual reference (i.e. a reference not visible in Git).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Reference {
-    /// A git reference or lightweight tag.
-    Git(gix::refs::FullName),
-    /// A reference not visible in Git, managed by GitButler.
-    // TODO: ideally this isn't needed anymore in the final version as all refs are 'real'.
-    Virtual(String),
-}
-
-impl std::fmt::Display for Reference {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Reference::Git(r) => match r.category_and_short_name() {
-                Some((gix::refs::Category::LocalBranch, short_name)) => short_name.fmt(f),
-                _ => "".fmt(f),
-            },
-            Reference::Virtual(r) => r.fmt(f),
-        }
-    }
 }
 
 /// Open a repository in such a way that the object cache is set to accelerate merge operations.
@@ -489,7 +295,6 @@ pub struct ChangeState {
 
 /// The status we can't handle, which always originated in the worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 pub enum IgnoredWorktreeTreeChangeStatus {
     /// A conflicting entry in the index. The worktree state of the entry is unclear.
     Conflict,
@@ -499,25 +304,16 @@ pub enum IgnoredWorktreeTreeChangeStatus {
     /// is the same as what Git is currently tracking.
     TreeIndexWorktreeChangeIneffective,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(IgnoredWorktreeTreeChangeStatus);
 
 /// A way to indicate that a path in the index isn't suitable for committing and needs to be dealt with.
 #[derive(Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 pub struct IgnoredWorktreeChange {
     /// The worktree-relative path to the change.
     #[serde(serialize_with = "but_serde::bstring_lossy::serialize")]
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::bstring_lossy")
-    )]
     pub path: BString,
     /// The status that caused this change to be ignored.
     pub status: IgnoredWorktreeTreeChangeStatus,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(IgnoredWorktreeChange);
 
 /// The type returned by [`worktree_changes()`](diff::worktree_changes).
 #[derive(Clone)]

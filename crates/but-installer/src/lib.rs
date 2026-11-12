@@ -1,9 +1,12 @@
 #![cfg(unix)]
-//! GitButler installer library
+//! GitCthulhu installer library
 //!
-//! This library provides functionality for installing GitButler on Linux and macOS systems.
+//! This library provides functionality for installing GitCthulhu on Linux and macOS systems.
 //! It handles downloading releases, verifying signatures, extracting archives,
-//! and setting up the application and CLI tools.
+//! and setting up the application and the `PATH` entry for its binary.
+//!
+//! The release server and the signing key are explicit configuration
+//! ([`RELEASE_URL_ENV`], [`RELEASE_PUBLIC_KEY_ENV`]); there are no defaults.
 
 mod config;
 mod download;
@@ -22,8 +25,10 @@ mod install_macos;
 use anyhow::Result;
 use config::{Channel, InstallerConfig};
 // Re-export types for public API consumers
-pub use config::{Version, VersionRequest};
-use install::but_binary_path;
+pub use config::{
+    RELEASE_PUBLIC_KEY_ENV, RELEASE_URL_ENV, ReleaseSource, VERSION_ENV, Version, VersionRequest,
+};
+use install::APP_BINARY_NAME;
 use release::fetch_release;
 use shell::configure_shell;
 use ui::{info, success};
@@ -33,20 +38,18 @@ use crate::install_linux::download_and_install_app;
 #[cfg(target_os = "macos")]
 use crate::install_macos::download_and_install_app;
 
-/// Runs the complete GitButler installation process with a specific version.
+/// Runs the complete GitCthulhu installation process with a specific version.
 ///
 /// This is the main entry point that orchestrates:
-/// - Fetching release information from the API
-/// - Downloading and verifying the application tarball
+/// - Fetching release information from the release API configured in [`RELEASE_URL_ENV`]
+/// - Downloading the application and verifying it against [`RELEASE_PUBLIC_KEY_ENV`]
 /// - Extracting and installing the app bundle
-/// - Setting up the `but` CLI and shell configuration
+/// - Setting up the `PATH` entry for the application binary
 ///
 /// # Arguments
 /// * `version_request` - Version to install (Release, Nightly, or Specific version).
 /// * `interactive` - Whether this is an interactive installation (e.g., from the install script).
-///   When `true`, runs `but onboarding` and prints usage instructions after installation.
-///   Set to `false` when called from CLI tools (like `but update`) where the user
-///   is already familiar with the CLI.
+///   When `true`, offers to configure the shell and prints usage instructions after installation.
 ///
 /// Returns an error if any step fails. The function will attempt to rollback
 /// changes on installation failure.
@@ -58,54 +61,25 @@ pub fn run_installation_with_version(
     run_installation_impl(config, interactive)
 }
 
-/// Runs the complete GitButler installation process.
+/// The environment variable that forces a non-interactive installation when set to a non-empty value.
+pub const NONINTERACTIVE_ENV: &str = "GITCTHULHU_NONINTERACTIVE";
+
+/// Runs the complete GitCthulhu installation process.
 ///
-/// Reads version from command-line arguments or GITBUTLER_VERSION environment variable.
+/// Reads version from command-line arguments or the [`VERSION_ENV`] environment variable.
 /// If neither is provided, installs the latest release.
 ///
 /// This is the entry point for the standalone installer binary, and runs in interactive mode with
-/// shell configuration and other onboarding if there is a terminal connected. Otherwise, or when
-/// `GITBUTLER_NONINTERACTIVE` is set to a non-empty value (for scripts that wrap the installer),
-/// it runs non-interactively.
+/// shell configuration if there is a terminal connected. Otherwise, or when [`NONINTERACTIVE_ENV`]
+/// is set to a non-empty value (for scripts that wrap the installer), it runs non-interactively.
 ///
 /// Returns an error if any step fails. The function will attempt to rollback
 /// changes on installation failure.
 pub fn run_installation() -> Result<()> {
     let config = InstallerConfig::new()?;
-    let forced_noninteractive =
-        std::env::var("GITBUTLER_NONINTERACTIVE").is_ok_and(|v| !v.is_empty());
+    let forced_noninteractive = std::env::var(NONINTERACTIVE_ENV).is_ok_and(|v| !v.is_empty());
     let interactive = ui::is_connected_to_terminal() && !forced_noninteractive;
-    let but_path = but_binary_path(&config.home_dir);
-    run_installation_impl(config, interactive)?;
-    if supports_agent_setup(&but_path) {
-        if interactive {
-            ui::println_empty();
-            offer_agent_skill_setup(&but_path);
-        } else {
-            info("To install the GitButler skill for your coding agent, run: but agent setup");
-        }
-    }
-    Ok(())
-}
-
-/// Returns true if the installed `but` has the built-in `agent setup` command.
-///
-/// Detected by `but --help` listing an `agent` subcommand. Do not probe by
-/// running `but agent ...` itself: pinned older versions lack the command and
-/// some of them would dispatch it to an unrelated `but-agent` executable on
-/// PATH, whereas `--help` is built in on every version.
-fn supports_agent_setup(but_path: &std::path::Path) -> bool {
-    std::process::Command::new(but_path)
-        .arg("--help")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok_and(|out| {
-            out.status.success()
-                && String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .any(|line| line.trim_start().starts_with("agent "))
-        })
+    run_installation_impl(config, interactive)
 }
 
 fn run_installation_impl(config: InstallerConfig, interactive: bool) -> Result<()> {
@@ -161,7 +135,7 @@ fn run_installation_impl(config: InstallerConfig, interactive: bool) -> Result<(
 
     ui::println_empty();
     success(&format!(
-        "✓ GitButler CLI installation completed! ({}{})",
+        "✓ GitCthulhu installation completed! ({}{})",
         channel
             .map(|c| format!("{} ", c.display_name()))
             .unwrap_or_default(),
@@ -170,58 +144,10 @@ fn run_installation_impl(config: InstallerConfig, interactive: bool) -> Result<(
     ui::println_empty();
 
     if interactive {
-        // Run onboarding to show metrics info message (if first run).
-        // Suppress stderr - older CLI versions don't have this command and would print an error.
-        let but_path = but_binary_path(&config.home_dir);
-        let _ = std::process::Command::new(&but_path)
-            .arg("onboarding")
-            .stderr(std::process::Stdio::null())
-            .status();
-
-        info("Usage:");
-        ui::println("  but --help           Show available commands");
-        ui::println("  but status           Show branch status");
-        ui::println("  but commit           Create a commit");
-        ui::println_empty();
-        info("For more information, visit: https://docs.gitbutler.com");
+        info(&format!(
+            "Start GitCthulhu with: {APP_BINARY_NAME} [repository directory]"
+        ));
     }
 
     Ok(())
-}
-
-/// Offers to run `but agent setup` after a successful interactive installation.
-///
-/// Best-effort: the installation has already succeeded at this point, so
-/// declining, cancelling the wizard, or any failure never fails the install.
-fn offer_agent_skill_setup(but_path: &std::path::Path) {
-    if !ui::prompt_for_confirmation_default_yes(
-        "Install the GitButler skill for your coding agent (Claude Code, Codex, ...)?",
-    ) {
-        info("You can install it later with: but agent setup");
-        return;
-    }
-
-    // The setup wizard requires a terminal on stdin. Under `curl | sh` this
-    // process inherits curl's pipe as stdin, so give the child a duplicate of
-    // our stdout instead — in interactive mode that is the terminal device,
-    // opened read-write by the terminal emulator. Deliberately not an opened
-    // `/dev/tty`: on macOS, kqueue cannot poll that alias device, and the
-    // wizard's event loop would hang before reading a single key.
-    let child_stdin = {
-        use std::os::fd::AsFd;
-        std::io::stdout()
-            .as_fd()
-            .try_clone_to_owned()
-            .map(std::process::Stdio::from)
-            .unwrap_or_else(|_| std::process::Stdio::inherit())
-    };
-
-    let status = std::process::Command::new(but_path)
-        .args(["agent", "setup"])
-        .stdin(child_stdin)
-        .status();
-
-    if !status.map(|s| s.success()).unwrap_or(false) {
-        info("Agent setup did not complete. You can run it again with: but agent setup");
-    }
 }

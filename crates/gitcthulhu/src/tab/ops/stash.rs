@@ -1,13 +1,15 @@
-//! Stash operations of the catalogue (spec 21 §2.11; owned by G3 after G0b). G0b implements the reference method
-//! `pop_stash` (prepare reads the stash's untracked paths for the snapshot).
+//! Stash operations of the catalogue (spec 21 §2.11, §2.9; owned by G3): stash, apply, pop and drop. G0b wrote the
+//! reference method `pop_stash` (prepare reads the stash's untracked paths for the snapshot); apply shares its
+//! build. A conflicted or partial apply/pop is a successful run that keeps the stash entry and adds a Warning toast
+//! to the success toast (which must stay: it carries the undo action of a recorded run).
 
 use gpui_kit::{Context, Window};
 
 use super::{OpKind, OpSpec, Prepared};
-use crate::backend::present::OpFailure;
+use crate::backend::present::{OpFailure, confirm_unrestorable};
 use crate::backend::{
-    ByteSlice as _, ObjectId, OperationDescriptor, OperationKind, RefreshSet, Scope,
-    StashApplyOptions, StashApplyResult, UntrackedCapture, git, loaders,
+    ByteSlice as _, ChangeKind, ObjectId, OperationDescriptor, OperationKind, RefreshSet, RelaPath,
+    Scope, StashApplyOptions, StashApplyResult, StashPushOptions, UntrackedCapture, git, loaders,
 };
 use crate::notifications::ToastKind;
 use crate::tab::RepoTab;
@@ -52,21 +54,59 @@ impl RepoTab {
             .map(|s| s.index)
     }
 
-    /// ★ `git stash pop` of `id`: a full snapshot that captures the untracked files the stash restores (read in
-    /// `prepare`, before the guard). A conflicted or partial pop keeps the entry and shows a Warning toast.
-    /// Refresh: STATUS | STASHES | LOG | REPO_STATE.
-    pub fn pop_stash(&mut self, id: ObjectId, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// The untracked files of the loaded status (the candidates of `stash -u`'s snapshot capture).
+    fn untracked_paths(&self, cx: &Context<Self>) -> Vec<RelaPath> {
+        self.ctx
+            .model
+            .read(cx)
+            .status
+            .value
+            .as_ref()
+            .map(|status| {
+                status
+                    .unstaged
+                    .iter()
+                    .filter(|e| e.kind == ChangeKind::Untracked)
+                    .map(|e| e.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Apply and pop share everything but the backend call, the oplog kind and the refresh set.
+    fn run_stash_apply(
+        &mut self,
+        id: ObjectId,
+        pop: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let index = self.stash_index(id, cx).unwrap_or(0);
+        let (op, oplog_kind, verb) = if pop {
+            (OpKind::PopStash, OperationKind::StashPop, "Pop")
+        } else {
+            (OpKind::ApplyStash, OperationKind::StashApply, "Apply")
+        };
         let descriptor = OperationDescriptor {
-            kind: OperationKind::StashPop,
-            title: format!("Pop stash@{{{index}}}"),
+            kind: oplog_kind,
+            title: format!("{verb} stash@{{{index}}}"),
             detail: None,
             scope: Scope::Full,
             untracked: UntrackedCapture::None,
         };
-        let spec = OpSpec::new(OpKind::PopStash, move |env| {
+        let refresh = if pop {
+            RefreshSet::STATUS | RefreshSet::STASHES | RefreshSet::LOG | RefreshSet::REPO_STATE
+        } else {
+            RefreshSet::STATUS | RefreshSet::REPO_STATE
+        };
+        let spec = OpSpec::new(op, move |env| {
             let (repo, ctx) = (env.repo, env.ctx);
-            git::stash::stash_pop(repo, env.perm(), ctx, id, StashApplyOptions::default())
+            let opts = StashApplyOptions::default();
+            if pop {
+                git::stash::stash_pop(repo, env.perm(), ctx, id, opts)
+            } else {
+                git::stash::stash_apply(repo, env.perm(), ctx, id, opts)
+            }
         })
         .prepare(move |handle, _| {
             let paths = loaders::stash_untracked_paths(&handle.repo, id)
@@ -76,48 +116,129 @@ impl RepoTab {
             })
         })
         .record(descriptor)
-        .base_refresh(
-            RefreshSet::STATUS | RefreshSet::STASHES | RefreshSet::LOG | RefreshSet::REPO_STATE,
-        )
+        .base_refresh(refresh)
+        // The runner's success toast stays (it carries the undo action of a recorded run, 17 §4.5); a result that
+        // did not apply cleanly adds the Warning.
         .then(|tab, result, _, cx| {
-            if let Some(text) = stash_result_warning(result) {
-                crate::app_view::show_toast(cx, Some(tab.ctx.id), ToastKind::Warning, text, None);
+            if let Some(warning) = stash_result_warning(result) {
+                crate::app_view::show_toast(
+                    cx,
+                    Some(tab.ctx.id),
+                    ToastKind::Warning,
+                    warning,
+                    None,
+                );
             }
         });
         self.run_op(spec, window, cx)
     }
 
-    /// `git stash push` (`include_untracked` = `-u`). Owner: G3.
-    pub fn stash(
-        &mut self,
-        _message: Option<String>,
-        _include_untracked: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.not_implemented("Stash", cx);
-        false
+    /// ★ `git stash pop` of `id`: a full snapshot that captures the untracked files the stash restores (read in
+    /// `prepare`, before the guard). A conflicted or partial pop keeps the entry and shows a Warning toast.
+    /// Refresh: STATUS | STASHES | LOG | REPO_STATE.
+    pub fn pop_stash(&mut self, id: ObjectId, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.run_stash_apply(id, true, window, cx)
     }
 
-    /// `git stash apply` of `id`. Owner: G3.
+    /// `git stash apply` of `id` (without `--index`), recorded like a pop. A conflicted or partial apply keeps the
+    /// entry (as every apply does) and shows a Warning toast. Refresh: STATUS | REPO_STATE.
     pub fn apply_stash(
         &mut self,
-        _id: ObjectId,
-        _window: &mut Window,
+        id: ObjectId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Apply stash", cx);
-        false
+        self.run_stash_apply(id, false, window, cx)
     }
 
-    /// `git stash drop` of `id`. Owner: G3.
-    pub fn drop_stash(
+    /// `git stash push` (`include_untracked` = `-u`; Gitnuro always includes them). With untracked files the
+    /// snapshot captures `All` of them; when it cannot hold some, the user is asked first. A stash that found
+    /// nothing to save shows a Warning toast. Refresh: STATUS | STASHES | LOG.
+    pub fn stash(
         &mut self,
-        _id: ObjectId,
-        _window: &mut Window,
+        message: Option<String>,
+        include_untracked: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Delete stash", cx);
-        false
+        let title = "Stash changes".to_owned();
+        let untracked = if include_untracked {
+            self.untracked_paths(cx)
+        } else {
+            Vec::new()
+        };
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::StashPush,
+            title: title.clone(),
+            detail: None,
+            scope: Scope::Full,
+            untracked: if include_untracked {
+                UntrackedCapture::All
+            } else {
+                UntrackedCapture::None
+            },
+        };
+        let message = message
+            .map(|m| m.trim().to_owned())
+            .filter(|m| !m.is_empty());
+        let mut spec = OpSpec::new(OpKind::Stash, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            let opts = StashPushOptions {
+                message,
+                include_untracked,
+                ..StashPushOptions::default()
+            };
+            git::stash::stash_push(repo, env.perm(), ctx, &opts)
+        })
+        .record(descriptor)
+        .base_refresh(RefreshSet::STATUS | RefreshSet::STASHES | RefreshSet::LOG)
+        // The runner's "Changes stashed" toast keeps the undo action of a recorded run; the rare race in which the
+        // changes vanished before Git ran (the Stash button is disabled on a clean tree) adds a Warning.
+        .then(|tab, saved: &Option<ObjectId>, _, cx| {
+            if saved.is_none() {
+                crate::app_view::show_toast(
+                    cx,
+                    Some(tab.ctx.id),
+                    ToastKind::Warning,
+                    "There were no changes to stash",
+                    None,
+                );
+            }
+        });
+        if include_untracked {
+            spec = spec.prepare(move |handle, asker| {
+                let skipped = handle.preview_skipped(&untracked);
+                if skipped.is_empty() || asker.confirm(confirm_unrestorable(&title, &skipped)) {
+                    Ok(Prepared::Continue { untracked: None })
+                } else {
+                    Ok::<_, OpFailure>(Prepared::Cancelled)
+                }
+            });
+        }
+        self.run_op(spec, window, cx)
+    }
+
+    /// `git stash drop` of `id`. Refresh: STASHES | LOG.
+    pub fn drop_stash(
+        &mut self,
+        id: ObjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let index = self.stash_index(id, cx).unwrap_or(0);
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::StashDrop,
+            title: format!("Drop stash@{{{index}}}"),
+            detail: None,
+            scope: Scope::RefsOnly,
+            untracked: UntrackedCapture::None,
+        };
+        let spec = OpSpec::new(OpKind::DropStash, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stash::stash_drop(repo, env.perm(), ctx, id)
+        })
+        .record(descriptor)
+        .base_refresh(RefreshSet::STASHES | RefreshSet::LOG);
+        self.run_op(spec, window, cx)
     }
 }

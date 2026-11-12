@@ -4,7 +4,8 @@
 //! keychain is read) whenever the `ai` setting or a stored key changes and when the services have just started.
 //! Views read [`Readiness`] and never block.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, Subscription, Task};
@@ -62,6 +63,11 @@ pub struct AiHub {
     /// Identity of the services instance the settings were given to.
     services_id: Option<usize>,
     generation: u64,
+    /// The newest generation, readable from the background threads: an older configuration that has not started
+    /// yet is skipped, so the service always ends with the newest settings.
+    latest: Arc<AtomicU64>,
+    /// Serialises the background configure calls (two of them must not interleave or finish out of order).
+    gate: Arc<Mutex<()>>,
     /// The pending re-apply after a settings change (typing in a field must not read the keychain per keystroke).
     debounce: Option<Task<()>>,
     _settings: Subscription,
@@ -89,6 +95,8 @@ impl AiHub {
             applied: AiSettings::default(),
             services_id: None,
             generation: 0,
+            latest: Arc::new(AtomicU64::new(0)),
+            gate: Arc::new(Mutex::new(())),
             debounce: None,
             _settings: settings,
         }
@@ -112,15 +120,23 @@ impl AiHub {
         self.applied = settings.clone();
         self.generation += 1;
         let generation = self.generation;
+        self.latest.store(generation, Ordering::SeqCst);
+        let latest = self.latest.clone();
+        let gate = self.gate.clone();
         let keys = key_store(cx);
         let task = crate::backend::bg(cx, move || {
-            backend_ai::configure(&services, &settings, &keys)
+            let _turn = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A newer configuration is queued behind this one: it carries the settings that count.
+            (latest.load(Ordering::SeqCst) == generation)
+                .then(|| backend_ai::configure(&services, &settings, &keys))
         });
         cx.spawn(async move |this, cx| {
             let status = task.await;
             this.update(cx, |hub, cx| {
                 // A newer configuration is on its way: this result is stale.
-                if hub.generation == generation {
+                if hub.generation == generation
+                    && let Some(status) = status
+                {
                     hub.set_readiness(Readiness::of(status), cx);
                 }
             })

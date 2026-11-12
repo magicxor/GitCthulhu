@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
 };
 
@@ -12,7 +12,7 @@ use gix::{ObjectId, refs::FullName, remote::Direction};
 use crate::{
     AheadBehind, CancelToken, Decorations, GitError, GitTime, HeadState, LocalBranch, RefLabel,
     RefList, RefListOptions, RemoteBranch, RemoteInfo, Repo, Result, StashInfo, TagInfo, Upstream,
-    config::other, remote::symref_head_branch, worktree::head_state,
+    internal::errors::gix_error, remote::symref_head_branch, worktree::head_state,
 };
 
 impl RefListOptions {
@@ -51,13 +51,13 @@ pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
         }
     }
 
-    let platform = gix_repo.references().map_err(other)?;
+    let platform = gix_repo.references().map_err(gix_error)?;
 
     let mut local = Vec::new();
-    for reference in platform.local_branches().map_err(other)? {
-        let mut reference = reference.map_err(other)?;
+    for reference in platform.local_branches().map_err(gix_error)? {
+        let mut reference = reference.map_err(gix_error)?;
         let full = reference.name().to_owned();
-        let Ok(target) = reference.peel_to_id() else {
+        let Some(target) = resolved_id(&mut reference) else {
             continue;
         };
         let name = full.shorten().to_str_lossy().into_owned();
@@ -67,7 +67,7 @@ pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
             checked_out_in: checked_out.get(&full).cloned(),
             name,
             full,
-            target: target.detach(),
+            target,
             upstream,
             ahead_behind: None,
         });
@@ -80,16 +80,12 @@ pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
     }
 
     let mut tags = Vec::new();
-    let mut undecorated_tags = HashSet::new();
     if opts.tags {
-        for reference in platform.tags().map_err(other)? {
-            let reference = reference.map_err(other)?;
-            let Some((info, is_commit)) = tag_info(&gix_repo, reference)? else {
+        for reference in platform.tags().map_err(gix_error)? {
+            let reference = reference.map_err(gix_error)?;
+            let Some(info) = tag_info(&gix_repo, reference)? else {
                 continue;
             };
-            if !is_commit {
-                undecorated_tags.insert(info.full.clone());
-            }
             tags.push(info);
         }
         tags.sort_by(|a, b| version_cmp(&a.name, &b.name));
@@ -109,7 +105,7 @@ pub fn list(repo: &Repo, opts: RefListOptions) -> Result<RefList> {
         stashes,
         decorations: Decorations::default(),
     };
-    list.decorations = build_decorations(&list, &undecorated_tags);
+    list.decorations = decorations(&list);
     Ok(list)
 }
 
@@ -126,7 +122,7 @@ fn upstream_of(
     let Some(merge) = gix_repo.branch_remote_ref_name(full.as_ref(), Direction::Fetch) else {
         return Ok(None);
     };
-    let merge = merge.map_err(other)?;
+    let merge = merge.map_err(gix_error)?;
     let tracking = if remote == "." {
         // Upstream is a local branch.
         Some(merge.clone())
@@ -138,7 +134,7 @@ fn upstream_of(
     let gone = match &tracking {
         Some(tracking) => gix_repo
             .try_find_reference(tracking.as_ref())
-            .map_err(other)?
+            .map_err(gix_error)?
             .is_none(),
         None => false,
     };
@@ -233,8 +229,8 @@ fn remote_infos(
     by_name_len.sort_by_key(|name| std::cmp::Reverse(name.len()));
     let by_name_len: Vec<String> = by_name_len.into_iter().cloned().collect();
 
-    for reference in platform.remote_branches().map_err(other)? {
-        let mut reference = reference.map_err(other)?;
+    for reference in platform.remote_branches().map_err(gix_error)? {
+        let mut reference = reference.map_err(gix_error)?;
         let full = reference.name().to_owned();
         let full_str = lossy(full.as_bstr());
         let Some(rest) = full_str.strip_prefix("refs/remotes/") else {
@@ -265,7 +261,7 @@ fn remote_infos(
         if branch == "HEAD" {
             continue;
         }
-        let Ok(target) = reference.peel_to_id() else {
+        let Some(target) = resolved_id(&mut reference) else {
             continue;
         };
         infos
@@ -282,7 +278,7 @@ fn remote_infos(
                 remote,
                 name: branch,
                 full,
-                target: target.detach(),
+                target,
             });
     }
     let mut remotes: Vec<RemoteInfo> = infos.into_values().collect();
@@ -292,27 +288,36 @@ fn remote_infos(
     Ok(remotes)
 }
 
-/// `(info, points_to_commit)`; `None` for a ref that cannot be resolved.
+/// The object a reference points to, `None` if a symbolic reference cannot be resolved.
+///
+/// A direct reference is read as it is. Asking gix to `peel_to_id` it would look the reference up again, which for a
+/// packed reference means checking `packed-refs` on disk every time: about 50 us each, 0.5 s for 10k refs.
+fn resolved_id(reference: &mut gix::Reference<'_>) -> Option<ObjectId> {
+    match reference.target() {
+        gix::refs::TargetRef::Object(id) => Some(id.to_owned()),
+        gix::refs::TargetRef::Symbolic(_) => reference.peel_to_id().ok().map(gix::Id::detach),
+    }
+}
+
+/// `None` for a ref that cannot be resolved.
 fn tag_info(
     gix_repo: &gix::Repository,
     mut reference: gix::Reference<'_>,
-) -> Result<Option<(TagInfo, bool)>> {
+) -> Result<Option<TagInfo>> {
     let full = reference.name().to_owned();
     let name = full.shorten().to_str_lossy().into_owned();
-    // `peel_to_id` rewrites the reference in place: remember the unpeeled id (the tag object) first.
-    let first = match reference.target() {
-        gix::refs::TargetRef::Object(id) => Some(id.to_owned()),
-        gix::refs::TargetRef::Symbolic(_) => None,
-    };
-    let Ok(direct) = reference.peel_to_id() else {
+    // The id the reference points to, i.e. the tag object of an annotated tag (peeled below).
+    let Some(first) = resolved_id(&mut reference) else {
         return Ok(None);
     };
-    let first = first.unwrap_or_else(|| direct.detach());
-    let object = gix_repo.find_object(first).map_err(other)?;
-    let (tag_object, summary, tagger_time, target, is_commit) =
+    let Ok(object) = gix_repo.find_object(first) else {
+        tracing::warn!(tag = %full.as_bstr(), "Ignoring a tag whose object is missing");
+        return Ok(None);
+    };
+    let (tag_object, summary, tagger_time, target, peeled_kind) =
         if object.kind == gix::object::Kind::Tag {
             let tag = object.clone().into_tag();
-            let decoded = tag.decode().map_err(other)?;
+            let decoded = tag.decode().map_err(gix_error)?;
             let summary = decoded
                 .message
                 .lines()
@@ -325,34 +330,20 @@ fn tag_info(
                 .flatten()
                 .and_then(|sig| sig.time().ok())
                 .map(git_time);
-            let peeled = object.peel_tags_to_end().map_err(other)?;
-            (
-                Some(first),
-                summary,
-                time,
-                peeled.id,
-                peeled.kind == gix::object::Kind::Commit,
-            )
+            let peeled = object.peel_tags_to_end().map_err(gix_error)?;
+            (Some(first), summary, time, peeled.id, peeled.kind)
         } else {
-            (
-                None,
-                None,
-                None,
-                object.id,
-                object.kind == gix::object::Kind::Commit,
-            )
+            (None, None, None, object.id, object.kind)
         };
-    Ok(Some((
-        TagInfo {
-            name,
-            full,
-            target,
-            tag_object,
-            message_summary: summary,
-            tagger_time,
-        },
-        is_commit,
-    )))
+    Ok(Some(TagInfo {
+        name,
+        full,
+        target,
+        peeled_kind,
+        tag_object,
+        message_summary: summary,
+        tagger_time,
+    }))
 }
 
 /// Digit runs compare numerically, other runs bytewise (`v1.9` < `v1.10`).
@@ -405,13 +396,13 @@ pub fn ahead_behind(
             .with_hidden([hidden])
             .use_commit_graph(true)
             .all()
-            .map_err(other)?;
+            .map_err(gix_error)?;
         let mut n = 0u32;
         for info in walk {
             if n >= cap {
                 return Ok((n, true));
             }
-            info.map_err(other)?;
+            info.map_err(gix_error)?;
             n += 1;
             if n.is_multiple_of(256) {
                 cancel.check()?;
@@ -453,7 +444,10 @@ fn stash_branch(message: &str) -> Option<String> {
 /// The stash list, `stash@{0}` first.
 pub fn stash_list(repo: &Repo) -> Result<Vec<StashInfo>> {
     let gix_repo = repo.local();
-    let Some(reference) = gix_repo.try_find_reference("refs/stash").map_err(other)? else {
+    let Some(reference) = gix_repo
+        .try_find_reference("refs/stash")
+        .map_err(gix_error)?
+    else {
         return Ok(Vec::new());
     };
     let mut platform = reference.log_iter();
@@ -466,12 +460,12 @@ pub fn stash_list(repo: &Repo) -> Result<Vec<StashInfo>> {
     };
     let mut out = Vec::new();
     for (index, line) in lines.enumerate() {
-        let line = line.map_err(other)?;
+        let line = line.map_err(gix_error)?;
         let id = line.new_oid;
         let Ok(commit) = gix_repo.find_commit(id) else {
             continue;
         };
-        let decoded = commit.decode().map_err(other)?;
+        let decoded = commit.decode().map_err(gix_error)?;
         let mut parents = decoded.parents();
         let Some(base) = parents.next() else {
             continue;
@@ -517,7 +511,7 @@ pub fn resolve_commit(repo: &Repo, spec: &str) -> Result<ObjectId> {
         .map_err(|_| not_found())?;
     let commit = id
         .object()
-        .map_err(other)?
+        .map_err(gix_error)?
         .peel_to_commit()
         .map_err(|_| not_found())?;
     Ok(commit.id)
@@ -536,17 +530,14 @@ pub fn is_merged(repo: &Repo, branch: ObjectId, into: Option<ObjectId>) -> Resul
     if branch == into {
         return Ok(true);
     }
-    let base = gix_repo.merge_base(branch, into).map_err(other)?;
+    let base = gix_repo.merge_base(branch, into).map_err(gix_error)?;
     Ok(base.is_some_and(|base| base.detach() == branch))
 }
 
 /// Labels per commit; pure, also filled into `RefList::decorations` by `list`.
+///
+/// Tags of trees and blobs are not decorations: their ids never appear as graph rows.
 pub fn decorations(list: &RefList) -> Decorations {
-    build_decorations(list, &HashSet::new())
-}
-
-/// `skip_tags`: full names of tags that do not point at commits.
-fn build_decorations(list: &RefList, skip_tags: &HashSet<FullName>) -> Decorations {
     let mut map: HashMap<ObjectId, smallvec::SmallVec<[RefLabel; 2]>> = HashMap::new();
     let mut add = |id: ObjectId, label: RefLabel| map.entry(id).or_default().push(label);
     if let HeadState::Branch { target, .. } | HeadState::Detached { target } = &list.head {
@@ -566,7 +557,11 @@ fn build_decorations(list: &RefList, skip_tags: &HashSet<FullName>) -> Decoratio
             );
         }
     }
-    for tag in list.tags.iter().filter(|t| !skip_tags.contains(&t.full)) {
+    for tag in list
+        .tags
+        .iter()
+        .filter(|tag| tag.peeled_kind == gix::object::Kind::Commit)
+    {
         add(tag.target, RefLabel::Tag(tag.name.clone()));
     }
     for stash in &list.stashes {

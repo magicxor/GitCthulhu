@@ -7,66 +7,13 @@
 use gix::ObjectId;
 
 use crate::{
-    CommandLog, ContinueOutcome, FastForward, GitError, InProgress, MergeOptions, MergeOutcome,
-    OpClass, OpContext, OpOutcome, OpWarning, OverwriteKind, PickOptions, RefreshSet, RelaPath,
-    Repo, RepoExclusive, ResetMode, Result, SequenceOutcome,
-    cli::{self, CommandKind, GitCommand, GitOutput},
+    ContinueOutcome, FastForward, GitError, InProgress, MergeOptions, MergeOutcome, OpClass,
+    OpContext, OpOutcome, PickOptions, RefreshSet, Repo, RepoExclusive, ResetMode, Result,
+    SequenceOutcome,
+    cli::{self, CommandKind, GitCommand},
+    internal::{errors::gix_error, outcome::Collected},
     rebase,
 };
-
-/// Hooks that run after the operation happened: their failure is a warning, never an error.
-const POST_HOOKS: &[&str] = &[
-    "post-checkout",
-    "post-merge",
-    "post-commit",
-    "post-rewrite",
-    "post-applypatch",
-    "post-index-change",
-];
-
-/// Collects what the commands of one operation produced, to be turned into an [`OpOutcome`].
-#[derive(Default)]
-pub(crate) struct Collected {
-    log: CommandLog,
-    warnings: Vec<OpWarning>,
-}
-
-impl Collected {
-    /// Record a finished command and hand its output back for parsing.
-    pub(crate) fn add(&mut self, out: GitOutput) -> GitOutput {
-        self.log.commands.push(out.record.clone());
-        self.log.hooks.extend(out.hooks.iter().cloned());
-        self.log
-            .removed_stale_locks
-            .extend(out.removed_stale_locks.iter().cloned());
-        self.warnings.extend(out.warnings.iter().cloned());
-        // Git ignores the exit status of some post hooks (`post-merge`), so the command succeeds without the
-        // executor having seen a failure: report them from the hook runs.
-        for hook in &out.hooks {
-            let reported = self.warnings.iter().any(
-                |w| matches!(w, OpWarning::PostHookFailed { hook: name, .. } if *name == hook.name),
-            );
-            if hook.exit_code != Some(0) && POST_HOOKS.contains(&hook.name.as_str()) && !reported {
-                self.warnings.push(OpWarning::PostHookFailed {
-                    hook: hook.name.clone(),
-                    exit_code: hook.exit_code,
-                    output: format!("{}{}", out.stderr, String::from_utf8_lossy(&out.stdout)),
-                });
-            }
-        }
-        out
-    }
-
-    /// The outcome of the operation: `value` plus everything collected.
-    pub(crate) fn finish<T>(self, value: T, refresh: RefreshSet) -> OpOutcome<T> {
-        OpOutcome {
-            value,
-            refresh,
-            log: self.log,
-            warnings: self.warnings,
-        }
-    }
-}
 
 /// `Err(Cancelled)` if the operation was cancelled before it started.
 pub(crate) fn check_cancel(ctx: &OpContext) -> Result<()> {
@@ -80,15 +27,11 @@ pub(crate) fn check_cancel(ctx: &OpContext) -> Result<()> {
 /// The commit HEAD points to; `UnbornHead` for an unborn branch.
 pub(crate) fn head_commit_id(repo: &Repo) -> Result<ObjectId> {
     let local = repo.local();
-    let head = local
-        .head()
-        .map_err(|err| GitError::Other(anyhow::Error::new(err)))?;
+    let head = local.head().map_err(gix_error)?;
     if head.is_unborn() {
         return Err(GitError::UnbornHead);
     }
-    let id = local
-        .head_id()
-        .map_err(|err| GitError::Other(anyhow::Error::new(err)))?;
+    let id = local.head_id().map_err(gix_error)?;
     Ok(id.detach())
 }
 
@@ -165,12 +108,7 @@ pub fn merge(
     let mut collected = Collected::default();
     let out = collected.add(result?);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Older Git: "Applying autostash resulted in conflicts."; newer: "Your local changes are stashed, however
-    // applying them resulted in conflicts." (line-wrapped).
-    let autostash_conflict = [out.stderr.as_str(), &stdout].iter().any(|text| {
-        text.contains("Applying autostash resulted in conflicts")
-            || text.contains("Your local changes are stashed, however applying them")
-    });
+    let autostash_conflict = out.autostash_conflicted();
     let value = if stdout.contains("Already up to date") || stdout.contains("Already up-to-date") {
         MergeOutcome::UpToDate
     } else if stdout.contains("Squash commit -- not updating HEAD") {
@@ -200,9 +138,7 @@ fn check_mainline(
     }
     let local = repo.local();
     for id in commits {
-        let commit = local
-            .find_commit(*id)
-            .map_err(|err| GitError::Other(anyhow::Error::new(err)))?;
+        let commit = local.find_commit(*id).map_err(gix_error)?;
         if commit.parent_ids().count() > 1 {
             return Err(GitError::Unsupported { what });
         }
@@ -302,51 +238,10 @@ pub fn reset(
         .args(["reset", flag, "-q"])
         .arg(target.to_string())
         .with_hooks();
-    let out = cli::run_checked(repo, cmd, ctx, OpClass::Reset).map_err(|err| match mode {
-        ResetMode::Keep => keep_refusal(err),
-        ResetMode::Soft | ResetMode::Mixed | ResetMode::Hard => err,
-    })?;
+    let out = cli::run_checked(repo, cmd, ctx, OpClass::Reset)?;
     let mut collected = Collected::default();
     collected.add(out);
     Ok(collected.finish((), RefreshSet::OPERATION_STATE))
-}
-
-/// `git reset --keep` refuses with unpack-trees messages that are not in the classifier's table:
-/// `error: Entry '<p>' not uptodate. Cannot merge.` (a local change) and
-/// `error: Untracked working tree file '<p>' would be overwritten by merge.`. Both become `WouldOverwrite`.
-fn keep_refusal(err: GitError) -> GitError {
-    let GitError::CommandFailed { stderr, .. } = &err else {
-        return err;
-    };
-    let quoted_path = |line: &str, prefix: &str, suffix: &str| -> Option<RelaPath> {
-        let line = line.trim_end().strip_suffix(suffix)?;
-        let start = line.find(prefix)? + prefix.len();
-        Some(RelaPath::from(&line[start..]))
-    };
-    let (mut local, mut untracked) = (Vec::new(), Vec::new());
-    for line in stderr.lines() {
-        if let Some(path) = quoted_path(line, "Entry '", "' not uptodate. Cannot merge.") {
-            local.push(path);
-        } else if let Some(path) = quoted_path(
-            line,
-            "Untracked working tree file '",
-            "' would be overwritten by merge.",
-        ) {
-            untracked.push(path);
-        }
-    }
-    let (kind, paths) = if !local.is_empty() {
-        (OverwriteKind::LocalChanges, local)
-    } else if !untracked.is_empty() {
-        (OverwriteKind::Untracked, untracked)
-    } else {
-        return err;
-    };
-    GitError::WouldOverwrite {
-        kind,
-        paths,
-        stderr: stderr.clone(),
-    }
 }
 
 /// Write `message` to `MERGE_MSG` of the (per-worktree) git directory.

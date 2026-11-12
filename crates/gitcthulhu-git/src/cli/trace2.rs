@@ -28,23 +28,25 @@ pub(crate) enum HookClass {
     Pre,
     /// The operation happened: `OpWarning::PostHookFailed`.
     Post,
-    /// Any other hook (not run by the operations of this crate).
+    /// Any other hook (not run by the operations of this crate), or one whose failure Git has already decided on.
     Other,
 }
 
-/// Classify a hook by name (§1.11 table).
-pub(crate) fn hook_class(name: &str) -> HookClass {
-    match name {
-        "pre-commit"
-        | "prepare-commit-msg"
-        | "commit-msg"
-        | "pre-merge-commit"
-        | "pre-push"
-        | "pre-rebase"
-        | "pre-applypatch"
-        | "applypatch-msg"
-        | "pre-auto-gc"
-        | "reference-transaction" => HookClass::Pre,
+/// Classify a hook run (§1.11 table).
+///
+/// `reference-transaction` runs in phases and Git only honours the exit code of the first two (`preparing`,
+/// `prepared`): there a failure vetoes the update (pre). In `committed` the update has happened and Git ignores the
+/// exit code (post: reported as a warning). In `aborted` the update has already failed for another reason (other).
+/// Without a phase it counts as pre.
+pub(crate) fn hook_class(hook: &HookRun) -> HookClass {
+    match hook.name.as_str() {
+        "reference-transaction" => match hook.phase.as_deref() {
+            Some("committed") => HookClass::Post,
+            Some("aborted") => HookClass::Other,
+            _ => HookClass::Pre,
+        },
+        "pre-commit" | "prepare-commit-msg" | "commit-msg" | "pre-merge-commit" | "pre-push"
+        | "pre-rebase" | "pre-applypatch" | "applypatch-msg" | "pre-auto-gc" => HookClass::Pre,
         "post-checkout" | "post-merge" | "post-commit" | "post-rewrite" | "post-applypatch"
         | "post-index-change" => HookClass::Post,
         _ => HookClass::Other,
@@ -55,8 +57,8 @@ pub(crate) fn hook_class(name: &str) -> HookClass {
 #[derive(Default)]
 struct ProcessTrace {
     sid: String,
-    /// `child_id` -> (class, hook name).
-    started: HashMap<u64, (String, Option<String>)>,
+    /// `child_id` -> (class, hook name, phase argument of `reference-transaction`).
+    started: HashMap<u64, (String, Option<String>, Option<String>)>,
     /// `child_id` -> (pid, exit code, duration in ms), in order of exit.
     exited: Vec<(u64, Option<u32>, Option<i32>, u64)>,
     /// Hook `child_id`s in start order.
@@ -96,10 +98,21 @@ impl ProcessTrace {
                         .get("hook_name")
                         .and_then(|v| v.as_str())
                         .map(str::to_owned);
+                    // Only `reference-transaction` has a phase worth keeping; other hooks get file names and the like.
+                    let phase = if hook_name.as_deref() == Some("reference-transaction") {
+                        event
+                            .get("argv")
+                            .and_then(|v| v.as_array())
+                            .and_then(|argv| argv.get(1))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
                     if class == "hook" {
                         trace.hook_order.push(id);
                     }
-                    trace.started.insert(id, (class, hook_name));
+                    trace.started.insert(id, (class, hook_name, phase));
                 }
                 Some("child_exit") => {
                     let Some(id) = child_id() else { continue };
@@ -127,7 +140,7 @@ impl ProcessTrace {
     /// The pids of git children this process started itself (not hooks).
     fn non_hook_child_pids(&self) -> impl Iterator<Item = u32> + '_ {
         self.exited.iter().filter_map(|(id, pid, ..)| {
-            let (class, _) = self.started.get(id)?;
+            let (class, ..) = self.started.get(id)?;
             (class != "hook").then_some(*pid).flatten()
         })
     }
@@ -135,10 +148,11 @@ impl ProcessTrace {
     /// The hooks this process ran, in start order.
     fn hooks(&self) -> impl Iterator<Item = HookRun> + '_ {
         self.hook_order.iter().filter_map(|id| {
-            let (_, name) = self.started.get(id)?;
+            let (_, name, phase) = self.started.get(id)?;
             let exit = self.exited.iter().find(|(exit_id, ..)| exit_id == id);
             Some(HookRun {
                 name: name.clone().unwrap_or_else(|| "unknown hook".to_owned()),
+                phase: phase.clone(),
                 // No exit event: the hook (or Git) was killed before it was recorded.
                 exit_code: exit.and_then(|(_, _, code, _)| *code),
                 duration_ms: exit.map(|(.., ms)| *ms).unwrap_or(0),
@@ -262,7 +276,8 @@ mod tests {
             [HookRun {
                 name: "pre-commit".into(),
                 exit_code: Some(3),
-                duration_ms: 250
+                duration_ms: 250,
+                phase: None,
             }],
             "only the top-level process counts; the nested git's parent was the hook's shell"
         );
@@ -328,7 +343,8 @@ mod tests {
             [HookRun {
                 name: "pre-commit".into(),
                 exit_code: None,
-                duration_ms: 0
+                duration_ms: 0,
+                phase: None,
             }],
             "a hook that never exited is reported without exit code"
         );
@@ -342,21 +358,83 @@ mod tests {
         );
     }
 
+    fn run(name: &str, phase: Option<&str>) -> HookRun {
+        HookRun {
+            name: name.into(),
+            exit_code: Some(1),
+            duration_ms: 0,
+            phase: phase.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn hook_classes() {
-        assert_eq!(hook_class("pre-push"), HookClass::Pre, "pre hook");
         assert_eq!(
-            hook_class("reference-transaction"),
+            hook_class(&run("pre-push", None)),
             HookClass::Pre,
             "pre hook"
         );
-        assert_eq!(hook_class("post-checkout"), HookClass::Post, "post hook");
         assert_eq!(
-            hook_class("post-index-change"),
+            hook_class(&run("post-checkout", None)),
             HookClass::Post,
             "post hook"
         );
-        assert_eq!(hook_class("update"), HookClass::Other, "server-side hook");
+        assert_eq!(
+            hook_class(&run("post-index-change", None)),
+            HookClass::Post,
+            "post hook"
+        );
+        assert_eq!(
+            hook_class(&run("update", None)),
+            HookClass::Other,
+            "server-side hook"
+        );
+    }
+
+    #[test]
+    fn reference_transaction_class_follows_the_phase() {
+        for (phase, class) in [
+            (Some("preparing"), HookClass::Pre),
+            (Some("prepared"), HookClass::Pre),
+            (None, HookClass::Pre),
+            (Some("committed"), HookClass::Post),
+            (Some("aborted"), HookClass::Other),
+        ] {
+            assert_eq!(
+                hook_class(&run("reference-transaction", phase)),
+                class,
+                "reference-transaction in phase {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_transaction_phase_comes_from_argv() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let start = |id: u64, phase: &str| {
+            line(
+                TOP,
+                &format!(
+                    r#""child_start","child_id":{id},"child_class":"hook","hook_name":"reference-transaction","argv":[".git/hooks/reference-transaction","{phase}"]"#
+                ),
+            )
+        };
+        write(
+            dir.path(),
+            TOP,
+            &[
+                start(0, "prepared"),
+                child_exit(TOP, 0, 1, 3),
+                start(1, "aborted"),
+                child_exit(TOP, 1, 2, 0),
+            ],
+        );
+        let phases: Vec<_> = collect(dir.path()).into_iter().map(|h| h.phase).collect();
+        assert_eq!(
+            phases,
+            [Some("prepared".to_owned()), Some("aborted".to_owned())],
+            "the first argument of a reference-transaction hook is its phase"
+        );
     }
 
     #[test]

@@ -24,6 +24,8 @@ use crate::{
     BlameChunk, BlameCommit, BlameOptions, BlameResult, BlameRev, CancelToken, GitError, OpContext,
     RelaPath, Repo, Result,
     cli::{CommandKind, GitCommand},
+    internal::errors::gix_error,
+    log::CommitDecoder,
 };
 
 /// How many results of `BlameRev::Commit` are remembered.
@@ -262,7 +264,7 @@ fn gix_blame(
         gix::blame::BlameRanges::default()
     };
     let options = gix::blame::Options {
-        diff_algorithm: local.diff_algorithm().map_err(other)?,
+        diff_algorithm: local.diff_algorithm().map_err(gix_error)?,
         ranges,
         since: opts
             .since
@@ -272,16 +274,18 @@ fn gix_blame(
     };
     let shallow: HashSet<ObjectId> = local
         .shallow_commits()
-        .map_err(other)?
+        .map_err(gix_error)?
         .map(|commits| commits.iter().copied().collect())
         .unwrap_or_default();
     // The commit-graph would hand out the parents a shallow boundary commit must not have.
     let graph = if shallow.is_empty() {
-        local.commit_graph_if_enabled().map_err(other)?
+        local.commit_graph_if_enabled().map_err(gix_error)?
     } else {
         None
     };
-    let mut resource_cache = local.diff_resource_cache_for_tree_diff().map_err(other)?;
+    let mut resource_cache = local
+        .diff_resource_cache_for_tree_diff()
+        .map_err(gix_error)?;
     let outcome = gix::blame::file(
         ShallowAware {
             odb: &local.objects,
@@ -293,7 +297,7 @@ fn gix_blame(
         path.as_bstr(),
         options,
     )
-    .map_err(other)?;
+    .map_err(gix_error)?;
     let entries = outcome
         .entries
         .into_iter()
@@ -371,17 +375,17 @@ fn blob_at(
         what: "commit",
         name: commit.to_string(),
     })?;
-    let tree = commit.tree().map_err(other)?;
+    let tree = commit.tree().map_err(gix_error)?;
     let Some(entry) = tree
         .lookup_entry(path.split(|byte| *byte == b'/'))
-        .map_err(other)?
+        .map_err(gix_error)?
     else {
         return Ok(None);
     };
     if !(entry.mode().is_blob() || entry.mode().is_link()) {
         return Ok(None);
     }
-    let blob = local.find_blob(entry.object_id()).map_err(other)?;
+    let blob = local.find_blob(entry.object_id()).map_err(gix_error)?;
     Ok(Some(blob.data.clone()))
 }
 
@@ -403,7 +407,7 @@ fn worktree_content(local: &gix::Repository, repo: &Repo, path: &RelaPath) -> Re
     if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(&full).map_err(|err| GitError::io(&full, err))?;
         return Ok(gix::path::into_bstr(target)
-            .map_err(other)?
+            .map_err(gix_error)?
             .into_owned()
             .into());
     }
@@ -566,7 +570,7 @@ fn build_result(
     } = attribution;
     entries.sort_by_key(|entry| entry.start);
 
-    let mut people = HashMap::new();
+    let mut decoder = CommitDecoder::new(None);
     let mut commits: Vec<BlameCommit> = Vec::new();
     let mut index_of: HashMap<(ObjectId, Option<BString>), u32> = HashMap::new();
     let mut chunks: Vec<BlameChunk> = Vec::new();
@@ -579,8 +583,7 @@ fn build_result(
                 Some(match index_of.get(&key) {
                     Some(index) => *index,
                     None => {
-                        let commit = local.find_commit(id).map_err(other)?;
-                        let info = crate::history::commit_info(&commit, &mut people)?;
+                        let info = decoder.decode(local, id, false)?.0;
                         commits.push(BlameCommit {
                             id,
                             author: info.author,

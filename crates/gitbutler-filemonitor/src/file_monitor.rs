@@ -153,11 +153,14 @@ fn setup_watch_plan(
     worktree_path: &Path,
     git_dir: &Path,
     linked_git_dirs: &[&Path],
+    problems: &mut Vec<String>,
 ) -> Result<()> {
+    let mut limit_hit: Option<PathBuf> = None;
     // Start the watcher, but retry if there are transient errors.
-    backoff::retry(watch_backoff_policy(), || {
+    let result = backoff::retry(watch_backoff_policy(), || {
         let mut paths = debouncer.watcher().paths_mut();
         let mut add_error: Option<(std::path::PathBuf, notify::Error)> = None;
+        limit_hit = None;
         compute_watch_plan_for_repo(repo, worktree_path, git_dir, linked_git_dirs, |path, mode| {
             if add_error.is_some() {
                 return Ok(std::ops::ControlFlow::Break(()));
@@ -170,6 +173,7 @@ fn setup_watch_plan(
                             path = %path.display(),
                             "OS file watch limit reached; continuing with partial watches. Monitoring coverage may be incomplete until restart."
                         );
+                        limit_hit = Some(path.to_owned());
                         Ok(std::ops::ControlFlow::Break(()))
                     }
                     _ => {
@@ -190,7 +194,16 @@ fn setup_watch_plan(
             Err(err) => Err(into_backoff_err(err, worktree_path))
         }
     })
-        .map_err(backoff_err_to_anyhow).context("Watcher start failed")
+        .map_err(backoff_err_to_anyhow).context("Watcher start failed");
+    if result.is_ok()
+        && let Some(path) = limit_hit
+    {
+        problems.push(format!(
+            "The operating system's limit of file watches was reached at {}: changes in parts of the repository will not be noticed",
+            path.display()
+        ));
+    }
+    result
 }
 
 fn setup_legacy_watch(
@@ -198,6 +211,7 @@ fn setup_legacy_watch(
     worktree_path: &Path,
     git_dir: &Path,
     common_dir: Option<&Path>,
+    problems: &mut Vec<String>,
 ) -> Result<()> {
     let extra_git_dir_to_watch = {
         let mut enclosing_worktree_dir = git_dir.to_owned();
@@ -228,7 +242,7 @@ fn setup_legacy_watch(
     .map_err(backoff_err_to_anyhow)
     .context("failed to start watcher")?;
     if let Some(common_dir) = common_dir {
-        watch_common_dir(debouncer, common_dir)?;
+        watch_common_dir(debouncer, common_dir, problems)?;
     }
     Ok(())
 }
@@ -238,10 +252,13 @@ fn setup_legacy_watch(
 fn watch_common_dir(
     debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
     common_dir: &Path,
+    problems: &mut Vec<String>,
 ) -> Result<()> {
-    backoff::retry(watch_backoff_policy(), || {
+    let mut limit_hit: Option<PathBuf> = None;
+    let result = backoff::retry(watch_backoff_policy(), || {
         let mut paths = debouncer.watcher().paths_mut();
         let mut add_error: Option<(PathBuf, notify::Error)> = None;
+        limit_hit = None;
         let _flow = crate::watch_plan::emit_git_dir_watches(common_dir, &mut |path, mode| {
             if add_error.is_some() {
                 return Ok(std::ops::ControlFlow::Break(()));
@@ -252,6 +269,7 @@ fn watch_common_dir(
                         path = %path.display(),
                         "OS file watch limit reached; continuing with partial watches"
                     );
+                    limit_hit = Some(path.to_owned());
                 } else {
                     add_error = Some((path.to_owned(), err));
                 }
@@ -268,7 +286,16 @@ fn watch_common_dir(
             .map_err(|err| into_backoff_err(err, common_dir))
     })
     .map_err(backoff_err_to_anyhow)
-    .context("failed to watch the common git directory")
+    .context("failed to watch the common git directory");
+    if result.is_ok()
+        && let Some(path) = limit_hit
+    {
+        problems.push(format!(
+            "The operating system's limit of file watches was reached at {}: changes of the shared git directory will not be noticed",
+            path.display()
+        ));
+    }
+    result
 }
 
 /// Listen to interesting filesystem events of files in `worktree_path` that are not `.gitignore`d, and classify
@@ -347,27 +374,44 @@ pub fn spawn(
 
     let mut effective_watch_mode = watch_mode;
 
-    let plan = |debouncer: &mut Debouncer<RecommendedWatcher, NoCache>| {
-        setup_watch_plan(debouncer, &repo, &worktree_path, &git_dir, &extra_git_dirs)
+    // What did not work while setting up, reported as `InternalEvent::WatchError` once the worker runs.
+    let mut problems: Vec<String> = Vec::new();
+    let plan = |debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
+                problems: &mut Vec<String>| {
+        setup_watch_plan(
+            debouncer,
+            &repo,
+            &worktree_path,
+            &git_dir,
+            &extra_git_dirs,
+            problems,
+        )
     };
-    let legacy = |debouncer: &mut Debouncer<RecommendedWatcher, NoCache>| {
-        setup_legacy_watch(debouncer, &worktree_path, &git_dir, common_dir.as_deref())
+    let legacy = |debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
+                  problems: &mut Vec<String>| {
+        setup_legacy_watch(
+            debouncer,
+            &worktree_path,
+            &git_dir,
+            common_dir.as_deref(),
+            problems,
+        )
     };
     match watch_mode {
-        WatchMode::Legacy => legacy(&mut debouncer)?,
+        WatchMode::Legacy => legacy(&mut debouncer, &mut problems)?,
         WatchMode::Modern => {
-            if let Err(err) = plan(&mut debouncer) {
+            if let Err(err) = plan(&mut debouncer, &mut problems) {
                 tracing::warn!(
                     ?err,
                     "watch-plan setup failed; falling back to legacy watch mode"
                 );
                 effective_watch_mode = WatchMode::Legacy;
-                legacy(&mut debouncer)?;
+                legacy(&mut debouncer, &mut problems)?;
             }
         }
         WatchMode::Auto => {
             if is_wsl() {
-                match plan(&mut debouncer) {
+                match plan(&mut debouncer, &mut problems) {
                     Ok(()) => {
                         effective_watch_mode = WatchMode::Modern;
                     }
@@ -377,12 +421,12 @@ pub fn spawn(
                             "watch-plan setup failed; falling back to legacy watch mode"
                         );
                         effective_watch_mode = WatchMode::Legacy;
-                        legacy(&mut debouncer)?;
+                        legacy(&mut debouncer, &mut problems)?;
                     }
                 }
             } else {
                 effective_watch_mode = WatchMode::Legacy;
-                legacy(&mut debouncer)?;
+                legacy(&mut debouncer, &mut problems)?;
             }
         }
     }
@@ -399,6 +443,7 @@ pub fn spawn(
             &worktree_path,
             checkout,
             dynamic_watch_enabled,
+            &mut problems,
         );
     }
     let main = WatchedCheckout {
@@ -421,6 +466,7 @@ pub fn spawn(
                 &linked_worktrees,
                 &out,
                 dynamic_watch_enabled,
+                problems,
             );
         })
         .context("failed to start the file monitor thread")?;
@@ -441,11 +487,18 @@ fn run_worker(
     linked_worktrees: &impl Fn() -> Result<Vec<LinkedWorktree>>,
     out: &std::sync::mpsc::Sender<InternalEvent>,
     dynamic_watch_enabled: bool,
+    mut problems: Vec<String>,
 ) {
     // Even though the watcher cannot 'double-watch', we keep track of newly added watches
     // to avoid it doing any work, and for better traces.
     let mut dynamically_watched_dirs: HashSet<std::path::PathBuf> = HashSet::new();
     'outer: loop {
+        // Problems of the setup, and of the dynamic watches of the previous round.
+        for message in problems.drain(..) {
+            if out.send(InternalEvent::WatchError(message)).is_err() {
+                break 'outer;
+            }
+        }
         // Handle control plane messages.
         loop {
             match cmd_rx.try_recv() {
@@ -471,8 +524,11 @@ fn run_worker(
         )
         .entered();
         match result {
-            Err(err) => {
-                tracing::error!(?err, "ignored file watcher error");
+            Err(errors) => {
+                for err in errors {
+                    tracing::error!(?err, "file watcher error");
+                    problems.push(format!("The file watcher reported an error: {err}"));
+                }
             }
             Ok(events) => {
                 let num_events = events.len();
@@ -509,6 +565,7 @@ fn run_worker(
                             &mut debouncer,
                             &mut dynamically_watched_dirs,
                             std::iter::once(registry_dir.join(LINKED_WORKTREES_DIR)),
+                            &mut problems,
                         );
                     }
                     // A moved worktree leaves as its old location and joins as its new one,
@@ -535,6 +592,7 @@ fn run_worker(
                             &main.workdir,
                             added,
                             dynamic_watch_enabled,
+                            &mut problems,
                         );
                     }
                 }
@@ -548,6 +606,7 @@ fn run_worker(
                                 .worktree
                                 .iter()
                                 .map(|relative_path| checkout.workdir.join(relative_path)),
+                            &mut problems,
                         );
                     }
                     if dynamic_watch_enabled {
@@ -556,6 +615,7 @@ fn run_worker(
                             &mut dynamically_watched_dirs,
                             &checkout.git_dir,
                             &changes.git,
+                            &mut problems,
                         );
                     }
 
@@ -589,6 +649,7 @@ fn run_worker(
                             &mut dynamically_watched_dirs,
                             common_dir,
                             &common_changes,
+                            &mut problems,
                         );
                     }
                     let event =
@@ -614,6 +675,7 @@ fn update_dynamic_git_dir_watches(
     dynamically_watched_dirs: &mut HashSet<PathBuf>,
     git_dir: &Path,
     changed: &HashSet<PathBuf>,
+    problems: &mut Vec<String>,
 ) {
     let mut non_recursive = Vec::new();
     let mut recursive = Vec::new();
@@ -641,6 +703,7 @@ fn update_dynamic_git_dir_watches(
         debouncer,
         dynamically_watched_dirs,
         non_recursive.into_iter(),
+        problems,
     );
     for dir in recursive {
         if dynamically_watched_dirs.contains(&dir) || !dir.is_dir() {
@@ -655,6 +718,10 @@ fn update_dynamic_git_dir_watches(
             }
             Err(err) => {
                 tracing::warn!(?dir, ?err, "failed to watch a submodule's refs");
+                problems.push(format!(
+                    "Could not watch the refs of the submodule at {}: {err}",
+                    dir.display()
+                ));
             }
         }
     }
@@ -667,12 +734,20 @@ fn watch_linked_workdir(
     main_workdir: &Path,
     linked: &WatchedCheckout,
     use_watch_plan: bool,
+    problems: &mut Vec<String>,
 ) {
     let res = if use_watch_plan {
         gix::open_opts(&linked.workdir, gix::open::Options::isolated())
             .map_err(anyhow::Error::from)
             .and_then(|repo| {
-                setup_watch_plan(debouncer, &repo, &linked.workdir, &linked.git_dir, &[])
+                setup_watch_plan(
+                    debouncer,
+                    &repo,
+                    &linked.workdir,
+                    &linked.git_dir,
+                    &[],
+                    problems,
+                )
             })
     } else if linked.has_own_recursive_watch(main_workdir, use_watch_plan) {
         debouncer
@@ -688,6 +763,10 @@ fn watch_linked_workdir(
             workdir = ?linked.workdir,
             "failed to watch linked worktree; changes to its files will be missed"
         );
+        problems.push(format!(
+            "Could not watch the linked worktree at {}: changes to its files will not be noticed ({err:#})",
+            linked.workdir.display()
+        ));
     }
 }
 
@@ -742,6 +821,7 @@ fn update_dynamic_watches(
     debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
     dynamically_watched_dirs: &mut HashSet<PathBuf>,
     paths: impl Iterator<Item = PathBuf>,
+    problems: &mut Vec<String>,
 ) {
     #[derive(Debug)]
     enum Mode {
@@ -773,7 +853,11 @@ fn update_dynamic_watches(
                 ?mode,
                 ?err,
                 "failed to add or remove watch; changes may be missed until restart"
-            )
+            );
+            problems.push(format!(
+                "Could not update the watch of {}: changes there may not be noticed ({err})",
+                path.display()
+            ));
         });
         match mode {
             Mode::AddWatch if res.is_ok() => {

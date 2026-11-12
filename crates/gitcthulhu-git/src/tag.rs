@@ -1,17 +1,13 @@
 //! Tags (WP-B6).
 
-use bstr::ByteSlice;
 use gix::{ObjectId, refs::FullName};
 
 use crate::{
     GitError, OpClass, OpContext, OpOutcome, RefreshSet, Repo, RepoExclusive, Result, SignMode,
     TagOptions,
-    branch::gix_error,
     cli::{self, CommandKind, GitCommand},
-    commit::outcome,
+    internal::{errors::gix_error, names, outcome::single},
 };
-
-const TAGS: &str = "refs/tags/";
 
 /// Create a lightweight or annotated tag.
 ///
@@ -30,12 +26,14 @@ pub fn create_tag(
     let _ = perm;
     ctx.cancel.check()?;
     let full = if opts.force {
-        tag_ref_name(name)?
+        names::tag_ref(name)?
     } else {
         validate_tag_name(repo, name)?
     };
     let annotated = opts.message.is_some() || opts.sign == SignMode::Sign;
-    let mut cmd = GitCommand::new(repo, CommandKind::Mutation).arg("tag");
+    let mut cmd = GitCommand::new(repo, CommandKind::Mutation)
+        .with_hooks()
+        .arg("tag");
     if annotated {
         cmd = cmd.arg("-a");
         match opts.sign {
@@ -57,7 +55,7 @@ pub fn create_tag(
     }
     cmd = cmd.arg(name).arg(target.to_hex().to_string());
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Tag)?;
-    Ok(outcome(full, RefreshSet::TAGS | RefreshSet::LOG, out))
+    Ok(single(full, RefreshSet::TAGS | RefreshSet::LOG, out))
 }
 
 /// Delete a tag (local only; remote deletion is `network::delete_remote_tag`).
@@ -71,7 +69,7 @@ pub fn delete_tag(
 ) -> Result<OpOutcome<()>> {
     let _ = perm;
     ctx.cancel.check()?;
-    let full = tag_ref_name(name)?;
+    let full = names::tag_ref(name)?;
     if !tag_exists(repo, &full)? {
         return Err(GitError::NotFound {
             what: "tag",
@@ -79,38 +77,18 @@ pub fn delete_tag(
         });
     }
     let cmd = GitCommand::new(repo, CommandKind::Mutation)
+        .with_hooks()
         .args(["tag", "-d"])
         .arg(name);
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Tag)?;
-    Ok(outcome((), RefreshSet::TAGS | RefreshSet::LOG, out))
+    Ok(single((), RefreshSet::TAGS | RefreshSet::LOG, out))
 }
 
-/// Pure check with `gix::validate::reference::name` + "refs/tags/" prefix; also rejects an existing tag.
+/// Pure check of a new tag name (`internal::names`); also rejects an existing tag.
 ///
 /// Errors: `InvalidName { what: "tag" }`, `AlreadyExists { what: "tag" }`.
 pub fn validate_tag_name(repo: &Repo, name: &str) -> Result<FullName> {
-    let full = tag_ref_name(name)?;
-    if tag_exists(repo, &full)? {
-        return Err(GitError::AlreadyExists {
-            what: "tag",
-            name: name.to_owned(),
-        });
-    }
-    Ok(full)
-}
-
-/// `refs/tags/<name>` after the syntax checks.
-fn tag_ref_name(name: &str) -> Result<FullName> {
-    let invalid = || GitError::InvalidName {
-        what: "tag",
-        name: name.to_owned(),
-    };
-    if name.is_empty() || name.starts_with('-') || name.trim() != name {
-        return Err(invalid());
-    }
-    let full = format!("{TAGS}{name}");
-    gix::validate::reference::name(full.as_bytes().as_bstr()).map_err(|_| invalid())?;
-    FullName::try_from(full).map_err(|_| invalid())
+    names::new_tag(&repo.local(), name)
 }
 
 fn tag_exists(repo: &Repo, full: &FullName) -> Result<bool> {

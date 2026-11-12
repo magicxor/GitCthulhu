@@ -14,38 +14,24 @@ use std::{
 use gix::{ObjectId, refs::FullName};
 
 use crate::{
-    CloneOptions, CommandLog, FetchOptions, FetchReport, FetchTarget, ForceMode, GitError,
-    GitErrorKind, GitRuntime, MergeOutcome, MergeOutcomeOrRebase, OpClass, OpContext, OpOutcome,
-    OpWarning, PullMode, PullOptions, PushOptions, PushRefSpec, PushReport, PushedRefUpdate,
-    RebaseOutcome, RefreshSet, Repo, RepoExclusive, Result, TagFetch, TagPush,
+    CloneOptions, FetchOptions, FetchReport, FetchTarget, ForceMode, GitError, GitErrorKind,
+    GitRuntime, MergeOutcome, MergeOutcomeOrRebase, OpClass, OpContext, OpOutcome, OpWarning,
+    PullMode, PullOptions, PushOptions, PushRefSpec, PushReport, PushedRefUpdate, RebaseOutcome,
+    RefreshSet, Repo, RepoExclusive, Result, TagFetch, TagPush,
     cli::{self, CommandKind, GitCommand, GitOutput, porcelain},
-    error::classify,
-    internal::post_state,
+    error::{classify, combined_output},
+    internal::{errors::gix_error, outcome::Collected, post_state},
 };
 
 // ───────────────────────────── helpers ─────────────────────────────
 
 /// Merge the logs of several finished commands into one outcome.
 fn outcome<T>(value: T, refresh: RefreshSet, outs: &[GitOutput]) -> OpOutcome<T> {
-    let mut log = CommandLog::default();
-    let mut warnings: Vec<OpWarning> = Vec::new();
+    let mut collected = Collected::default();
     for out in outs {
-        log.commands.push(out.record.clone());
-        log.hooks.extend(out.hooks.iter().cloned());
-        log.removed_stale_locks
-            .extend(out.removed_stale_locks.iter().cloned());
-        warnings.extend(out.warnings.iter().cloned());
+        collected.record(out);
     }
-    OpOutcome {
-        value,
-        refresh,
-        log,
-        warnings,
-    }
-}
-
-fn other_err<E: std::error::Error + Send + Sync + 'static>(err: E) -> GitError {
-    GitError::Other(anyhow::Error::new(err))
+    collected.finish(value, refresh)
 }
 
 /// The names of all configured remotes.
@@ -85,7 +71,7 @@ fn config_string(local: &gix::Repository, key: &str) -> Option<String> {
 fn head_branch_short(local: &gix::Repository) -> Result<Option<String>> {
     Ok(local
         .head_name()
-        .map_err(other_err)?
+        .map_err(gix_error)?
         .map(|name| name.shorten().to_string()))
 }
 
@@ -414,11 +400,15 @@ pub fn pull(
     } else {
         MergeOutcomeOrRebase::Merge(merge_outcome(&out, before, after)?)
     };
-    Ok(outcome(
-        value,
-        RefreshSet::OPERATION_STATE | RefreshSet::REMOTES,
-        &[out],
-    ))
+    let mut collected = Collected::default();
+    collected.record(&out);
+    // A rebase has no outcome variant for it: the pull completed, but the local changes need attention.
+    if rebases && out.autostash_conflicted() {
+        collected.warn(OpWarning::AutostashConflict {
+            output: combined_output(&out),
+        });
+    }
+    Ok(collected.finish(value, RefreshSet::OPERATION_STATE | RefreshSet::REMOTES))
 }
 
 fn no_upstream(branch: Option<String>) -> GitError {
@@ -459,10 +449,7 @@ fn merge_outcome(
         return Ok(MergeOutcome::UpToDate);
     }
     let new_head = after.ok_or(GitError::UnbornHead)?;
-    if out
-        .stderr
-        .contains("Applying autostash resulted in conflicts")
-    {
+    if out.autostash_conflicted() {
         return Ok(MergeOutcome::AutostashConflict { new_head });
     }
     if before.is_none() || stdout.lines().any(|l| l.trim() == "Fast-forward") {
@@ -579,7 +566,7 @@ fn force_args(
                 let has_tracking_ref = match tracking {
                     Some(name) => local
                         .try_find_reference(name.as_str())
-                        .map_err(other_err)?
+                        .map_err(gix_error)?
                         .is_some(),
                     None => false,
                 };
@@ -694,7 +681,7 @@ pub fn push_current_branch(
     let local = repo.local();
     let head = local
         .head_name()
-        .map_err(other_err)?
+        .map_err(gix_error)?
         .ok_or(GitError::Unsupported {
             what: "push from detached HEAD",
         })?;

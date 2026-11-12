@@ -600,7 +600,7 @@ fn summary_line(message: &[u8]) -> (&[u8], bool) {
 
 /// Decodes commits into [`CommitInfo`], interning persons (after the mailmap) so that every distinct raw
 /// name/email pair is resolved and allocated once per walker.
-struct CommitDecoder {
+pub(crate) struct CommitDecoder {
     buf: Vec<u8>,
     key: Vec<u8>,
     people: HashMap<Box<[u8]>, Arc<Person>>,
@@ -608,7 +608,7 @@ struct CommitDecoder {
 }
 
 impl CommitDecoder {
-    fn new(mailmap: Option<gix::mailmap::Snapshot>) -> Self {
+    pub(crate) fn new(mailmap: Option<gix::mailmap::Snapshot>) -> Self {
         CommitDecoder {
             buf: Vec::new(),
             key: Vec::new(),
@@ -618,7 +618,7 @@ impl CommitDecoder {
     }
 
     /// `id` as [`CommitInfo`], plus its full decoded message if `with_message`.
-    fn decode(
+    pub(crate) fn decode(
         &mut self,
         repo: &gix::Repository,
         id: ObjectId,

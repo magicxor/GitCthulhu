@@ -701,7 +701,7 @@ pub fn classify(op: OpClass, out: &GitOutput, post: &PostState) -> GitError {
     if let Some(hook) = out
         .hooks
         .iter()
-        .find(|hook| hook.exit_code != Some(0) && hook_class(&hook.name) == HookClass::Pre)
+        .find(|hook| hook.exit_code != Some(0) && hook_class(hook) == HookClass::Pre)
     {
         return GitError::HookFailed {
             hook: hook.name.clone(),
@@ -897,12 +897,19 @@ pub fn classify(op: OpClass, out: &GitOutput, post: &PostState) -> GitError {
             };
         }
     }
-    // 18.
+    // 16/17, unpack-trees wording (`reset --keep`, `read-tree -m -u`): one line per path.
+    if let Some(err) = unpack_trees_overwrite(&m, out) {
+        return err;
+    }
+    // 18. (`git worktree remove`: "'<p>' contains modified or untracked files, use --force to delete it" and
+    // "working trees containing submodules cannot be moved or removed".)
     if m.contains_any(&[
         "you have unstaged changes",
         "your index contains uncommitted changes",
         "cannot rebase:",
         "please commit or stash them",
+        "contains modified or untracked files, use --force",
+        "containing submodules cannot be moved or removed",
     ]) {
         return GitError::UncommittedChanges { stderr: stderr() };
     }
@@ -916,7 +923,8 @@ pub fn classify(op: OpClass, out: &GitOutput, post: &PostState) -> GitError {
         };
     }
     // 20. ("Merging/Cherry-picking/Committing is not possible because you have unmerged files" is how Git refuses
-    // to start anything while conflicts are unresolved.)
+    // to start anything while conflicts are unresolved; `rebase --continue` with unresolved paths says
+    // "<path>: needs merge" and "You must edit all merge conflicts and then mark them as resolved using git add".)
     if !post.conflicted.is_empty()
         && m.contains_any(&[
             "conflict (",
@@ -924,6 +932,8 @@ pub fn classify(op: OpClass, out: &GitOutput, post: &PostState) -> GitError {
             "could not apply",
             "you need to resolve your current index first",
             "is not possible because you have unmerged files",
+            ": needs merge",
+            "you must edit all merge conflicts",
         ])
     {
         return GitError::Conflicts {
@@ -1006,6 +1016,45 @@ pub fn classify(op: OpClass, out: &GitOutput, post: &PostState) -> GitError {
     }
     // 31.
     command_failed(out)
+}
+
+/// The unpack-trees refusals that do not come with Git's "following files would be overwritten" header:
+/// `error: Entry '<p>' not uptodate. Cannot merge.` (a local change) and
+/// `error: Untracked working tree file '<p>' would be overwritten by merge.` (an untracked file in the way).
+/// Local changes win when both occur.
+fn unpack_trees_overwrite(m: &Matcher<'_>, out: &GitOutput) -> Option<GitError> {
+    const ENTRY: (&str, &str) = ("entry '", "' not uptodate. cannot merge.");
+    const UNTRACKED: (&str, &str) = (
+        "untracked working tree file '",
+        "' would be overwritten by merge.",
+    );
+    let (mut local, mut untracked) = (Vec::new(), Vec::new());
+    for (line, lower) in m.lines() {
+        let lower = lower.trim_end();
+        for ((prefix, suffix), paths) in [(ENTRY, &mut local), (UNTRACKED, &mut untracked)] {
+            if let Some(start) = lower.find(prefix)
+                && lower.ends_with(suffix)
+                && lower.len() >= start + prefix.len() + suffix.len()
+            {
+                // Git prints the index path as it is between the quotes (no C-style quoting here).
+                paths.push(RelaPath::from(
+                    &line[start + prefix.len()..lower.len() - suffix.len()],
+                ));
+            }
+        }
+    }
+    let (kind, paths) = if !local.is_empty() {
+        (OverwriteKind::LocalChanges, local)
+    } else if !untracked.is_empty() {
+        (OverwriteKind::Untracked, untracked)
+    } else {
+        return None;
+    };
+    Some(GitError::WouldOverwrite {
+        kind,
+        paths,
+        stderr: out.stderr.clone(),
+    })
 }
 
 /// `CommandFailed` for `out`: arguments, exit code, stderr and the last 4 KiB of stdout.
@@ -1343,7 +1392,6 @@ mod tests {
                 stderr: String::new(),
             },
             prompt_refused: None,
-            removed_stale_locks: vec![],
             warnings: vec![],
         }
     }
@@ -1353,6 +1401,7 @@ mod tests {
             name: name.into(),
             exit_code: Some(exit_code),
             duration_ms: 1,
+            phase: None,
         }
     }
 

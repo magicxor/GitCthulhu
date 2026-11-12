@@ -143,6 +143,7 @@ fn annotated_and_lightweight_tags_peeled() {
     fixture.git(&["tag", "light"]);
     fixture.git(&["tag", "-a", "ann", "-m", "first line\n\nbody"]);
     fixture.git(&["tag", "treetag", "HEAD^{tree}"]);
+    fixture.git(&["tag", "-a", "annotated-tree", "-m", "a tree", "HEAD^{tree}"]);
     let tag_object = id(&fixture.git(&["rev-parse", "refs/tags/ann"]));
     let tree = id(&fixture.git(&["rev-parse", "HEAD^{tree}"]));
 
@@ -176,6 +177,23 @@ fn annotated_and_lightweight_tags_peeled() {
         tree,
         "tree tags are listed with the tree id"
     );
+    for (name, kind) in [
+        ("light", gix::object::Kind::Commit),
+        ("ann", gix::object::Kind::Commit),
+        ("treetag", gix::object::Kind::Tree),
+        ("annotated-tree", gix::object::Kind::Tree),
+    ] {
+        assert_eq!(
+            tag(name).peeled_kind,
+            kind,
+            "{name}: the kind of the peeled object is reported"
+        );
+    }
+    assert_eq!(
+        tag("annotated-tree").target,
+        tree,
+        "an annotated tag of a tree is peeled to the tree"
+    );
 
     let labels = list
         .decorations
@@ -193,6 +211,10 @@ fn annotated_and_lightweight_tags_peeled() {
     assert!(
         !list.decorations.0.contains_key(&tree),
         "tags of trees are not decorated"
+    );
+    assert!(
+        !refs::decorations(&list).0.contains_key(&tree),
+        "the pure decorations() agrees with list(): the kind is part of TagInfo"
     );
 }
 

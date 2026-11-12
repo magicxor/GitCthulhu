@@ -11,54 +11,16 @@ use bstr::ByteSlice as _;
 use gix::config::Source;
 
 use crate::{
-    CancelToken, CommandLog, ConfigScope, GitError, GitRuntime, Identity, IdentityInfo, OpClass,
-    OpContext, OpOutcome, OpWarning, PartialIdentity, PullMode, RefreshSet, Repo, RepoExclusive,
-    Result, SigningConfig, SigningFormat,
-    cli::{CommandKind, GitCommand, GitOutput, run_checked, run_checked_global},
+    CancelToken, ConfigScope, GitError, GitRuntime, Identity, IdentityInfo, OpClass, OpContext,
+    OpOutcome, PartialIdentity, PullMode, RefreshSet, Repo, RepoExclusive, Result, SigningConfig,
+    SigningFormat,
+    cli::{CommandKind, GitCommand, run_checked_global},
+    internal::outcome::run_one,
 };
 
 /// Wrap any displayable error into [`GitError::Other`].
 pub(crate) fn other(err: impl std::fmt::Display) -> GitError {
     GitError::Other(anyhow::anyhow!("{err:#}"))
-}
-
-/// Collects the logs and warnings of the `git` commands one operation ran.
-#[derive(Default)]
-pub(crate) struct OpAccumulator {
-    log: CommandLog,
-    warnings: Vec<OpWarning>,
-}
-
-impl OpAccumulator {
-    /// Record one finished command.
-    pub(crate) fn push(&mut self, out: GitOutput) {
-        self.log.commands.push(out.record);
-        self.log.hooks.extend(out.hooks);
-        self.log.removed_stale_locks.extend(out.removed_stale_locks);
-        self.warnings.extend(out.warnings);
-    }
-
-    /// The finished outcome.
-    pub(crate) fn finish<T>(self, value: T, refresh: RefreshSet) -> OpOutcome<T> {
-        OpOutcome {
-            value,
-            refresh,
-            log: self.log,
-            warnings: self.warnings,
-        }
-    }
-}
-
-/// Run `cmd` and collect its output into a fresh accumulator.
-pub(crate) fn run_one(
-    repo: &Repo,
-    cmd: GitCommand,
-    ctx: &OpContext,
-    class: OpClass,
-) -> Result<OpAccumulator> {
-    let mut acc = OpAccumulator::default();
-    acc.push(run_checked(repo, cmd, ctx, class)?);
-    Ok(acc)
 }
 
 // ───────────────────────────── identity ─────────────────────────────

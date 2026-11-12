@@ -9,10 +9,9 @@ use gix::ObjectId;
 use crate::{
     GitError, GitVersion, OpClass, OpContext, OpOutcome, RefreshSet, RelaPath, Repo, RepoExclusive,
     Result, StashApplyOptions, StashApplyResult, StashPushOptions,
-    branch::gix_error,
     cli::{self, CommandKind, GitCommand},
-    commit::outcome,
-    internal::post_state,
+    internal::{errors::gix_error, outcome::single, post_state},
+    refs,
 };
 
 /// `git stash push`; `None` when there was nothing to stash.
@@ -68,7 +67,7 @@ pub fn stash_push(
     let nothing_saved = after == before
         || String::from_utf8_lossy(&out.stdout).contains("No local changes to save");
     let value = if nothing_saved { None } else { after };
-    Ok(outcome(
+    Ok(single(
         value,
         RefreshSet::STATUS | RefreshSet::STASHES | RefreshSet::LOG,
         out,
@@ -127,10 +126,11 @@ pub fn stash_drop(
     ctx.cancel.check()?;
     let index = stash_index(repo, stash)?;
     let cmd = GitCommand::new(repo, CommandKind::Mutation)
+        .with_hooks()
         .args(["stash", "drop"])
         .arg(stash_spec(index));
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Stash)?;
-    Ok(outcome((), RefreshSet::STASHES | RefreshSet::LOG, out))
+    Ok(single((), RefreshSet::STASHES | RefreshSet::LOG, out))
 }
 
 /// `git stash clear`.
@@ -141,9 +141,11 @@ pub fn stash_clear(
 ) -> Result<OpOutcome<()>> {
     let _ = perm;
     ctx.cancel.check()?;
-    let cmd = GitCommand::new(repo, CommandKind::Mutation).args(["stash", "clear"]);
+    let cmd = GitCommand::new(repo, CommandKind::Mutation)
+        .with_hooks()
+        .args(["stash", "clear"]);
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Stash)?;
-    Ok(outcome((), RefreshSet::STASHES | RefreshSet::LOG, out))
+    Ok(single((), RefreshSet::STASHES | RefreshSet::LOG, out))
 }
 
 /// Read: paths stored in the stash's untracked-files commit (parent 3), empty if none. The GUI passes them as
@@ -198,7 +200,7 @@ fn apply_or_pop(
     cmd = cmd.arg(stash_spec(index));
     let out = cli::run(repo.runtime(), cmd, ctx)?;
     if out.success() {
-        return Ok(outcome(StashApplyResult::Applied, refresh, out));
+        return Ok(single(StashApplyResult::Applied, refresh, out));
     }
     let post = post_state::read(repo)?;
     let text = format!("{}\n{}", out.stderr, String::from_utf8_lossy(&out.stdout));
@@ -235,7 +237,7 @@ fn apply_or_pop(
     } else {
         return Err(crate::error::classify(OpClass::Stash, &out, &post));
     };
-    Ok(outcome(result, refresh, out))
+    Ok(single(result, refresh, out))
 }
 
 /// The id `refs/stash` points to, `None` without stashes.
@@ -250,25 +252,11 @@ fn stash_tip(repo: &Repo) -> Result<Option<ObjectId>> {
     Ok(reference.peel_to_id().ok().map(|id| id.detach()))
 }
 
-/// Position of `stash` in the current stash list (`stash@{n}`), found by scanning the `refs/stash` reflog.
+/// Position of `stash` in the current stash list (`stash@{n}`).
 fn stash_index(repo: &Repo, stash: ObjectId) -> Result<usize> {
-    let not_found = || GitError::StashNotFound { id: stash };
-    let gix_repo = repo.local();
-    let reference = gix_repo
-        .try_find_reference("refs/stash")
-        .map_err(gix_error)?
-        .ok_or_else(not_found)?;
-    let mut log = reference.log_iter();
-    let log_path = repo.common_dir().join("logs").join("refs").join("stash");
-    let lines = log
-        .rev()
-        .map_err(|err| GitError::io(&log_path, err))?
-        .ok_or_else(not_found)?;
-    for (index, line) in lines.enumerate() {
-        let line = line.map_err(gix_error)?;
-        if line.new_oid == stash {
-            return Ok(index);
-        }
-    }
-    Err(not_found())
+    refs::stash_list(repo)?
+        .into_iter()
+        .find(|entry| entry.id == stash)
+        .map(|entry| entry.index)
+        .ok_or(GitError::StashNotFound { id: stash })
 }

@@ -1,0 +1,2 @@
+error: Untracked working tree file 'u.txt' would be overwritten by merge.
+fatal: Could not reset index file to revision 'other'.

@@ -213,7 +213,7 @@ async fn cancelled_prompt_is_reported_and_git_fails() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn askpass_used_for_mutations() {
+async fn session_environment_reaches_git_children() {
     // A `!`-alias sees the environment the session adds: the helper is what Git (and ssh) would run.
     let env = TestEnv::new();
     let done = run_git(
@@ -419,5 +419,128 @@ fn missing_helper_is_reported_before_spawning() {
     assert!(
         matches!(err, AskpassError::AskpassExecutableNotFound { .. }),
         "got {err:?}"
+    );
+}
+
+// ───────────────────────────── through the executor ─────────────────────────────
+
+/// `git credential fill` asks for a username and a password through the askpass of its environment, whatever the
+/// remote: a mutation that needs credentials without any network.
+fn credential_fill(
+    repo: &gitcthulhu_git::Repo,
+    kind: gitcthulhu_git::cli::CommandKind,
+) -> gitcthulhu_git::cli::GitCommand {
+    gitcthulhu_git::cli::GitCommand::new(repo, kind)
+        .args(["-c", "credential.helper=", "credential", "fill"])
+        .stdin(
+            b"protocol=https
+host=gitcthulhu.invalid
+
+"
+            .to_vec(),
+        )
+}
+
+#[test]
+fn askpass_used_for_mutations() {
+    use gitcthulhu_git::{
+        OpContext,
+        cli::{self, CommandKind},
+    };
+
+    let env = TestEnv::new();
+    let fixture = env.repo("repo");
+    let repo = fixture.open();
+    let prompter = Arc::new(support::TestPrompter::new([Some("alice"), Some("s3cret")]));
+    let ctx = fixture.op_ctx(CancelToken::new(), prompter.clone());
+
+    let out = cli::run(
+        repo.runtime(),
+        credential_fill(&repo, CommandKind::Mutation),
+        &ctx,
+    )
+    .expect("git runs");
+    assert_eq!(
+        out.exit_code,
+        Some(0),
+        "the credentials were answered through the askpass session: {}",
+        out.stderr
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("username=alice") && stdout.contains("password=s3cret"),
+        "git received the answers of the prompter: {stdout}"
+    );
+    let kinds: Vec<_> = prompter
+        .requests()
+        .into_iter()
+        .map(|request| request.kind)
+        .collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                PromptKind::HttpsUsername { .. },
+                PromptKind::HttpsPassword { .. }
+            ]
+        ),
+        "the prompts reached the prompter as username, then password: {kinds:?}"
+    );
+
+    // A refusal fails the command by itself and is recorded for the classifier.
+    let silent = OpContext::silent(CancelToken::new());
+    let refused = cli::run(
+        repo.runtime(),
+        credential_fill(&repo, CommandKind::Mutation),
+        &silent,
+    )
+    .expect("git runs");
+    assert_ne!(refused.exit_code, Some(0), "no answer, no credentials");
+    assert!(
+        refused
+            .prompt_refused
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("Username")),
+        "the refused prompt is reported: {:?}",
+        refused.prompt_refused
+    );
+    assert!(
+        matches!(
+            cli::run_checked(
+                &repo,
+                credential_fill(&repo, CommandKind::Mutation),
+                &silent,
+                gitcthulhu_git::OpClass::Generic
+            ),
+            Err(gitcthulhu_git::GitError::AuthCancelled { .. })
+        ),
+        "run_checked turns the refusal into AuthCancelled"
+    );
+}
+
+#[test]
+fn reads_get_no_askpass_session() {
+    use gitcthulhu_git::cli::{self, CommandKind};
+
+    let env = TestEnv::new();
+    let fixture = env.repo("repo");
+    let repo = fixture.open();
+    let prompter = Arc::new(support::TestPrompter::new([Some("alice"), Some("s3cret")]));
+    let ctx = fixture.op_ctx(CancelToken::new(), prompter.clone());
+
+    let out = cli::run(
+        repo.runtime(),
+        credential_fill(&repo, CommandKind::Read),
+        &ctx,
+    )
+    .expect("git runs");
+    assert_ne!(
+        out.exit_code,
+        Some(0),
+        "without a session git cannot ask (GIT_TERMINAL_PROMPT=0)"
+    );
+    assert!(
+        prompter.requests().is_empty(),
+        "a read never reaches the prompter"
     );
 }

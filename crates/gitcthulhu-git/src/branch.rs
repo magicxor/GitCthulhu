@@ -10,7 +10,11 @@ use crate::{
     CheckoutOptions, GitError, OpClass, OpContext, OpOutcome, RefreshSet, Repo, RepoExclusive,
     Result, StartPoint,
     cli::{self, CommandKind, GitCommand},
-    commit::{no_op_outcome, outcome},
+    internal::{
+        errors::gix_error,
+        names,
+        outcome::{no_op, single},
+    },
 };
 
 const HEADS: &str = "refs/heads/";
@@ -41,7 +45,7 @@ pub fn checkout_branch(
     let short = short_branch_name(branch)?;
     let gix_repo = repo.local();
     if gix_repo.head_name().map_err(gix_error)?.as_ref() == Some(branch) {
-        return Ok(no_op_outcome(()));
+        return Ok(no_op(()));
     }
     if !reference_exists(&gix_repo, branch.as_bstr())? {
         return Err(GitError::NotFound {
@@ -51,7 +55,7 @@ pub fn checkout_branch(
     }
     let cmd = switch_command(repo, opts).arg(short);
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Checkout)?;
-    Ok(outcome((), CHECKOUT_REFRESH, out))
+    Ok(single((), CHECKOUT_REFRESH, out))
 }
 
 /// Remote-tracking ref -> local tracking branch. If a local branch already tracks it, check that one out.
@@ -114,7 +118,7 @@ pub fn checkout_remote_branch(
         .arg(remote_ref_text);
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Checkout)?;
     repo.reload()?;
-    Ok(outcome(
+    Ok(single(
         local_full,
         CHECKOUT_REFRESH | RefreshSet::CONFIG,
         out,
@@ -136,7 +140,7 @@ pub fn checkout_detached(
         .arg("--detach")
         .arg(commit.to_hex().to_string());
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Checkout)?;
-    Ok(outcome((), CHECKOUT_REFRESH, out))
+    Ok(single((), CHECKOUT_REFRESH, out))
 }
 
 /// Create a branch, optionally checking it out.
@@ -173,6 +177,7 @@ pub fn create_branch(
     } else {
         (
             GitCommand::new(repo, CommandKind::Mutation)
+                .with_hooks()
                 .args(["branch", name])
                 .arg(start_arg),
             RefreshSet::BRANCHES | RefreshSet::LOG | RefreshSet::CONFIG,
@@ -180,7 +185,7 @@ pub fn create_branch(
     };
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Branch)?;
     repo.reload()?;
-    Ok(outcome(full, refresh, out))
+    Ok(single(full, refresh, out))
 }
 
 /// Rename a branch.
@@ -198,17 +203,18 @@ pub fn rename_branch(
     let old_short = short_branch_name(branch)?;
     // A case-only rename finds "itself" on a case-insensitive file system: let Git decide there.
     let new_full = if old_short.eq_ignore_ascii_case(new_name) && old_short != new_name {
-        branch_ref_name(new_name)?
+        names::branch_ref(new_name)?
     } else {
         validate_branch_name(repo, new_name)?
     };
     let cmd = GitCommand::new(repo, CommandKind::Mutation)
+        .with_hooks()
         .args(["branch", "-m"])
         .arg(old_short)
         .arg(new_name);
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Branch)?;
     repo.reload()?;
-    Ok(outcome(
+    Ok(single(
         new_full,
         RefreshSet::BRANCHES | RefreshSet::LOG | RefreshSet::WORKTREES | RefreshSet::CONFIG,
         out,
@@ -238,11 +244,12 @@ pub fn delete_branch(
         });
     }
     let cmd = GitCommand::new(repo, CommandKind::Mutation)
+        .with_hooks()
         .args(["branch", if force { "-D" } else { "-d" }])
         .arg(short);
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Branch)?;
     repo.reload()?;
-    Ok(outcome(
+    Ok(single(
         (),
         RefreshSet::BRANCHES | RefreshSet::LOG | RefreshSet::CONFIG,
         out,
@@ -279,7 +286,7 @@ pub fn set_upstream(
                 .string(&format!("branch.{short}.merge"))
                 .is_some();
             if !has_upstream {
-                return Ok(no_op_outcome(()));
+                return Ok(no_op(()));
             }
             GitCommand::new(repo, CommandKind::Mutation)
                 .args(["branch", "--unset-upstream"])
@@ -288,73 +295,15 @@ pub fn set_upstream(
     };
     let out = cli::run_checked(repo, cmd, ctx, OpClass::Branch)?;
     repo.reload()?;
-    Ok(outcome((), RefreshSet::BRANCHES | RefreshSet::CONFIG, out))
+    Ok(single((), RefreshSet::BRANCHES | RefreshSet::CONFIG, out))
 }
 
-/// Pure check with `gix::validate::reference::name` + "refs/heads/" prefix; also rejects an existing branch.
+/// Pure check of a new branch name (`internal::names`); also rejects an existing branch.
 ///
 /// Errors: `InvalidName { what: "branch" }`, `AlreadyExists { what: "branch" }` (also when an existing branch name is
 /// a path prefix of `name` or lives below it, which Git cannot represent).
 pub fn validate_branch_name(repo: &Repo, name: &str) -> Result<FullName> {
-    let full = branch_ref_name(name)?;
-    let gix_repo = repo.local();
-    if reference_exists(&gix_repo, full.as_bstr())? {
-        return Err(GitError::AlreadyExists {
-            what: "branch",
-            name: name.to_owned(),
-        });
-    }
-    // Directory/file conflicts: `a` exists and `a/b` is requested, or the other way round.
-    let mut prefix = String::from(HEADS);
-    let mut parts = name.split('/').peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            break;
-        }
-        prefix.push_str(part);
-        if reference_exists(&gix_repo, prefix.as_bytes().as_bstr())? {
-            return Err(GitError::AlreadyExists {
-                what: "branch",
-                name: prefix[HEADS.len()..].to_owned(),
-            });
-        }
-        prefix.push('/');
-    }
-    let below = gix_repo
-        .references()
-        .map_err(gix_error)?
-        .prefixed(format!("{HEADS}{name}/").as_str())
-        .map_err(gix_error)?
-        .next()
-        .is_some();
-    if below {
-        return Err(GitError::AlreadyExists {
-            what: "branch",
-            name: name.to_owned(),
-        });
-    }
-    Ok(full)
-}
-
-/// `refs/heads/<name>` after the syntax checks (no existence check).
-fn branch_ref_name(name: &str) -> Result<FullName> {
-    let invalid = || GitError::InvalidName {
-        what: "branch",
-        name: name.to_owned(),
-    };
-    // Git's own branch-name rules on top of the ref-format check: `-x` would be an option, `HEAD` and `@` are
-    // reserved (`git branch @` fails with "'@' is not a valid branch name").
-    if name.is_empty()
-        || name.starts_with('-')
-        || name == "HEAD"
-        || name == "@"
-        || name.trim() != name
-    {
-        return Err(invalid());
-    }
-    let full = format!("{HEADS}{name}");
-    gix::validate::reference::name(full.as_bytes().as_bstr()).map_err(|_| invalid())?;
-    FullName::try_from(full).map_err(|_| invalid())
+    names::new_branch(&repo.local(), name)
 }
 
 /// `refs/heads/<short>` -> `<short>`; anything else is `InvalidName`.
@@ -448,9 +397,4 @@ fn local_branches_tracking(repo: &Repo, remote_ref: &FullName) -> Result<Vec<Ful
     }
     found.sort_by(|a, b| a.as_bstr().cmp(b.as_bstr()));
     Ok(found)
-}
-
-/// Wrap any gix error.
-pub(crate) fn gix_error(err: impl Into<gix::Error>) -> GitError {
-    GitError::Gix(err.into())
 }

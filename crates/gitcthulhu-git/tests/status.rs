@@ -417,6 +417,21 @@ fn conflict_kinds_all_seven() {
     assert_conflict(&status, "a.txt", ConflictKind::BothDeleted);
     assert_conflict(&status, "b.txt", ConflictKind::AddedByUs);
     assert_conflict(&status, "c.txt", ConflictKind::AddedByThem);
+    let listed: Vec<_> = status
+        .unstaged
+        .iter()
+        .map(|entry| (entry.path.to_string(), entry.kind))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("a.txt".to_owned(), ChangeKind::Conflicted),
+            ("b.txt".to_owned(), ChangeKind::Conflicted),
+            ("c.txt".to_owned(), ChangeKind::Conflicted),
+        ],
+        "every conflicted path is listed once, never also as untracked (gix walks a theirs-only path as untracked)"
+    );
+    assert_eq!(status.counts.unstaged.untracked, 0, "nothing is untracked");
 }
 
 #[test]
@@ -709,17 +724,49 @@ fn index_state(repo: &TestRepo) -> (Vec<u8>, std::time::SystemTime) {
     )
 }
 
-/// Rewrites every file with the same content so the stat data in the index is stale.
+/// Rewrites `t0.txt` .. `t<count-1>.txt` with the same content, then moves the mtime of every worktree file ten seconds
+/// before the one it had, so the stat data in the index is stale, deterministically: each new mtime is in another
+/// second than the recorded one (gix compares whole seconds), and every file is far older than any index write that
+/// follows. A file whose mtime falls into the same second as the index write stays "racily clean" for gix, so a
+/// refresh would not make it clean; that is why the files that are not rewritten (`keep.txt`, conflicted files) are
+/// moved back as well.
 fn touch_all(repo: &TestRepo, count: usize) {
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    fn mtime(path: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .expect("the file has an mtime")
+    }
+    fn backdate(
+        dir: &std::path::Path,
+        recorded: &std::collections::HashMap<std::path::PathBuf, std::time::SystemTime>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("the directory can be listed") {
+            let path = entry.expect("readable directory entry").path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path).expect("the entry has metadata");
+            if meta.is_dir() {
+                backdate(&path, recorded);
+            } else if meta.is_file() {
+                let before = recorded.get(&path).copied().unwrap_or_else(|| mtime(&path));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(before - std::time::Duration::from_secs(10)))
+                    .expect("the mtime of the file can be set");
+            }
+        }
+    }
+    let mut recorded = std::collections::HashMap::new();
     for i in 0..count {
         let rela = format!("t{i}.txt");
+        let path = repo.path.join(&rela);
+        recorded.insert(path.clone(), mtime(&path));
         let content = repo.read(&rela);
         repo.write(&rela, content);
     }
-    // An entry whose mtime falls into the same second as the index write stays "racily clean" for gix (it compares
-    // whole seconds), so a refresh would not make it clean. Let the touch fall into an earlier second.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    backdate(&repo.path, &recorded);
 }
 
 fn touched_repo(env: &TestEnv, count: usize) -> TestRepo {

@@ -499,3 +499,32 @@ fn runtime_reports_version_and_git_path() {
         env.rt.git_path().display()
     );
 }
+
+#[test]
+fn isolated_runtime_leaves_core_autocrlf_to_the_repository() {
+    let env = TestEnv::new();
+    let fixture = env.repo("repo");
+    fixture.write("a.txt", "one\n");
+    fixture.commit_all("one");
+
+    let plain = fixture.open();
+    assert!(
+        !plain
+            .local()
+            .config_snapshot()
+            .boolean("core.autocrlf")
+            .unwrap_or(false),
+        "gix does not read the global file of the fixtures (false); unset means false"
+    );
+    let crlf = fixture.open_with_autocrlf("true");
+    assert_eq!(
+        crlf.local().config_snapshot().boolean("core.autocrlf"),
+        Some(true),
+        "the repository's own setting is not overridden for gix"
+    );
+    assert_eq!(
+        fixture.git(&["config", "--get", "core.autocrlf"]),
+        "true",
+        "and the git children agree"
+    );
+}

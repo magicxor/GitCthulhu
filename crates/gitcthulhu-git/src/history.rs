@@ -3,9 +3,8 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashSet},
     num::NonZeroUsize,
-    sync::Arc,
 };
 
 use bstr::{BStr, BString, ByteSlice as _};
@@ -14,8 +13,8 @@ use lru::LruCache;
 use smallvec::SmallVec;
 
 use crate::{
-    CancelToken, ChangeKind, CommitInfo, FileHistoryEntry, FileHistoryPage, GitError, GitTime,
-    Person, RelaPath, Repo, Result, Signature,
+    CancelToken, ChangeKind, CommitInfo, FileHistoryEntry, FileHistoryPage, GitError, RelaPath,
+    Repo, Result, internal::errors::gix_error, log::CommitDecoder,
 };
 
 /// How many commits are processed between two looks at the cancel token.
@@ -80,7 +79,7 @@ pub struct FileHistoryWalker {
     seen: HashSet<(ObjectId, BString)>,
     next_seq: u64,
     entries: LruCache<(ObjectId, BString), EntryKey>,
-    people: HashMap<(BString, BString), Arc<Person>>,
+    decoder: CommitDecoder,
     visited: usize,
 }
 
@@ -107,12 +106,10 @@ impl FileHistoryWalker {
             }
             None => local.head_id().ok().map(gix::Id::detach),
         };
-        let graph = local
-            .commit_graph_if_enabled()
-            .map_err(|err| GitError::Other(anyhow::anyhow!(err)))?;
+        let graph = local.commit_graph_if_enabled().map_err(gix_error)?;
         let shallow = local
             .shallow_commits()
-            .map_err(|err| GitError::Other(anyhow::anyhow!(err)))?
+            .map_err(gix_error)?
             .map(|commits| commits.iter().copied().collect())
             .unwrap_or_default();
         let mut walker = FileHistoryWalker {
@@ -126,7 +123,7 @@ impl FileHistoryWalker {
             entries: LruCache::new(
                 NonZeroUsize::new(ENTRY_CACHE).expect("the cache size is not zero"),
             ),
-            people: HashMap::new(),
+            decoder: CommitDecoder::new(None),
             visited: 0,
         };
         if let Some(start) = start {
@@ -203,7 +200,7 @@ impl FileHistoryWalker {
                 .map(|parent| {
                     parent
                         .map(|pos| graph.id_at(pos).to_owned())
-                        .map_err(|err| GitError::Other(anyhow::anyhow!(err)))
+                        .map_err(gix_error)
                 })
                 .collect();
             return Ok(CommitMeta {
@@ -212,10 +209,7 @@ impl FileHistoryWalker {
             });
         }
         let commit = self.repo.find_commit(id).map_err(GitError::Gix)?;
-        let time = commit
-            .committer()
-            .map_err(|err| GitError::Other(anyhow::anyhow!(err)))?
-            .seconds();
+        let time = commit.committer().map_err(gix_error)?.seconds();
         Ok(CommitMeta {
             time,
             parents: commit.parent_ids().map(gix::Id::detach).collect(),
@@ -236,7 +230,7 @@ impl FileHistoryWalker {
             .map_err(GitError::Gix)?;
         let found = tree
             .lookup_entry(path.split(|byte| *byte == b'/'))
-            .map_err(|err| GitError::Other(anyhow::anyhow!(err)))?
+            .map_err(gix_error)?
             .map(|entry| (entry.object_id(), entry.mode()));
         self.entries.put(key, found);
         Ok(found)
@@ -312,19 +306,18 @@ impl FileHistoryWalker {
         commit: ObjectId,
         path: &BStr,
     ) -> Result<Option<BString>> {
-        let other = |err: &dyn std::fmt::Display| GitError::Other(anyhow::anyhow!("{err}"));
         let old_tree = self
             .repo
             .find_commit(parent)
-            .map_err(|err| other(&err))?
+            .map_err(gix_error)?
             .tree()
-            .map_err(|err| other(&err))?;
+            .map_err(gix_error)?;
         let new_tree = self
             .repo
             .find_commit(commit)
-            .map_err(|err| other(&err))?
+            .map_err(gix_error)?
             .tree()
-            .map_err(|err| other(&err))?;
+            .map_err(gix_error)?;
         let rewrites = gix::diff::Rewrites {
             limit: RENAME_LIMIT,
             ..Default::default()
@@ -334,7 +327,7 @@ impl FileHistoryWalker {
         let changes = self
             .repo
             .diff_tree_to_tree(&old_tree, &new_tree, options)
-            .map_err(|err| other(&err))?;
+            .map_err(gix_error)?;
         Ok(changes.into_iter().find_map(|change| match change {
             gix::object::tree::diff::ChangeDetached::Rewrite {
                 source_location,
@@ -348,58 +341,11 @@ impl FileHistoryWalker {
 
     /// The summary of a commit, with authors and committers interned per walker.
     fn commit_info(&mut self, id: ObjectId) -> Result<CommitInfo> {
-        let commit = self.repo.find_commit(id).map_err(GitError::Gix)?;
-        commit_info(&commit, &mut self.people)
+        Ok(self.decoder.decode(&self.repo, id, false)?.0)
     }
 }
 
 /// Whether an executable-bit flip is the only difference between two entry modes.
 fn is_same_entry_type(a: EntryMode, b: EntryMode) -> bool {
     a.kind() == b.kind() || (a.is_blob() && b.is_blob())
-}
-
-/// Build the [`CommitInfo`] of `commit`, interning people in `people`.
-pub(crate) fn commit_info(
-    commit: &gix::Commit<'_>,
-    people: &mut HashMap<(BString, BString), Arc<Person>>,
-) -> Result<CommitInfo> {
-    let other = |err: &dyn std::fmt::Display| GitError::Other(anyhow::anyhow!("{err}"));
-    let author = signature(commit.author().map_err(|err| other(&err))?, people);
-    let committer = signature(commit.committer().map_err(|err| other(&err))?, people);
-    let message = commit.message_raw_sloppy();
-    let (summary, rest) = match message.find_byte(b'\n') {
-        Some(end) => (&message[..end], &message[end + 1..]),
-        None => (message, b"".as_bstr()),
-    };
-    Ok(CommitInfo {
-        id: commit.id,
-        parents: commit.parent_ids().map(gix::Id::detach).collect(),
-        author,
-        committer,
-        summary: summary.to_str_lossy().trim_end().into(),
-        has_body: !rest.trim().is_empty(),
-    })
-}
-
-fn signature(
-    raw: gix::actor::SignatureRef<'_>,
-    people: &mut HashMap<(BString, BString), Arc<Person>>,
-) -> Signature {
-    let person = people
-        .entry((raw.name.to_owned(), raw.email.to_owned()))
-        .or_insert_with(|| {
-            Arc::new(Person {
-                name: raw.name.to_owned(),
-                email: raw.email.to_owned(),
-            })
-        })
-        .clone();
-    let time = raw.time().unwrap_or_default();
-    Signature {
-        person,
-        time: GitTime {
-            seconds: time.seconds,
-            offset_minutes: time.offset / 60,
-        },
-    }
 }

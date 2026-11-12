@@ -971,7 +971,6 @@ fn classify_table() {
                 stderr: String::new(),
             },
             prompt_refused: None,
-            removed_stale_locks: Vec::new(),
             warnings: Vec::new(),
         };
         let (op, post, expected) = expectation(&row);
@@ -1187,6 +1186,16 @@ mod capture {
         ]);
         w.save("15.switch", &run_raw(&repo, M, &["switch", "side"]));
         w.save("15.branch-d", &run_raw(&repo, M, &["branch", "-d", "main"]));
+        // 18, `worktree remove` of a worktree with an untracked file
+        std::fs::write(linked.join("untracked.txt"), "x").expect("untracked file in the worktree");
+        w.save(
+            "18.worktree-remove",
+            &run_raw(
+                &repo,
+                M,
+                &["worktree", "remove", &linked.display().to_string()],
+            ),
+        );
 
         // 15b
         fixture.git(&["switch", "-q", "-c", "lonely-branch"]);
@@ -1230,10 +1239,18 @@ mod capture {
         let d_repo = d.open();
         d.write("f.txt", "dirty\n");
         w.save("16", &run_raw(&d_repo, M, &["switch", "other"]));
+        w.save(
+            "16.reset-keep",
+            &run_raw(&d_repo, M, &["reset", "--keep", "other"]),
+        );
         w.save("18", &run_raw(&d_repo, M, &["rebase", "other"]));
         d.git(&["checkout", "--", "f.txt"]);
         d.write("u.txt", "untracked here\n");
         w.save("17", &run_raw(&d_repo, M, &["switch", "other"]));
+        w.save(
+            "17.reset-keep",
+            &run_raw(&d_repo, M, &["reset", "--keep", "other"]),
+        );
         d.remove("u.txt");
 
         // 20, 19
@@ -1252,6 +1269,14 @@ mod capture {
             &run_raw(&d_repo, M, &["cherry-pick", &other]),
         );
         d.git(&["cherry-pick", "--abort"]);
+        // 20, `rebase --continue` while the conflicts are not resolved
+        let started = run_raw(&d_repo, M, &["rebase", "other"]);
+        assert_ne!(started.exit_code, Some(0), "the rebase stops at a conflict");
+        w.save(
+            "20.rebase-continue",
+            &run_raw(&d_repo, M, &["rebase", "--continue"]),
+        );
+        d.git(&["rebase", "--abort"]);
 
         // 21, 22
         d.git(&["switch", "-q", "--orphan", "unrelated"]);

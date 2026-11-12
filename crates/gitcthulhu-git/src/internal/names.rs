@@ -12,7 +12,7 @@
 use bstr::{BStr, BString, ByteSlice};
 use gix::refs::FullName;
 
-use crate::{GitError, Result};
+use crate::{GitError, Result, internal::errors::gix_error};
 
 fn invalid(what: &'static str, name: &str) -> GitError {
     GitError::InvalidName {
@@ -26,9 +26,12 @@ fn full_name(what: &'static str, name: &str, full: BString) -> Result<FullName> 
 }
 
 /// `refs/heads/<name>` if `name` is a valid branch name (`InvalidName { what: "branch" }` otherwise).
+///
+/// A branch called `@` is refused although `git branch @` creates it: `@` is the alias of `HEAD` in every revision
+/// argument, so no later command could address such a branch.
 pub(crate) fn branch_ref(name: &str) -> Result<FullName> {
     const WHAT: &str = "branch";
-    if name.starts_with('-') {
+    if name.starts_with('-') || name == "@" {
         return Err(invalid(WHAT, name));
     }
     let full: BString = format!("refs/heads/{name}").into();
@@ -125,7 +128,7 @@ fn ensure_absent(
     let platform = repo.references()?;
     let mut iter = platform.prefixed(below.as_bstr())?;
     if let Some(existing) = iter.next() {
-        let existing = existing.map_err(|err| GitError::Other(anyhow::anyhow!(err)))?;
+        let existing = existing.map_err(gix_error)?;
         return Err(already(existing.name().as_bstr()));
     }
     Ok(())
@@ -187,7 +190,6 @@ mod tests {
         assert_eq!(
             ok,
             [
-                "@",
                 "ä",
                 "feature/x",
                 "a@b",
@@ -196,7 +198,7 @@ mod tests {
                 "HEAD/x",
                 "x/HEAD"
             ],
-            "exactly the names `git branch` accepts"
+            "the names `git branch` accepts, minus `@` (refused on purpose)"
         );
         assert_eq!(
             branch_ref("feature/x").expect("valid").as_bstr(),

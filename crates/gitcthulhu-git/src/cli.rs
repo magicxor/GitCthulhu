@@ -188,17 +188,42 @@ pub struct GitOutput {
     pub record: CommandRecord,
     /// Askpass NeedsAuthorization prompt.
     pub prompt_refused: Option<String>,
-    /// Lock files deleted after a cancel.
-    pub removed_stale_locks: Vec<PathBuf>,
-    /// Filled by `run_checked` when only post hooks failed (§1.11); the exit code is then non-zero but the
-    /// command is treated as successful.
+    /// One `PostHookFailed` per failing post hook (§1.11), filled by every run that traced its hooks. The command
+    /// may have exited 0 (Git ignores the exit code of `post-commit`, `post-merge`, `post-rewrite`) or not (a failing
+    /// `post-checkout` makes `git switch` exit 1 after it switched).
     pub warnings: Vec<OpWarning>,
 }
 
 impl GitOutput {
-    /// Exit code 0, or `run_checked` accepted it as success-with-post-hook-warnings.
+    /// Exit code 0, or a non-zero exit that only failing post hooks account for (§1.11): a failing `post-checkout`
+    /// and no failing hook other than post hooks. The operation happened and [`GitOutput::warnings`] says what went
+    /// wrong afterwards.
     pub fn success(&self) -> bool {
-        self.exit_code == Some(0) || !self.warnings.is_empty()
+        self.exit_code == Some(0) || self.only_post_hooks_failed()
+    }
+
+    /// Whether Git reports that re-applying the autostash conflicted. Older Git: "Applying autostash resulted in
+    /// conflicts."; newer (line-wrapped): "Your local changes are stashed, however applying them resulted in
+    /// conflicts."
+    pub(crate) fn autostash_conflicted(&self) -> bool {
+        let stdout = String::from_utf8_lossy(&self.stdout);
+        [self.stderr.as_str(), &stdout].iter().any(|text| {
+            text.contains("Applying autostash resulted in conflicts")
+                || text.contains("Your local changes are stashed, however applying them")
+        })
+    }
+
+    /// Every failing hook is a post hook (the operation did happen), and one of them is `post-checkout`.
+    ///
+    /// `post-checkout` is the only post hook whose exit status Git passes on (`switch`, `checkout`, `worktree add`,
+    /// `clone`). Git ignores the status of the others (`post-commit`, `post-merge`, `post-rewrite`, a
+    /// `reference-transaction` in phase `committed`), so they can never be the reason for a non-zero exit: when one of
+    /// them failed and the command failed too (a rebase that stopped at a conflict after updating `ORIG_HEAD`, a
+    /// rejected push after updating remote-tracking refs), the failure is the command's own and must be classified.
+    fn only_post_hooks_failed(&self) -> bool {
+        let mut failing = self.hooks.iter().filter(|hook| hook.exit_code != Some(0));
+        failing.clone().any(|hook| hook.name == "post-checkout")
+            && failing.all(|hook| trace2::hook_class(hook) == trace2::HookClass::Post)
     }
 }
 
@@ -214,8 +239,9 @@ pub fn run(rt: &GitRuntime, cmd: GitCommand, ctx: &OpContext) -> Result<GitOutpu
 /// `run`, then on non-zero exit: (1) post-hook-only failure => Ok with `warnings` (§1.11); (2) otherwise
 /// `error::classify(class, &out, &internal::post_state::read(repo)?)`.
 ///
-/// A successful command whose post hooks failed (Git ignores the exit code of `post-commit` and `post-merge`) also
-/// gets `warnings`, so the GUI can surface every failing hook (D0.6).
+/// A successful command whose post hooks failed (Git ignores the exit code of `post-commit` and `post-merge`) has
+/// `warnings` too, so the GUI can surface every failing hook (D0.6). Hooks are only known for commands built with
+/// [`GitCommand::with_hooks`].
 pub fn run_checked(
     repo: &Repo,
     cmd: GitCommand,
@@ -255,21 +281,13 @@ pub fn run_simple(repo: &Repo, args: &[&str], cancel: &CancelToken) -> Result<Ve
     }
 }
 
-/// The post-processing of `run_checked*`: success, success with post-hook warnings, or a classified error.
+/// The post-processing of `run_checked*`: success (possibly with post-hook warnings) or a classified error.
 fn check(
-    mut out: GitOutput,
+    out: GitOutput,
     class: OpClass,
     post: impl FnOnce() -> Result<PostState>,
 ) -> Result<GitOutput> {
-    let mut failing = out
-        .hooks
-        .iter()
-        .filter(|hook| hook.exit_code != Some(0))
-        .peekable();
-    let only_post_hooks_failed = failing.peek().is_some()
-        && failing.all(|hook| trace2::hook_class(&hook.name) == trace2::HookClass::Post);
-    if out.exit_code == Some(0) || only_post_hooks_failed {
-        out.warnings = post_hook_warnings(&out);
+    if out.success() {
         return Ok(out);
     }
     Err(classify(class, &out, &post()?))
@@ -281,7 +299,7 @@ fn post_hook_warnings(out: &GitOutput) -> Vec<OpWarning> {
         .hooks
         .iter()
         .filter(|hook| {
-            hook.exit_code != Some(0) && trace2::hook_class(&hook.name) == trace2::HookClass::Post
+            hook.exit_code != Some(0) && trace2::hook_class(hook) == trace2::HookClass::Post
         })
         .peekable();
     if failing.peek().is_none() {
@@ -413,14 +431,14 @@ fn execute(
             Target::Global => None,
         };
         let (transport_env, transport_args) =
-            askpass::transport_settings(config_dir, rt.config().host_key_policy);
+            askpass::transport_settings(config_dir, rt.config().host_key_policy, rt.base_env());
         vars.extend(transport_env);
         args.extend(transport_args);
     }
     let GitCommand {
         args: cmd_args,
         cwd,
-        kind: _,
+        kind,
         stdin,
         progress,
         trace_hooks: _,
@@ -432,6 +450,12 @@ fn execute(
     args.extend(cmd_args);
 
     let (lock_dirs, prompt_repo) = match target {
+        // Reads never take locks (`GIT_OPTIONAL_LOCKS=0`): after a cancel there is nothing of ours to clean up.
+        Target::Repo(repo) if kind == CommandKind::Read => (
+            LockDirs::None,
+            Some(repo.workdir().unwrap_or(repo.git_dir()).to_owned()),
+        ),
+        Target::Cwd if kind == CommandKind::Read => (LockDirs::None, Some(cwd.clone())),
         Target::Repo(repo) => (
             LockDirs::Known(vec![
                 repo.git_dir().to_owned(),
@@ -475,6 +499,12 @@ fn execute(
         testing::run_after_kill(&cwd);
         let removed = kill::remove_stale_locks(observed);
         tracing::debug!(args = %shown_args, ?reason, ?removed, "Killed git");
+        for lock in &removed {
+            ctx.progress.progress(Progress::Message(format!(
+                "Removed the lock file {} that the cancelled command left behind",
+                lock.display()
+            )));
+        }
         return Err(match reason {
             KillReason::Cancelled => GitError::Cancelled,
             KillReason::StdoutOverflow => output_too_large(shown_args),
@@ -495,7 +525,7 @@ fn execute(
         return Err(err);
     }
     tracing::debug!(args = %shown_args, exit_code = ?driven.exit_code, ?duration, "git finished");
-    Ok(GitOutput {
+    let mut out = GitOutput {
         exit_code: driven.exit_code,
         stdout: driven.stdout,
         record: CommandRecord {
@@ -507,9 +537,10 @@ fn execute(
         stderr: driven.stderr,
         hooks,
         prompt_refused: driven.prompt_refused,
-        removed_stale_locks: Vec::new(),
         warnings: Vec::new(),
-    })
+    };
+    out.warnings = post_hook_warnings(&out);
+    Ok(out)
 }
 
 /// Run `fut` on the runtime's tokio runtime and block the calling thread until it is done. Works from any thread
@@ -573,6 +604,13 @@ async fn drive(spawn: Spawn) -> Result<Driven> {
     #[cfg(unix)]
     command.process_group(0);
 
+    // Locks that exist now belong to somebody else; only a lock created after this point can be ours.
+    let lock_dirs: Vec<PathBuf> = match &lock_dirs {
+        LockDirs::Known(dirs) => dirs.clone(),
+        LockDirs::OfCwd => kill::git_dirs_of_cwd(&cwd),
+        LockDirs::None => Vec::new(),
+    };
+    let locks_before = kill::snapshot_locks(&lock_dirs);
     let started_at = SystemTime::now();
     let mut child = command.spawn().map_err(|err| spawn_error(&program, err))?;
     let mut tree = kill::ProcessTree::attach(&child);
@@ -651,12 +689,7 @@ async fn drive(spawn: Spawn) -> Result<Driven> {
             (status.code(), DriveEnd::Exited)
         }
         Err(reason) => {
-            let dirs = match &lock_dirs {
-                LockDirs::Known(dirs) => dirs.clone(),
-                LockDirs::OfCwd => kill::git_dirs_of_cwd(&cwd),
-                LockDirs::None => Vec::new(),
-            };
-            let observed = kill::observe_locks(&dirs, started_at);
+            let observed = kill::observe_locks(&lock_dirs, started_at, &locks_before);
             tree.terminate(&mut child).await;
             tree.release();
             let code = child.try_wait().ok().flatten().and_then(|s| s.code());

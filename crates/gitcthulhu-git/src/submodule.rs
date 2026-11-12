@@ -8,7 +8,7 @@ use crate::{
     CancelToken, GitError, GitVersion, OpClass, OpContext, OpOutcome, RefreshSet, RelaPath, Repo,
     RepoExclusive, Result, SubmoduleInfo, SubmoduleState,
     cli::{CommandKind, GitCommand, run_checked},
-    config::{OpAccumulator, other},
+    internal::{errors::gix_error, outcome::Collected},
 };
 
 /// `git submodule add --progress` is only passed from this version on (verified on 2.56; 2.34 is unverified).
@@ -28,16 +28,16 @@ fn to_path(path: &RelaPath) -> Result<std::borrow::Cow<'_, Path>> {
 /// The submodules of the repository; `with_dirty` also checks whether their worktrees are dirty.
 pub fn list(repo: &Repo, with_dirty: bool, cancel: &CancelToken) -> Result<Vec<SubmoduleInfo>> {
     let gix_repo = repo.local();
-    let Some(submodules) = gix_repo.submodules().map_err(other)? else {
+    let Some(submodules) = gix_repo.submodules().map_err(gix_error)? else {
         return Ok(Vec::new());
     };
     let workdir = repo.workdir().map(Path::to_owned);
     let mut out = Vec::new();
     for submodule in submodules {
         cancel.check()?;
-        let path: RelaPath = submodule.path().map_err(other)?;
+        let path: RelaPath = submodule.path().map_err(gix_error)?;
         let index_commit = submodule.index_id().ok().flatten();
-        let state = submodule.state().map_err(other)?;
+        let state = submodule.state().map_err(gix_error)?;
         let missing = index_commit.is_some()
             && workdir
                 .as_ref()
@@ -109,7 +109,7 @@ fn run_with(
     refresh: RefreshSet,
 ) -> Result<OpOutcome<()>> {
     ctx.cancel.check()?;
-    let mut acc = OpAccumulator::default();
+    let mut acc = Collected::default();
     acc.push(run_checked(repo, cmd, ctx, OpClass::Submodule)?);
     repo.reload()?;
     Ok(acc.finish((), refresh))
@@ -278,7 +278,7 @@ pub fn remove(
             name: path.to_str_lossy().into_owned(),
         })?;
     let paths = std::slice::from_ref(path);
-    let mut acc = OpAccumulator::default();
+    let mut acc = Collected::default();
     let deinit = command(repo, CommandKind::Mutation)
         .args(["deinit", "-f"])
         .literal_paths_after_dashdash(paths);

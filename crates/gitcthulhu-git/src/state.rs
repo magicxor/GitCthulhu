@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 use crate::{
     BisectState, FixupFlag, GitError, HeadState, InProgress, MergeState, RebaseBackend,
     RebaseState, RebaseStopReason, Repo, RepoFlags, RepoKind, RepoState, Result, SequencerKind,
-    SequencerState, TodoAction, TodoLine,
+    SequencerState, TodoAction, TodoLine, internal::errors::gix_error,
 };
 
 /// HEAD, the operation in progress and its details.
@@ -26,16 +26,12 @@ pub fn repo_state(repo: &Repo) -> Result<RepoState> {
 
     let merge = read_merge(git_dir)?;
     let sequencer = read_sequencer(git_dir, &local)?;
-    let mut rebase = read_rebase(git_dir, &local, conflicted_paths > 0)?;
+    let rebase = read_rebase(git_dir, &local, conflicted_paths > 0)?;
     let bisect = read_bisect(git_dir)?;
-    if git_dir.join("rebase-apply").join("applying").exists() {
-        // `git am`: not a rebase.
-        rebase = None;
-    }
 
     let flags = RepoFlags {
         bare: local.is_bare(),
-        shallow: local.is_shallow().map_err(other)?,
+        shallow: local.is_shallow().map_err(gix_error)?,
         linked_worktree: matches!(repo.kind(), RepoKind::LinkedWorktree { .. }),
         sparse: local
             .config_snapshot()
@@ -61,6 +57,13 @@ pub fn repo_state(repo: &Repo) -> Result<RepoState> {
     })
 }
 
+/// The rebase in progress in `repo`'s own git directory (what [`repo_state`] reports as `rebase`), without reading
+/// anything else. `None` when no rebase runs, and for `git am` (which shares `rebase-apply/`).
+pub(crate) fn rebase_details(repo: &Repo) -> Result<Option<RebaseState>> {
+    let local = repo.local();
+    read_rebase(repo.git_dir(), &local, has_conflicts(repo)?)
+}
+
 /// Cheap: scans the index for stage != 0.
 ///
 /// A bare repository has no index and therefore no conflicts.
@@ -69,25 +72,21 @@ pub fn has_conflicts(repo: &Repo) -> Result<bool> {
     if local.is_bare() {
         return Ok(false);
     }
-    let index = local.index_or_empty().map_err(other)?;
+    let index = local.index_or_empty().map_err(gix_error)?;
     Ok(index
         .entries()
         .iter()
         .any(|entry| entry.flags.stage_raw() != 0))
 }
 
-fn other(err: impl std::error::Error + Send + Sync + 'static) -> GitError {
-    GitError::Other(anyhow::Error::new(err))
-}
-
 fn head_state(local: &gix::Repository) -> Result<HeadState> {
-    let head = local.head().map_err(other)?;
+    let head = local.head().map_err(gix_error)?;
     Ok(match &head.kind {
         gix::head::Kind::Unborn(name) => HeadState::Unborn { name: name.clone() },
         gix::head::Kind::Detached { target, .. } => HeadState::Detached { target: *target },
         gix::head::Kind::Symbolic(reference) => {
             let name = reference.name.clone();
-            let target = local.head_id().map_err(other)?.detach();
+            let target = local.head_id().map_err(gix_error)?.detach();
             HeadState::Branch { name, target }
         }
     })
@@ -98,7 +97,7 @@ fn conflicted_paths(local: &gix::Repository) -> Result<usize> {
     if local.is_bare() {
         return Ok(0);
     }
-    let index = local.index_or_empty().map_err(other)?;
+    let index = local.index_or_empty().map_err(gix_error)?;
     // Entries are sorted by (path, stage), so the stages of one path are adjacent.
     let mut count = 0;
     let mut last = None;
@@ -218,9 +217,9 @@ fn read_sequencer(git_dir: &Path, local: &gix::Repository) -> Result<Option<Sequ
     } else {
         match todo.as_ref().and_then(|todo| todo.first()) {
             Some(TodoLine {
-                action: TodoAction::Unknown(word),
+                action: TodoAction::Revert,
                 ..
-            }) if word == "revert" => SequencerKind::Revert,
+            }) => SequencerKind::Revert,
             _ => SequencerKind::CherryPick,
         }
     };
@@ -251,6 +250,12 @@ fn read_rebase(
 ) -> Result<Option<RebaseState>> {
     let merge_dir = git_dir.join("rebase-merge");
     let apply_dir = git_dir.join("rebase-apply");
+    if apply_dir.join("applying").exists() {
+        // `git am`: not a rebase.
+        return Ok(None);
+    }
+    // The commit whose application is being resolved; Git removes it when the step is finished.
+    let rebase_head = read_id(&git_dir.join("REBASE_HEAD"))?;
     let started_by_us = git_dir
         .join("gitcthulhu")
         .join("rebase")
@@ -260,9 +265,13 @@ fn read_rebase(
         let done = read_todo(&merge_dir.join("done"), local)?;
         let todo = read_todo(&merge_dir.join("git-rebase-todo"), local)?;
         let stopped_sha = read_trimmed(&merge_dir.join("stopped-sha"))?;
-        let stopped_at = stopped_sha
-            .as_deref()
-            .and_then(|sha| resolve_abbrev(local, sha));
+        let stopped_at = rebase_head
+            .or_else(|| {
+                stopped_sha
+                    .as_deref()
+                    .and_then(|sha| resolve_abbrev(local, sha))
+            })
+            .or_else(|| done.last().and_then(|line| line.commit));
         let amend = read_id(&merge_dir.join("amend"))?;
         let stop_reason = if has_conflicts {
             RebaseStopReason::Conflict
@@ -303,7 +312,7 @@ fn read_rebase(
             started_by_us,
         }));
     }
-    if apply_dir.is_dir() && !apply_dir.join("applying").exists() {
+    if apply_dir.is_dir() {
         let step = match (
             read_number(&apply_dir.join("next"))?,
             read_number(&apply_dir.join("last"))?,
@@ -320,10 +329,12 @@ fn read_rebase(
             step,
             done: Vec::new(),
             todo: Vec::new(),
-            stopped_at: None,
+            stopped_at: rebase_head,
             amend: None,
             stop_reason: if has_conflicts {
                 RebaseStopReason::Conflict
+            } else if apply_dir.join("next").exists() {
+                RebaseStopReason::ResolvedNeedsContinue
             } else {
                 RebaseStopReason::Unknown
             },
@@ -396,6 +407,7 @@ pub fn parse_todo_line(line: &str) -> Option<TodoLine> {
     let (word, mut tail) = split_word(trimmed);
     let action = match word {
         "p" | "pick" => TodoAction::Pick,
+        "revert" => TodoAction::Revert,
         "r" | "reword" => TodoAction::Reword,
         "e" | "edit" => TodoAction::Edit,
         "s" | "squash" => TodoAction::Squash,
@@ -412,16 +424,16 @@ pub fn parse_todo_line(line: &str) -> Option<TodoLine> {
     };
     let mut action = action;
     // Commands whose first argument is a commit.
-    let takes_commit = match &action {
+    let takes_commit = matches!(
+        action,
         TodoAction::Pick
-        | TodoAction::Reword
-        | TodoAction::Edit
-        | TodoAction::Squash
-        | TodoAction::Drop
-        | TodoAction::Fixup(_) => true,
-        TodoAction::Unknown(word) => word == "revert",
-        _ => false,
-    };
+            | TodoAction::Revert
+            | TodoAction::Reword
+            | TodoAction::Edit
+            | TodoAction::Squash
+            | TodoAction::Drop
+            | TodoAction::Fixup(_)
+    );
     let mut abbrev = None;
     if matches!(action, TodoAction::Fixup(_)) {
         let (flag, after) = split_word(tail);

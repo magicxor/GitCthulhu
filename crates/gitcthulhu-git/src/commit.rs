@@ -9,60 +9,11 @@ use bstr::ByteSlice;
 use gix::{ObjectId, state::InProgress};
 
 use crate::{
-    CommandLog, CommitOptions, CommitOutcome, GitError, OpClass, OpContext, OpOutcome, OpWarning,
-    RefreshSet, Repo, RepoExclusive, Result, SignMode,
-    branch::gix_error,
-    cli::{self, CommandKind, GitCommand, GitOutput},
+    CommitOptions, CommitOutcome, GitError, OpClass, OpContext, OpOutcome, RefreshSet, Repo,
+    RepoExclusive, Result, SignMode,
+    cli::{self, CommandKind, GitCommand},
+    internal::{errors::gix_error, outcome::single},
 };
-
-/// Wrap the result of one finished git command into an [`OpOutcome`].
-///
-/// Git ignores the exit status of some post hooks (`post-commit`), so a failed post hook that the executor did not
-/// already turn into a warning is reported here from the hook trace.
-pub(crate) fn outcome<T>(value: T, refresh: RefreshSet, out: GitOutput) -> OpOutcome<T> {
-    let mut warnings = out.warnings;
-    for hook in &out.hooks {
-        let failed = hook.exit_code != Some(0);
-        let already_reported = warnings.iter().any(
-            |w| matches!(w, OpWarning::PostHookFailed { hook: name, .. } if *name == hook.name),
-        );
-        if failed && hook.name.starts_with("post-") && !already_reported {
-            // Same shape as the executor's warnings: stderr + stdout of the whole command (§1.11).
-            let mut output = out.stderr.clone();
-            if !out.stdout.is_empty() {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str(&String::from_utf8_lossy(&out.stdout));
-            }
-            warnings.push(OpWarning::PostHookFailed {
-                hook: hook.name.clone(),
-                exit_code: hook.exit_code,
-                output,
-            });
-        }
-    }
-    OpOutcome {
-        value,
-        refresh,
-        log: CommandLog {
-            commands: vec![out.record],
-            hooks: out.hooks,
-            removed_stale_locks: out.removed_stale_locks,
-        },
-        warnings,
-    }
-}
-
-/// An outcome for an operation that needed no command at all.
-pub(crate) fn no_op_outcome<T>(value: T) -> OpOutcome<T> {
-    OpOutcome {
-        value,
-        refresh: RefreshSet::empty(),
-        log: CommandLog::default(),
-        warnings: Vec::new(),
-    }
-}
 
 /// `git commit`, hooks included.
 ///
@@ -141,7 +92,7 @@ pub fn commit(
             draft.display()
         );
     }
-    Ok(outcome(
+    Ok(single(
         CommitOutcome { id, summary },
         RefreshSet::STATUS | RefreshSet::LOG | RefreshSet::BRANCHES | RefreshSet::REPO_STATE,
         out,

@@ -140,12 +140,22 @@ pub fn http_stall_limit_args(loc: HarnessLocation<'_>) -> Vec<String> {
 /// Otherwise `GIT_SSH_COMMAND` becomes `ssh -o StrictHostKeyChecking=<policy> -o KbdInteractiveAuthentication=no -o
 /// ServerAliveInterval=15 -o ServerAliveCountMax=4`.
 pub fn ssh_env(loc: HarnessLocation<'_>, host_key_policy: HostKeyPolicy) -> Vec<(String, String)> {
+    ssh_env_in(loc, host_key_policy, &|key| std::env::var(key).ok())
+}
+
+/// [`ssh_env()`] for a child whose environment is not the live process environment: `env` looks up the variables
+/// (`GIT_SSH_COMMAND`, `GIT_SSH`) the way the child will see them.
+pub fn ssh_env_in(
+    loc: HarnessLocation<'_>,
+    host_key_policy: HostKeyPolicy,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
     // Neither GIT_SSH_COMMAND nor GIT_SSH are required to be unicode; a value that is not valid UTF-8 is treated as
     // unconfigured here.
-    if let Ok(Some(git_ssh_command)) = configured_git_ssh_command(loc) {
+    if let Ok(Some(git_ssh_command)) = configured_git_ssh_command(loc, env) {
         return vec![("GIT_SSH_COMMAND".into(), git_ssh_command)];
     }
-    if let Ok(git_ssh) = std::env::var("GIT_SSH") {
+    if let Some(git_ssh) = env("GIT_SSH") {
         return vec![("GIT_SSH".into(), git_ssh)];
     }
 
@@ -169,8 +179,11 @@ pub fn ssh_env(loc: HarnessLocation<'_>, host_key_policy: HostKeyPolicy) -> Vec<
 /// The environment is checked explicitly: `gix::config::File::from_globals()` (used outside of a repository) does not
 /// apply environment overrides, and a returned default would otherwise replace the user's own `GIT_SSH_COMMAND` in
 /// the child.
-fn configured_git_ssh_command(loc: HarnessLocation<'_>) -> anyhow::Result<Option<String>> {
-    if let Ok(git_ssh_command) = std::env::var("GIT_SSH_COMMAND") {
+fn configured_git_ssh_command(
+    loc: HarnessLocation<'_>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(git_ssh_command) = env("GIT_SSH_COMMAND") {
         return Ok(Some(git_ssh_command));
     }
     match loc {
@@ -217,6 +230,10 @@ pub fn askpass_exe_next_to_current_exe() -> Result<PathBuf, AskpassError> {
         .with_file_name(ASKPASS_EXE_NAME)
         .with_extension(std::env::consts::EXE_EXTENSION))
 }
+
+/// How long a peer has to identify itself (send its secret and the prompt) after connecting. The helper does so at once;
+/// a silent peer must not block the prompts of the command.
+const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One askpass server for the lifetime of one git invocation.
 pub struct AskpassSession {
@@ -287,8 +304,10 @@ impl AskpassSession {
     /// Accept connections forever, verifying peer executable and secret, and answer each prompt with `on_prompt`.
     ///
     /// `None` as answer closes the connection without a reply and ends serving with
-    /// [`AskpassError::NeedsAuthorization`], carrying the prompt. Every other error (a failed security check, i/o
-    /// trouble) ends serving too: this is infrastructure that must not be silently skipped.
+    /// [`AskpassError::NeedsAuthorization`], carrying the prompt. A connection that fails the security check (another
+    /// executable, a wrong secret, a peer that vanished or stays silent, i/o trouble with it) is closed without an
+    /// answer and logged, and serving goes on: any local process may connect to the pipe, and an unrelated one must not
+    /// be able to cancel the prompts of the command. Only a failure of the server itself ends serving.
     ///
     /// The `on_prompt` futures must be `Send + 'static`: they are driven on the runtime, and may move an `Arc` clone
     /// of the prompter into `tokio::task::spawn_blocking`.
@@ -303,12 +322,28 @@ impl AskpassSession {
                 .accept()
                 .await
                 .map_err(AskpassError::AskpassServer)?;
-            let prompt = self.authenticate(&mut sock).await?;
+            let authenticated =
+                tokio::time::timeout(AUTHENTICATION_TIMEOUT, self.authenticate(&mut sock)).await;
+            let prompt = match authenticated {
+                Ok(Ok(prompt)) => prompt,
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "Rejected a connection to the askpass server");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Rejected a connection to the askpass server: it did not identify itself in time"
+                    );
+                    continue;
+                }
+            };
             match on_prompt(prompt.clone()).await {
-                Some(response) => sock
-                    .write_line(&response)
-                    .await
-                    .map_err(AskpassError::AskpassIo)?,
+                Some(response) => {
+                    if let Err(err) = sock.write_line(&response).await {
+                        // The helper went away (git was killed); the next prompt, if any, comes on a new connection.
+                        tracing::warn!(%err, "Could not send the answer to the askpass helper");
+                    }
+                }
                 None => return Err(AskpassError::NeedsAuthorization(prompt)),
             }
         }
@@ -493,27 +528,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wrong_secret_is_rejected_without_asking() {
+    async fn wrong_secret_is_rejected_and_serving_goes_on() {
         let session = AskpassSession::new(std::env::current_exe().expect("current exe"))
             .await
             .expect("the session can be created");
         let env = session.env();
-        let client = fake_helper(
+        let intruder = fake_helper(
             env_value(&env, "GITCTHULHU_ASKPASS_PIPE"),
             "not-the-secret".into(),
             "Password: ",
         );
-        let (served, answer) = tokio::join!(
-            session.serve(|p| -> std::future::Ready<Option<String>> {
-                panic!("the prompt handler must not run for an unauthenticated peer: {p:?}")
-            }),
-            client
+        let real = async {
+            // The real helper connects after the unrelated process was turned away.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            fake_helper(
+                env_value(&env, "GITCTHULHU_ASKPASS_PIPE"),
+                env_value(&env, "GITCTHULHU_ASKPASS_SECRET"),
+                "Password for 'https://example.org': ",
+            )
+            .await
+        };
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (intruder_answer, real_answer) = tokio::select! {
+            served = session.serve(move |p| {
+                seen_tx.send(p).ok();
+                std::future::ready(Some("hunter2".to_owned()))
+            }) => panic!("serving ended: {:?}", served.err()),
+            answers = async { tokio::join!(intruder, real) } => answers,
+        };
+        assert_eq!(
+            intruder_answer.expect("client i/o works"),
+            "",
+            "the unauthenticated peer gets no answer"
         );
-        assert!(
-            matches!(served, Err(AskpassError::AskpassSecretMismatch)),
-            "a wrong secret ends serving: {served:?}"
+        assert_eq!(
+            real_answer.expect("client i/o works"),
+            "hunter2",
+            "the real helper is still served"
         );
-        assert_eq!(answer.expect("client i/o works"), "", "no answer is given");
+        assert_eq!(
+            seen_rx.try_iter().collect::<Vec<_>>(),
+            ["Password for 'https://example.org': "],
+            "the prompt handler only saw the authenticated prompt"
+        );
     }
 
     /// Regression: slow Git operations died as "failed to create askpass server: timed out" when the askpass server
@@ -594,6 +651,21 @@ mod tests {
         assert!(
             command.contains("ServerAliveInterval=15"),
             "keep-alives are set: {command}"
+        );
+    }
+
+    #[test]
+    fn ssh_env_reads_the_given_environment_not_the_live_one() {
+        let dir = but_testsupport::gix_testtools::tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("repository can be initialised");
+        let loc = HarnessLocation::Repo(dir.path());
+        let env = ssh_env_in(loc, HostKeyPolicy::Ask, &|key| {
+            (key == "GIT_SSH_COMMAND").then(|| "my-ssh -q".to_owned())
+        });
+        assert_eq!(
+            env,
+            [("GIT_SSH_COMMAND".to_owned(), "my-ssh -q".to_owned())],
+            "the command of the given environment is passed on unchanged"
         );
     }
 }

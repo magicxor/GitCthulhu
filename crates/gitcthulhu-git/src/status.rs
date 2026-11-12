@@ -2,7 +2,7 @@
 //!
 //! Computed in-process with gix; the index is never written (see [`status()`] and [`refresh_index()`]).
 
-use std::{collections::HashSet, path::Path, time::UNIX_EPOCH};
+use std::{collections::HashSet, path::Path};
 
 use bstr::{BString, ByteSlice};
 use gix::{
@@ -23,6 +23,8 @@ use crate::{
     SubmoduleStatusMode, UntrackedMode,
     cli::{self, CommandKind, GitCommand},
     error::classify,
+    internal::errors::gix_error,
+    watch::file_stamp,
 };
 
 impl Default for StatusOptions {
@@ -187,7 +189,9 @@ pub fn status(repo: &Repo, opts: &StatusOptions, cancel: &CancelToken) -> Result
             .is_some_and(|outcome| outcome.has_changes());
     }
 
-    // Conflicted paths are reported once, as unstaged conflicts.
+    // Conflicted paths are reported once, as unstaged conflicts. The dirwalk of gix looks paths up in the index with
+    // `entry_by_path`, which only finds stage 0 or 2: a path that only has a "theirs" entry (added by them) is walked
+    // as untracked as well on case-sensitive file systems. Git never calls an unmerged path untracked.
     if unstaged.iter().any(|e| e.kind == ChangeKind::Conflicted) {
         let conflicted: HashSet<BString> = unstaged
             .iter()
@@ -195,6 +199,7 @@ pub fn status(repo: &Repo, opts: &StatusOptions, cancel: &CancelToken) -> Result
             .map(|e| e.path.clone())
             .collect();
         staged.retain(|e| !conflicted.contains(&e.path));
+        unstaged.retain(|e| e.kind != ChangeKind::Untracked || !conflicted.contains(&e.path));
     }
     staged.sort_by(|a, b| a.path.cmp(&b.path));
     unstaged.sort_by(|a, b| a.path.cmp(&b.path));
@@ -248,23 +253,6 @@ const REFRESH_INDEX_ARGS: [&str; 5] = [
     "--unmerged",
     "--refresh",
 ];
-
-fn gix_error(err: impl std::error::Error + Send + Sync + 'static) -> GitError {
-    GitError::Other(anyhow::Error::new(err))
-}
-
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let meta = path.symlink_metadata().ok()?;
-    let mtime = meta.modified().ok()?;
-    let mtime_ns = match mtime.duration_since(UNIX_EPOCH) {
-        Ok(after) => i128::try_from(after.as_nanos()).ok()?,
-        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
-    };
-    Some(FileStamp {
-        mtime_ns,
-        size: meta.len(),
-    })
-}
 
 fn count(entries: &[StatusEntry]) -> KindCounts {
     let mut counts = KindCounts::default();

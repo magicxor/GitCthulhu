@@ -6,6 +6,8 @@
 //! batches are held back, never dropped, and delivered once after a grace period.
 
 use std::{
+    cell::RefCell,
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -73,7 +75,9 @@ impl RepoWatcher {
     ///
     /// Returns after the watches are installed. If they cannot be (for example the operating system's limit of
     /// watches is exhausted), the watcher is inert and `on_event` receives a [`WatchEvent::Error`]; the GUI should
-    /// then refresh on window focus instead. The watch strategy follows `GITCTHULHU_WATCH_MODE` (`auto`, `legacy` or
+    /// then refresh on window focus instead. A watcher that works only in part (a watch limit reached half-way, a
+    /// directory or linked worktree that cannot be watched, errors reported by the operating system) keeps running
+    /// and reports each distinct problem once as a [`WatchEvent::Error`] as well. The watch strategy follows `GITCTHULHU_WATCH_MODE` (`auto`, `legacy` or
     /// `modern`).
     pub fn start(
         repo: &Repo,
@@ -117,6 +121,7 @@ impl RepoWatcher {
             rx,
             on_event: Box::new(on_event),
             startup_error,
+            reported_errors: RefCell::default(),
         };
         let thread = std::thread::Builder::new()
             .name("gitcthulhu-watch".into())
@@ -201,6 +206,8 @@ struct Worker {
     rx: Receiver<InternalEvent>,
     on_event: Callback,
     startup_error: Option<String>,
+    /// The problems already reported, so a watcher that complains over and over is heard once.
+    reported_errors: RefCell<HashSet<String>>,
 }
 
 /// What a batch of file system events asks the GUI to reload.
@@ -208,6 +215,8 @@ struct Worker {
 struct Batch {
     refresh: RefreshSet,
     paths: Vec<PathBuf>,
+    /// Watching problems reported by the file monitor (partial watches, watcher errors).
+    errors: Vec<String>,
 }
 
 impl Batch {
@@ -289,6 +298,7 @@ impl Worker {
                     batch.add(refresh, path);
                 }
             }
+            InternalEvent::WatchError(message) => batch.errors.push(message),
             // Other checkouts are not watched for this repository.
             InternalEvent::ProjectFilesChange(Checkout::Linked(_), _)
             | InternalEvent::GitFilesChange(Checkout::Linked(_), _) => {}
@@ -308,6 +318,12 @@ impl Worker {
 
     /// Deliver a batch now, or hold it if one of our own operations is (or just was) running.
     fn handle(&self, batch: Batch) {
+        // A broken watch is not an own-operation matter: report it at once, once per distinct message.
+        for message in batch.errors {
+            if self.reported_errors.borrow_mut().insert(message.clone()) {
+                (self.on_event)(WatchEvent::Error { message });
+            }
+        }
         if batch.refresh.is_empty() {
             return;
         }
@@ -429,6 +445,46 @@ mod tests {
 
     fn map(path: &str) -> RefreshSet {
         refresh_for_git_path(Path::new(path))
+    }
+
+    #[test]
+    fn partial_watch_failures_of_the_monitor_become_error_events_once() {
+        let (tx, rx) = mpsc::channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let worker = Worker {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::default()),
+            }),
+            git_dir: PathBuf::from("git-dir"),
+            rx,
+            on_event: {
+                let seen = seen.clone();
+                Box::new(move |event| seen.lock().push(event))
+            },
+            startup_error: None,
+            reported_errors: RefCell::default(),
+        };
+        for message in ["watch limit reached", "watch limit reached", "lost events"] {
+            tx.send(InternalEvent::WatchError(message.into()))
+                .expect("the worker has the receiver");
+        }
+        let first = worker.rx.recv().expect("an event is queued");
+        let batch = worker.gather_batch(first);
+        worker.handle(batch);
+
+        let messages: Vec<_> = seen
+            .lock()
+            .iter()
+            .map(|event| match event {
+                WatchEvent::Error { message } => message.clone(),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            ["watch limit reached", "lost events"],
+            "each distinct problem of the file monitor is reported, repeats are not"
+        );
     }
 
     #[test]

@@ -31,6 +31,10 @@ pub enum InternalEvent {
     CommonGitFilesChange(Vec<PathBuf>),
     /// Paths relative to the working directory of the checkout.
     ProjectFilesChange(Checkout, Vec<PathBuf>),
+    /// Part of the watching does not work: the operating system's watch limit was reached, a directory could not
+    /// be watched, or the watcher reported an error (for example lost events). Changes may be missed; whoever
+    /// consumes the events should refresh by other means.
+    WatchError(String),
 }
 
 impl Display for InternalEvent {
@@ -55,6 +59,7 @@ impl Display for InternalEvent {
                     comma_separated_paths(paths)
                 )
             }
+            InternalEvent::WatchError(message) => write!(f, "WatchError({message})"),
         }
     }
 }

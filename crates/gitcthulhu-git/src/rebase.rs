@@ -12,11 +12,14 @@ use std::path::{Path, PathBuf};
 use gix::ObjectId;
 
 use crate::{
-    GitError, GitErrorKind, GitVersion, InProgress, OpClass, OpContext, OpOutcome, RebaseAction,
-    RebaseOptions, RebaseOutcome, RebasePlan, RebaseStep, RebaseStopReason, RefreshSet, RelaPath,
-    Repo, RepoExclusive, Result, TodoAction, TodoLine,
+    GitError, GitErrorKind, GitVersion, InProgress, OpClass, OpContext, OpOutcome, OpWarning,
+    RebaseAction, RebaseOptions, RebaseOutcome, RebasePlan, RebaseStep, RebaseStopReason,
+    RefreshSet, Repo, RepoExclusive, Result, TodoAction, TodoLine,
     cli::{self, CommandKind, EditorMode, GitCommand},
-    merge::{Collected, check_cancel, current_operation, head_commit_id},
+    error::combined_output,
+    internal::{errors::gix_error, outcome::Collected, post_state},
+    merge::{check_cancel, current_operation, head_commit_id},
+    state,
 };
 
 /// The first Git that knows `--no-update-refs`.
@@ -26,7 +29,8 @@ const UPDATE_REFS_VERSION: GitVersion = GitVersion {
     patch: 0,
 };
 
-fn other<E: std::error::Error + Send + Sync + 'static>(err: E) -> GitError {
+/// Serializing the plan is not a gix failure: [`GitError::Other`].
+fn json_error(err: serde_json::Error) -> GitError {
     GitError::Other(anyhow::Error::new(err))
 }
 
@@ -66,105 +70,12 @@ fn no_rebase() -> GitError {
 
 // ───────────────────────────── state after a command ─────────────────────────────
 
-/// `rebase-merge/` if present, else `rebase-apply/`.
-fn rebase_state_dir(repo: &Repo) -> PathBuf {
-    let merge = repo.git_dir().join("rebase-merge");
-    if merge.is_dir() {
-        merge
-    } else {
-        repo.git_dir().join("rebase-apply")
-    }
-}
+/// Changes whenever the rebase advances to another step: the number of finished steps and the position.
+type ProgressMarker = Option<(usize, Option<(u32, u32)>)>;
 
-/// Changes whenever the rebase advances to another step.
-fn progress_marker(repo: &Repo) -> Option<Vec<u8>> {
-    let dir = rebase_state_dir(repo);
-    std::fs::read(dir.join("done"))
-        .or_else(|_| std::fs::read(dir.join("next")))
-        .ok()
-}
-
-fn read_trimmed(path: &Path) -> Option<String> {
-    let text = std::fs::read(path).ok()?;
-    Some(String::from_utf8_lossy(&text).trim().to_owned())
-}
-
-/// Paths with unmerged index entries.
-fn conflicted_paths(repo: &Repo) -> Result<Vec<RelaPath>> {
-    let index = repo.local().index_or_empty().map_err(other)?;
-    let mut paths: Vec<RelaPath> = Vec::new();
-    for entry in index.entries() {
-        if entry.stage() == gix::index::entry::Stage::Unconflicted {
-            continue;
-        }
-        let path = entry.path(&index);
-        if paths
-            .last()
-            .is_none_or(|last| last.as_slice() != path.as_ref() as &[u8])
-        {
-            paths.push(path.to_owned());
-        }
-    }
-    Ok(paths)
-}
-
-fn resolve(repo: &Repo, rev: &str) -> Option<ObjectId> {
-    if rev.is_empty() {
-        return None;
-    }
-    repo.local()
-        .rev_parse_single(rev)
-        .ok()
-        .map(|id| id.detach())
-}
-
-/// The commit of the last `done` line that names one.
-fn last_done_commit(repo: &Repo) -> Option<String> {
-    let done = std::fs::read(rebase_state_dir(repo).join("done")).ok()?;
-    let done = String::from_utf8_lossy(&done);
-    let line = done
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))?;
-    let mut tokens = line.split_whitespace();
-    let command = tokens.next()?;
-    if matches!(
-        command,
-        "exec" | "x" | "break" | "b" | "label" | "l" | "reset" | "t" | "noop"
-    ) {
-        return None;
-    }
-    tokens
-        .find(|t| !t.starts_with('-') && t.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map(str::to_owned)
-}
-
-/// Why the rebase in progress stopped, derived like Git's own prompt does.
-fn stop_reason(repo: &Repo, conflicted: bool) -> RebaseStopReason {
-    if conflicted {
-        return RebaseStopReason::Conflict;
-    }
-    let dir = rebase_state_dir(repo);
-    if dir.join("amend").exists() {
-        return RebaseStopReason::Edit;
-    }
-    let done = std::fs::read(dir.join("done")).unwrap_or_default();
-    let done = String::from_utf8_lossy(&done);
-    let command = done
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .and_then(|l| l.split_whitespace().next());
-    match command {
-        Some("edit" | "e") => RebaseStopReason::Edit,
-        Some("break" | "b") => RebaseStopReason::Break,
-        Some("exec" | "x") => RebaseStopReason::ExecFailed,
-        Some(_) => RebaseStopReason::ResolvedNeedsContinue,
-        None if dir.join("next").exists() => RebaseStopReason::ResolvedNeedsContinue,
-        None => RebaseStopReason::Unknown,
-    }
+fn progress_marker(repo: &Repo) -> ProgressMarker {
+    let rebase = state::rebase_details(repo).ok().flatten()?;
+    Some((rebase.done.len(), rebase.step))
 }
 
 /// The outcome of a rebase command that exited (successfully or stopped): finished, or stopped somewhere.
@@ -174,16 +85,14 @@ fn current_outcome(repo: &Repo) -> Result<RebaseOutcome> {
             new_head: head_commit_id(repo)?,
         });
     }
-    let conflicts = conflicted_paths(repo)?;
-    let at = read_trimmed(&repo.git_dir().join("REBASE_HEAD"))
-        .and_then(|s| resolve(repo, &s))
-        .or_else(|| {
-            read_trimmed(&rebase_state_dir(repo).join("stopped-sha"))
-                .and_then(|s| resolve(repo, &s))
-        })
-        .or_else(|| last_done_commit(repo).and_then(|s| resolve(repo, &s)));
+    let conflicts = post_state::read(repo)?.conflicted;
+    let (reason, at) = match state::rebase_details(repo)? {
+        Some(rebase) => (rebase.stop_reason, rebase.stopped_at),
+        None if conflicts.is_empty() => (RebaseStopReason::Unknown, None),
+        None => (RebaseStopReason::Conflict, None),
+    };
     Ok(RebaseOutcome::Stopped {
-        reason: stop_reason(repo, !conflicts.is_empty()),
+        reason,
         at,
         conflicts,
     })
@@ -198,11 +107,16 @@ fn run_rebase(
     repo: &Repo,
     ctx: &OpContext,
     cmd: GitCommand,
-    before: Option<Option<Vec<u8>>>,
+    before: Option<ProgressMarker>,
     collected: &mut Collected,
 ) -> Result<RebaseOutcome> {
     match cli::run_checked(repo, cmd, ctx, OpClass::Rebase) {
         Ok(out) => {
+            if out.autostash_conflicted() {
+                collected.warn(OpWarning::AutostashConflict {
+                    output: combined_output(&out),
+                });
+            }
             collected.add(out);
             current_outcome(repo)
         }
@@ -217,18 +131,6 @@ fn run_rebase(
             };
             if stoppable && advanced && rebase_in_progress(repo) {
                 return current_outcome(repo);
-            }
-            // `git rebase --continue` refuses unresolved conflicts with "<path>: needs merge / You must edit all
-            // merge conflicts", a text the classifier does not know: report it like the other operations do.
-            if !advanced && err.kind() == GitErrorKind::CommandFailed && rebase_in_progress(repo) {
-                let paths = conflicted_paths(repo)?;
-                if !paths.is_empty() {
-                    return Err(GitError::Conflicts {
-                        operation: current_operation(repo),
-                        paths,
-                        stderr: err.stderr().unwrap_or_default().to_owned(),
-                    });
-                }
             }
             Err(err)
         }
@@ -325,16 +227,16 @@ pub fn plan_interactive(repo: &Repo, base: Option<ObjectId>) -> Result<RebasePla
             base.map(|b| [b]),
         )
         .build()
-        .map_err(|err| GitError::Other(anyhow::anyhow!("{err}")))?;
+        .map_err(gix_error)?;
         Some(topo)
     };
     for info in walk.into_iter().flatten() {
-        let info = info.map_err(|err| GitError::Other(anyhow::anyhow!("{err}")))?;
+        let info = info.map_err(gix_error)?;
         if info.parent_ids.len() > 1 {
             merges_dropped += 1;
             continue;
         }
-        let commit = local.find_commit(info.id).map_err(other)?;
+        let commit = local.find_commit(info.id).map_err(gix_error)?;
         let message = String::from_utf8_lossy(commit.message_raw_sloppy().as_ref()).into_owned();
         let summary = message.lines().next().unwrap_or_default().trim().to_owned();
         steps.push(RebaseStep {
@@ -348,7 +250,7 @@ pub fn plan_interactive(repo: &Repo, base: Option<ObjectId>) -> Result<RebasePla
     steps.reverse();
     Ok(RebasePlan {
         head,
-        head_ref: local.head_name().map_err(other)?,
+        head_ref: local.head_name().map_err(gix_error)?,
         base,
         steps,
         merges_dropped,
@@ -492,14 +394,14 @@ fn write_plan_dir(repo: &Repo, plan: &RebasePlan) -> Result<PathBuf> {
     // `plan.json` also marks the rebase as started by us (`RebaseState::started_by_us`), so it is written in every
     // build; without the `serde` feature it carries only the ids.
     #[cfg(feature = "serde")]
-    let json = serde_json::to_vec_pretty(plan).map_err(other)?;
+    let json = serde_json::to_vec_pretty(plan).map_err(json_error)?;
     #[cfg(not(feature = "serde"))]
     let json = serde_json::to_vec_pretty(&serde_json::json!({
         "head": plan.head.to_string(),
         "base": plan.base.map(|id| id.to_string()),
         "steps": plan.steps.iter().map(|s| s.commit.to_string()).collect::<Vec<_>>(),
     }))
-    .map_err(other)?;
+    .map_err(json_error)?;
     let path = dir.join("plan.json");
     std::fs::write(&path, json).map_err(io(&path))?;
     Ok(dir)
@@ -526,7 +428,7 @@ pub fn start_interactive(
     }
     // A different branch at the same commit counts as moved: the rebase would rewrite the wrong branch.
     if head_commit_id(repo)? != plan.head
-        || repo.local().head_name().map_err(other)? != plan.head_ref
+        || repo.local().head_name().map_err(gix_error)? != plan.head_ref
     {
         return Err(GitError::RebasePlanStale {
             detail: "HEAD moved".to_owned(),
@@ -568,7 +470,9 @@ pub fn start_interactive(
 
     if dir.join("mismatch").exists() {
         if rebase_in_progress(repo) {
-            let abort = GitCommand::new(repo, CommandKind::Mutation).args(["rebase", "--abort"]);
+            let abort = GitCommand::new(repo, CommandKind::Mutation)
+                .with_hooks()
+                .args(["rebase", "--abort"]);
             // The plan is already refused; a failing abort must not hide that.
             cli::run_checked(repo, abort, ctx, OpClass::Rebase).ok();
         }
@@ -593,7 +497,9 @@ pub fn start_interactive(
 
 /// Make the message of the stopped step available to the editor helper.
 fn stage_message(repo: &Repo, message: &str) -> Result<()> {
-    let Some(sha) = last_done_commit(repo).and_then(|s| resolve(repo, &s)) else {
+    let Some(sha) = state::rebase_details(repo)?
+        .and_then(|rebase| rebase.done.last().and_then(|line| line.commit))
+    else {
         return Ok(());
     };
     let dir = plan_dir(repo).join("messages");
@@ -681,35 +587,6 @@ pub fn abort_rebase(
 
 // ───────────────────────────── editing the remaining todo ─────────────────────────────
 
-/// Todo commands Git knows, long and abbreviated.
-const TODO_COMMANDS: &[&str] = &[
-    "pick",
-    "p",
-    "reword",
-    "r",
-    "edit",
-    "e",
-    "squash",
-    "s",
-    "fixup",
-    "f",
-    "exec",
-    "x",
-    "break",
-    "b",
-    "drop",
-    "d",
-    "label",
-    "l",
-    "reset",
-    "t",
-    "merge",
-    "m",
-    "update-ref",
-    "u",
-    "noop",
-];
-
 fn invalid_todo_line(line: &str) -> GitError {
     GitError::InvalidName {
         what: "rebase todo line",
@@ -717,32 +594,37 @@ fn invalid_todo_line(line: &str) -> GitError {
     }
 }
 
-/// Whether `text` is one todo line Git accepts: a comment, or a known command with the argument it needs
-/// (`fixup -C|-c` needs a commit after the flag). A line break would smuggle in unchecked lines.
+/// Whether `text` is one todo line Git accepts: a comment, or a known command (`state::parse_todo_line`) with the
+/// argument it needs (a commit, a label or a command; `fixup -C|-c` needs a commit after the flag). A line break
+/// would smuggle in unchecked lines.
 fn is_valid_todo_line(text: &str) -> bool {
     if text.contains(['\n', '\r']) {
         return false;
     }
-    let text = text.trim();
-    if text.starts_with('#') {
-        return true;
-    }
-    let mut tokens = text.split_whitespace();
-    let Some(command) = tokens.next() else {
+    let Some(line) = state::parse_todo_line(text) else {
         return false;
     };
-    if !TODO_COMMANDS.contains(&command) {
-        return false;
-    }
-    if matches!(command, "break" | "b" | "noop") {
-        return true;
-    }
-    match tokens.next() {
-        None => false,
-        Some("-C" | "-c") if matches!(command, "fixup" | "f" | "merge" | "m") => {
-            tokens.next().is_some()
+    match line.action {
+        TodoAction::Comment | TodoAction::Break | TodoAction::Noop => true,
+        TodoAction::Unknown(_) => false,
+        TodoAction::Pick
+        | TodoAction::Revert
+        | TodoAction::Reword
+        | TodoAction::Edit
+        | TodoAction::Squash
+        | TodoAction::Fixup(_)
+        | TodoAction::Drop => line.abbrev.is_some(),
+        // `merge [-C <commit> | -c <commit>] <label>`: the label is required, and a flag needs its commit.
+        TodoAction::Merge => {
+            let (first, _) = line
+                .rest
+                .split_once(' ')
+                .unwrap_or((line.rest.as_str(), ""));
+            !line.rest.is_empty() && !matches!(first, "-C" | "-c")
         }
-        Some(_) => true,
+        TodoAction::Exec | TodoAction::Label | TodoAction::Reset | TodoAction::UpdateRef => {
+            !line.rest.is_empty()
+        }
     }
 }
 
@@ -763,6 +645,7 @@ fn render_todo_text(line: &TodoLine) -> Result<String> {
     }
     let (word, flag) = match &line.action {
         TodoAction::Pick => ("pick", None),
+        TodoAction::Revert => ("revert", None),
         TodoAction::Reword => ("reword", None),
         TodoAction::Edit => ("edit", None),
         TodoAction::Squash => ("squash", None),
@@ -793,6 +676,7 @@ fn render_todo_text(line: &TodoLine) -> Result<String> {
     } else if matches!(
         line.action,
         TodoAction::Pick
+            | TodoAction::Revert
             | TodoAction::Reword
             | TodoAction::Edit
             | TodoAction::Squash
@@ -948,6 +832,9 @@ mod tests {
             "noop",
             "# a comment",
             "update-ref refs/heads/x",
+            "merge -C abc123 topic",
+            "merge topic",
+            "label onto",
         ] {
             assert!(
                 is_valid_todo_line(valid),
@@ -959,6 +846,10 @@ mod tests {
             "pick",
             "fixup -C",
             "exec",
+            "merge",
+            "merge -C",
+            "merge -C abc123",
+            "label",
             "frobnicate abc123",
             "pick abc123 one\npick def456 two",
             "pick abc123 x\r",

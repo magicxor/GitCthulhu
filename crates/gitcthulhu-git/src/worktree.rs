@@ -6,7 +6,8 @@ use crate::{
     GitError, HeadState, OpClass, OpContext, OpOutcome, RefreshSet, Repo, RepoExclusive, Result,
     StartPoint, WorktreeAddOptions, WorktreeInfo, WorktreeTarget,
     cli::{CommandKind, GitCommand},
-    config::{other, run_one},
+    config::other,
+    internal::{errors::gix_error, names, outcome::run_one},
 };
 
 pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
@@ -18,7 +19,7 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
 
 /// HEAD of `repo` as the backend's own type.
 pub(crate) fn head_state(repo: &gix::Repository) -> Result<HeadState> {
-    let head = repo.head().map_err(other)?;
+    let head = repo.head().map_err(gix_error)?;
     let name = head.referent_name().map(|name| name.to_owned());
     if head.is_unborn() {
         let name = name.ok_or_else(|| other("unborn HEAD without a name"))?;
@@ -37,7 +38,7 @@ pub(crate) fn head_state(repo: &gix::Repository) -> Result<HeadState> {
 /// All worktrees: the main one (`id = None`) and the linked ones. gix: `repo.main_repo()?.worktrees()`.
 pub fn list(repo: &Repo) -> Result<Vec<WorktreeInfo>> {
     let local = repo.local();
-    let main = local.main_repo().map_err(other)?;
+    let main = local.main_repo().map_err(gix_error)?;
     let mut out = Vec::new();
     let bare = main.workdir().is_none();
     out.push(WorktreeInfo {
@@ -53,8 +54,8 @@ pub fn list(repo: &Repo) -> Result<Vec<WorktreeInfo>> {
         bare,
     });
     let mut linked = Vec::new();
-    for proxy in main.worktrees().map_err(other)? {
-        let id = proxy.id().map_err(other)?.to_string();
+    for proxy in main.worktrees().map_err(gix_error)? {
+        let id = proxy.id().map_err(gix_error)?.to_string();
         let git_dir = proxy.git_dir().to_owned();
         let base = proxy.base().ok();
         let locked = proxy.is_locked().then(|| {
@@ -176,27 +177,8 @@ pub fn add(
             name,
             start: start_point,
         } => {
-            let valid =
-                gix::validate::reference::name_partial(bstr::ByteSlice::as_bstr(name.as_bytes()))
-                    .is_ok();
-            if !valid || name.starts_with('-') {
-                return Err(GitError::InvalidName {
-                    what: "branch",
-                    name: name.clone(),
-                });
-            }
-            let full = format!("refs/heads/{name}");
-            if repo
-                .local()
-                .try_find_reference(full.as_str())
-                .map_err(other)?
-                .is_some()
-            {
-                return Err(GitError::AlreadyExists {
-                    what: "branch",
-                    name: name.clone(),
-                });
-            }
+            // Before spawning: Git would create the branch and then fail on the path.
+            names::new_branch(&repo.local(), name)?;
             cmd = cmd.arg("-b").arg(name);
             start = match start_point {
                 StartPoint::Head => None,
@@ -252,22 +234,8 @@ pub fn remove(
         }
     }
     cmd = cmd.arg("--").arg(&entry.path);
-    let acc = run_one(repo, cmd, ctx, OpClass::Worktree).map_err(dirty_worktree_error)?;
+    let acc = run_one(repo, cmd, ctx, OpClass::Worktree)?;
     Ok(acc.finish(id, RefreshSet::WORKTREES | RefreshSet::BRANCHES))
-}
-
-/// `git worktree remove` refuses a dirty worktree (or one with submodules) without `--force`; the GUI then offers
-/// force, so this is reported as [`GitError::UncommittedChanges`] rather than a generic failure.
-fn dirty_worktree_error(err: GitError) -> GitError {
-    match err {
-        GitError::CommandFailed { stderr, .. }
-            if stderr.contains("contains modified or untracked files")
-                || stderr.contains("containing submodules cannot be moved or removed") =>
-        {
-            GitError::UncommittedChanges { stderr }
-        }
-        err => err,
-    }
 }
 
 /// Returns the ids of pruned worktrees (ids listed by gix before minus after); the GUI clears their oplog chains.

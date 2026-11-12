@@ -275,8 +275,8 @@ impl CancelToken {
         }
     }
 
-    /// A future that completes when cancelled (used internally by cli.rs; not part of the stable API surface).
-    #[doc(hidden)]
+    /// A future that completes when cancelled, for async callers that want to select on it (the executor does).
+    /// Dropping the future unregisters its waker.
     pub fn cancelled(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
         Cancelled {
             token: self,
@@ -434,6 +434,12 @@ pub enum OpWarning {
         /// stderr + stdout of the git command.
         output: String,
     },
+    /// The operation finished, but re-applying the autostash (`pull --rebase --autostash`, `rebase --autostash`)
+    /// conflicted: the local changes are still in the stash and the worktree has conflict markers.
+    AutostashConflict {
+        /// stderr + stdout of the git command (Git's own explanation).
+        output: String,
+    },
 }
 
 /// What happened while an operation ran.
@@ -443,8 +449,6 @@ pub struct CommandLog {
     pub commands: Vec<CommandRecord>,
     /// The hooks Git ran.
     pub hooks: Vec<HookRun>,
-    /// Lock files deleted after a cancelled command.
-    pub removed_stale_locks: Vec<PathBuf>,
 }
 
 /// One executed git command.
@@ -469,6 +473,10 @@ pub struct HookRun {
     pub exit_code: Option<i32>,
     /// Duration in milliseconds.
     pub duration_ms: u64,
+    /// The phase Git passed to a hook that runs in several phases: `reference-transaction` gets `preparing`,
+    /// `prepared`, `committed` or `aborted`. Git ignores the exit code of the last two, so the phase decides whether
+    /// a failure vetoed the operation. `None` for every other hook.
+    pub phase: Option<String>,
 }
 
 // ───────────────────────────── repository state ─────────────────────────────
@@ -697,6 +705,8 @@ pub struct TodoLine {
 pub enum TodoAction {
     /// `pick`.
     Pick,
+    /// `revert` (a sequencer todo of `git revert`).
+    Revert,
     /// `reword`.
     Reword,
     /// `edit`.
@@ -1657,8 +1667,11 @@ pub struct TagInfo {
     pub name: String,
     /// The full ref name.
     pub full: FullName,
-    /// The peeled commit.
+    /// The object the tag finally points at: a commit for ordinary tags (the id of its commit), but a tree or blob
+    /// for the few tags Git allows on those (see [`TagInfo::peeled_kind`]).
     pub target: ObjectId,
+    /// The kind of `target`. Only tags of commits are decorations of the graph.
+    pub peeled_kind: gix::object::Kind,
     /// The tag object, for annotated tags.
     pub tag_object: Option<ObjectId>,
     /// First line of the tag message.
@@ -2332,14 +2345,24 @@ pub enum BlameRev {
 }
 
 /// Options of `blame::blame`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BlameOptions {
-    /// Default true.
+    /// Follow a file across renames. Default true.
     pub follow_renames: bool,
     /// Ignore commits before this time.
     pub since: Option<GitTime>,
     /// Restrict to these lines.
     pub line_range: Option<Range<u32>>,
+}
+
+impl Default for BlameOptions {
+    fn default() -> Self {
+        BlameOptions {
+            follow_renames: true,
+            since: None,
+            line_range: None,
+        }
+    }
 }
 
 /// The result of a blame.

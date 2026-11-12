@@ -18,7 +18,7 @@ members = [
     "crates/gitcthulhu",          # The GitCthulhu GUI (gpui-kit): app, helper binaries (askpass, editor).
 
     # Git CLI executor, credential prompts and file watching.
-    "crates/gitbutler-git",         # Run fetch/push/clone through the Git CLI, with askpass support (+ askpass binary).
+    "crates/gitbutler-git",         # Git CLI helpers: askpass harness (session, wire protocol) and transport defaults; no helper binary.
     "crates/but-askpass",           # Broker prompts from Git back to the application.
     "crates/gitbutler-filemonitor", # Watch worktrees for changes (vendors a notify debouncer).
 

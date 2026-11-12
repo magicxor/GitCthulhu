@@ -6,8 +6,9 @@
 //!   covered. The race window between spawn and assignment is accepted.
 //! - *Unix*: the child is spawned with `process_group(0)`. Cancel sends `killpg(SIGTERM)`, then `SIGKILL` after 3 s.
 //!
-//! After a cancelled command, lock files it may have left are deleted, but only if they are provably the ones that
-//! existed right before the kill (same file id, mtime and size), see [`remove_stale_locks`].
+//! After a cancelled command, lock files it may have left are deleted, but only if they are provably its own: they
+//! did not exist before the command was spawned, they were created since, they are unchanged since right before
+//! the kill (same file id, mtime and size) and no other process holds them open, see [`remove_stale_locks`].
 #![allow(unsafe_code)] // Job Object FFI (Windows) and file ids (Windows); see the crate docs.
 
 use std::{
@@ -30,8 +31,8 @@ const LOCK_FILES: &[&str] = &[
     "shallow.lock",
 ];
 /// A lock counts as created by the command if its mtime is at most this much older than the command's start.
-/// Covers file systems with coarse timestamps (FAT: 2 s); a foreign Git holding the same lock at that time would
-/// have made our command fail at once instead of running long enough to be cancelled.
+/// Covers file systems with coarse timestamps (FAT: 2 s) and kernels whose cached clock lags behind the wall clock.
+/// A lock that already existed when the command was spawned is excluded by [`snapshot_locks`], not by the time.
 const MTIME_SLACK: Duration = Duration::from_secs(2);
 
 /// The process tree of one spawned git child.
@@ -169,44 +170,83 @@ struct Identity {
     size: u64,
 }
 
-/// The lock files that exist in `dirs` and were created since `started` (minus [`MTIME_SLACK`]). Call right before
-/// terminating the process tree.
-pub(crate) fn observe_locks(dirs: &[PathBuf], started: SystemTime) -> Vec<LockObservation> {
-    let mut seen_dirs: Vec<&Path> = Vec::new();
-    let mut out = Vec::new();
-    for dir in dirs {
-        if seen_dirs.contains(&dir.as_path()) {
-            continue;
-        }
-        seen_dirs.push(dir);
-        for name in LOCK_FILES {
-            let path = dir.join(name);
-            let Some(identity) = identity(&path) else {
-                continue;
-            };
-            if identity.mtime + MTIME_SLACK >= started {
-                out.push(LockObservation { path, identity });
-            }
-        }
-    }
-    out
+/// A lock file that existed before the command was spawned: it belongs to somebody else.
+#[derive(Debug, Clone)]
+pub(crate) struct PreexistingLock {
+    path: PathBuf,
+    id: FileId,
 }
 
-/// Delete every observed lock file that still exists with the **same** file id, mtime and size; a lock that a
-/// terminal `git` created in the meantime is never touched. Returns the deleted paths.
+/// The lock files that exist in `dirs` right now. Call right before spawning the command.
+pub(crate) fn snapshot_locks(dirs: &[PathBuf]) -> Vec<PreexistingLock> {
+    candidates(dirs)
+        .filter_map(|path| {
+            let identity = identity(&path)?;
+            Some(PreexistingLock {
+                path,
+                id: identity.id,
+            })
+        })
+        .collect()
+}
+
+/// Every candidate lock file path in `dirs` (a directory listed twice is visited once).
+fn candidates(dirs: &[PathBuf]) -> impl Iterator<Item = PathBuf> + '_ {
+    let mut seen_dirs: Vec<&Path> = Vec::new();
+    dirs.iter()
+        .filter(move |dir| {
+            if seen_dirs.contains(&dir.as_path()) {
+                false
+            } else {
+                seen_dirs.push(dir);
+                true
+            }
+        })
+        .flat_map(|dir| LOCK_FILES.iter().map(move |name| dir.join(name)))
+}
+
+/// The lock files that exist in `dirs`, were created since `started` (minus [`MTIME_SLACK`]) and are not in `before`
+/// (the locks that existed when the command was spawned). Call right before terminating the process tree.
+pub(crate) fn observe_locks(
+    dirs: &[PathBuf],
+    started: SystemTime,
+    before: &[PreexistingLock],
+) -> Vec<LockObservation> {
+    candidates(dirs)
+        .filter_map(|path| {
+            let identity = identity(&path)?;
+            let existed_before = before
+                .iter()
+                .any(|lock| lock.path == path && lock.id == identity.id);
+            (!existed_before && identity.mtime + MTIME_SLACK >= started)
+                .then_some(LockObservation { path, identity })
+        })
+        .collect()
+}
+
+/// Delete every observed lock file that still exists with the **same** file id, mtime and size and that no other
+/// process holds open; a lock that a terminal `git` created in the meantime, or that it is still working with, is
+/// never touched. Returns the deleted paths. Call after the process tree is gone, so that only foreign processes
+/// can still hold a lock.
 pub(crate) fn remove_stale_locks(observed: &[LockObservation]) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     for lock in observed {
         match identity(&lock.path) {
-            Some(now) if now == lock.identity => match std::fs::remove_file(&lock.path) {
-                Ok(()) => {
-                    tracing::info!(path = %lock.path.display(), "Removed a lock file left by a cancelled git command");
-                    removed.push(lock.path.clone());
+            Some(now) if now == lock.identity => {
+                if held_open_by_another_process(&lock.path) {
+                    tracing::info!(path = %lock.path.display(), "Lock file is in use by another process; keeping it");
+                    continue;
                 }
-                Err(err) => {
-                    tracing::warn!(path = %lock.path.display(), %err, "Could not remove a stale lock file");
+                match std::fs::remove_file(&lock.path) {
+                    Ok(()) => {
+                        tracing::info!(path = %lock.path.display(), "Removed a lock file left by a cancelled git command");
+                        removed.push(lock.path.clone());
+                    }
+                    Err(err) => {
+                        tracing::warn!(path = %lock.path.display(), %err, "Could not remove a stale lock file");
+                    }
                 }
-            },
+            }
             Some(_) => {
                 tracing::info!(path = %lock.path.display(), "Lock file was replaced after the kill; keeping it");
             }
@@ -214,6 +254,60 @@ pub(crate) fn remove_stale_locks(observed: &[LockObservation]) -> Vec<PathBuf> {
         }
     }
     removed
+}
+
+/// Whether some process has `path` open. A git that is still working holds its lock file open until it renames or
+/// deletes it, while the lock of a killed git is orphaned. Where this cannot be determined (macOS and other Unixes
+/// without `/proc`) the answer is `false`; the other conditions of [`remove_stale_locks`] still apply there.
+fn held_open_by_another_process(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        // Asking for no sharing at all fails while any other handle is open, whatever its own share mode.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(_) => false,
+            Err(err) => matches!(
+                err.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+            ),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(target) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        procs
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            })
+            .any(|entry| {
+                let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+                    return false;
+                };
+                fds.filter_map(Result::ok)
+                    .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|link| link == target))
+            })
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// The git directories of the repository whose work tree (or bare git dir) is `cwd`, for commands run without a
@@ -381,7 +475,11 @@ mod tests {
         let started = SystemTime::now();
         let lock = dir.path().join("index.lock");
         std::fs::write(&lock, b"partial index").expect("lock can be written");
-        let observed = observe_locks(&[dir.path().to_owned(), dir.path().to_owned()], started);
+        let observed = observe_locks(
+            &[dir.path().to_owned(), dir.path().to_owned()],
+            started,
+            &[],
+        );
         assert_eq!(
             observed.len(),
             1,
@@ -402,7 +500,7 @@ mod tests {
         let started = SystemTime::now();
         let lock = dir.path().join("HEAD.lock");
         std::fs::write(&lock, b"old").expect("lock can be written");
-        let observed = observe_locks(&[dir.path().to_owned()], started);
+        let observed = observe_locks(&[dir.path().to_owned()], started, &[]);
         assert_eq!(observed.len(), 1, "the lock is observed");
 
         // Keep the old file alive under another name so its file id cannot be reused by the new one.
@@ -421,8 +519,56 @@ mod tests {
         std::fs::write(dir.path().join("index.lock"), b"x").expect("lock can be written");
         let much_later = SystemTime::now() + Duration::from_secs(3600);
         assert!(
-            observe_locks(&[dir.path().to_owned()], much_later).is_empty(),
+            observe_locks(&[dir.path().to_owned()], much_later, &[]).is_empty(),
             "a lock older than the command belongs to someone else"
+        );
+    }
+
+    #[test]
+    fn locks_that_existed_before_the_spawn_are_not_observed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dirs = [dir.path().to_owned()];
+        let foreign = dir.path().join("index.lock");
+        std::fs::write(&foreign, b"a terminal git's index").expect("lock can be written");
+        let before = snapshot_locks(&dirs);
+        assert_eq!(before.len(), 1, "the pre-existing lock is recorded");
+        std::fs::write(dir.path().join("HEAD.lock"), b"ours").expect("second lock");
+
+        let observed = observe_locks(&dirs, SystemTime::now() - Duration::from_secs(60), &before);
+        assert_eq!(
+            observed.len(),
+            1,
+            "only the lock created after the snapshot is observed, although both are recent"
+        );
+        assert!(
+            remove_stale_locks(&observed)
+                .iter()
+                .all(|path| path.ends_with("HEAD.lock")),
+            "the pre-existing lock is never deleted"
+        );
+        assert!(foreign.exists(), "the foreign lock survives");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn lock_held_open_by_another_process_is_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lock = dir.path().join("index.lock");
+        std::fs::write(&lock, b"being written").expect("lock can be written");
+        let observed = observe_locks(&[dir.path().to_owned()], SystemTime::now(), &[]);
+        assert_eq!(observed.len(), 1, "the lock is observed");
+
+        let holder = std::fs::File::open(&lock).expect("the lock can be held open");
+        assert!(
+            remove_stale_locks(&observed).is_empty(),
+            "a lock somebody still has open is kept"
+        );
+        assert!(lock.exists(), "the held lock survives");
+        drop(holder);
+        assert_eq!(
+            remove_stale_locks(&observed),
+            std::slice::from_ref(&lock),
+            "once nobody holds it, it is an orphan and goes"
         );
     }
 

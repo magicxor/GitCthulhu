@@ -510,6 +510,38 @@ fn no_not_implemented_stubs_remain() {
         }
     }
     let mut hits = Vec::new();
-    visit(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hits);
+    visit(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut hits,
+    );
     assert!(hits.is_empty(), "stub markers are left in: {hits:?}");
+}
+
+#[test]
+fn defaults_and_async_cancellation_are_usable() {
+    assert!(
+        BlameOptions::default().follow_renames,
+        "blame follows renames unless asked not to"
+    );
+
+    // `cancelled()` is public API: async callers (gitcthulhu-services) select on it.
+    let token = CancelToken::new();
+    let canceller = {
+        let token = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            token.cancel();
+        })
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(20), token.cancelled())
+            .await
+            .expect("the future completes once the token is cancelled");
+    });
+    canceller.join().expect("the canceller thread ends");
+    assert!(token.is_cancelled(), "the token stays cancelled");
 }

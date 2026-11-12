@@ -8,7 +8,8 @@ them. Do not apply them to generated, vendored, or fixture data unless the task 
 Fixed decisions (owner-approved). The virtual-branch code is gone; the new crates are being built.
 
 - **Git core**: `but-core` (to be slimmed of GitButler-only concepts), `but-error`, `but-serde`, `but-schemars`,
-  `but-project-handle`, `but-path`, `but-utils`, `gitbutler-git` (Git CLI executor + askpass helper binary),
+  `but-project-handle`, `but-path`, `but-utils`, `gitbutler-git` (askpass harness and transport defaults used by the `gitcthulhu-git` executor; the
+  `gitcthulhu-askpass` and `gitcthulhu-editor` helper programs ship with the `gitcthulhu` package),
   `but-askpass`, `gitbutler-filemonitor`, `but-testsupport`, `but-debugging`.
 - **Preserved capabilities**: forge integrations (`but-forge`, `but-forge-storage`, `but-github`, `but-gitlab`,
   `but-bitbucket`, `but-secret`), AI (`but-llm`), embedded terminal (`but-tty`), installer and updater
@@ -27,7 +28,9 @@ Fixed decisions (owner-approved). The virtual-branch code is gone; the new crate
 - **Mutations** (commit, checkout, merge, rebase, cherry-pick, revert, reset, stash, tag, branch, remote,
   submodule, worktree, clone, fetch, pull, push): the `git` executable, with askpass-based credential prompts.
   Hooks must run natively; never pass `--no-verify` and surface hook output and failures to the user.
-- Hunk/line staging: build a patch and apply it with `git apply --cached` (or `-R` to discard).
+- Whole-file staging, unstaging and discarding run `git add`/`git restore`/`git rm`. Hunk and line staging is an
+  in-process index edit (the new blob is the old image plus the selected line edits, written under `index.lock`
+  after a stale check); discarding selected lines writes the worktree file back through the filter pipeline.
 - No `git2`/libgit2 in new code. Treat existing `git2` use as legacy to be removed.
 
 ## Code Shape and Naming

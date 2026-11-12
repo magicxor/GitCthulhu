@@ -45,8 +45,14 @@ const SCRUBBED_ENV: &[&str] = &[
 /// Prefixes of further inherited variables that carry `-c` overrides into a child git.
 const SCRUBBED_ENV_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
 
+/// Keys that only the global gitconfig of the fixtures sets. They are *not* injected into gix opens as overrides,
+/// because an override beats the repository's own configuration: a test that runs `git config core.autocrlf true` in
+/// its repository must see that value through gix as well (gix's default for an unset `core.autocrlf` is `false`,
+/// the value of the global file). See [`TestRepo::open_with_autocrlf`].
+const GLOBAL_FILE_ONLY: &[&str] = &["core.autocrlf"];
+
 /// Settings every fixture repository gets (also applied to gix opens, which do not read the global file when
-/// isolated).
+/// isolated, except for [`GLOBAL_FILE_ONLY`]).
 const BASE_CONFIG: &[(&str, &str)] = &[
     ("user.name", "Test User"),
     ("user.email", "test@example.com"),
@@ -120,6 +126,7 @@ impl TestEnv {
                 global_config: global_config.to_owned(),
                 overrides: BASE_CONFIG
                     .iter()
+                    .filter(|(key, _)| !GLOBAL_FILE_ONLY.contains(key))
                     .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                     .collect(),
             }),
@@ -349,6 +356,16 @@ impl TestRepo {
 
     /// Feed a generated `git fast-import` stream (big graphs: 10k-100k commits, octopus merges, many tags).
     pub fn fast_import(&self, stream: &[u8]) {
+        let stream = stream.to_vec();
+        self.fast_import_with(move |stdin| stdin.write_all(&stream));
+    }
+
+    /// Like [`TestRepo::fast_import`], but `produce` writes the stream piece by piece, so a stream of hundreds of
+    /// megabytes never has to exist in memory.
+    pub fn fast_import_with(
+        &self,
+        produce: impl FnOnce(&mut std::process::ChildStdin) -> std::io::Result<()> + Send + 'static,
+    ) {
         let mut cmd = self.command(&["fast-import", "--quiet"]);
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -357,8 +374,7 @@ impl TestRepo {
             .spawn()
             .expect("git fast-import can be spawned");
         let mut stdin = child.stdin.take().expect("stdin is piped");
-        let stream = stream.to_vec();
-        let writer = std::thread::spawn(move || stdin.write_all(&stream));
+        let writer = std::thread::spawn(move || produce(&mut stdin));
         let output = child.wait_with_output().expect("fast-import finishes");
         writer
             .join()
@@ -369,6 +385,13 @@ impl TestRepo {
             "fast-import failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Set `core.autocrlf` in the repository's own configuration and open it: both the `git` children and the gix
+    /// reads of the backend see `value` (`"true"`, `"input"`, `"false"`).
+    pub fn open_with_autocrlf(&self, value: &str) -> Repo {
+        self.git(&["config", "core.autocrlf", value]);
+        self.open()
     }
 
     /// Open the repository with the backend under test.

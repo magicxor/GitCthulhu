@@ -10,8 +10,9 @@ use std::{
 
 use gitcthulhu_git::{
     CancelToken, CloneOptions, FetchOptions, FetchTarget, ForceMode, GitError, GitErrorKind,
-    MergeOutcome, MergeOutcomeOrRebase, NoPrompter, OpContext, Progress, PullMode, PullOptions,
-    PushOptions, PushRefSpec, PushRefStatus, RefreshSet, Result, TagFetch, TagPush, network,
+    MergeOutcome, MergeOutcomeOrRebase, NoPrompter, OpContext, OpWarning, Progress, PullMode,
+    PullOptions, PushOptions, PushRefSpec, PushRefStatus, RebaseOutcome, RefreshSet, Result,
+    TagFetch, TagPush, network,
 };
 use support::{TestEnv, TestRepo};
 
@@ -630,6 +631,41 @@ fn pull_rebase_clean() {
         w.work.git(&["rev-list", "--merges", "--count", "HEAD"]),
         "0",
         "history is linear"
+    );
+}
+
+#[test]
+fn pull_rebase_autostash_conflict_is_a_warning() {
+    let w = world();
+    let other = w.other("other");
+    other.write("a.txt", "from other\n");
+    other.commit_all("other");
+    other.git(&["push", "-q", "origin", "main"]);
+    // An uncommitted change to the same line: re-applying the autostash after the rebase conflicts.
+    w.work.write("a.txt", "dirty\n");
+    let repo = w.work.open();
+    let mut guard = w.work.exclusive(&repo);
+    let mut opts = pull_opts(PullMode::Rebase);
+    opts.autostash = true;
+    let out = network::pull(&repo, guard.write_permission(), &ctx_of(&w.work), &opts)
+        .expect("the pull itself succeeds");
+    assert!(
+        matches!(
+            out.value,
+            MergeOutcomeOrRebase::Rebase(RebaseOutcome::Completed { .. })
+        ),
+        "the rebase completed: {:?}",
+        out.value
+    );
+    assert!(
+        matches!(&out.warnings[..], [OpWarning::AutostashConflict { output }] if !output.is_empty()),
+        "the conflicting autostash is reported: {:?}",
+        out.warnings
+    );
+    assert_eq!(
+        w.work.git(&["stash", "list"]).lines().count(),
+        1,
+        "the local changes are still in the stash"
     );
 }
 

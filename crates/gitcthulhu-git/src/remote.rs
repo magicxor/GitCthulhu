@@ -7,28 +7,17 @@ use crate::{
     ForgeRemotes, GitError, OpClass, OpContext, OpOutcome, RefreshSet, RemoteRef, Repo,
     RepoExclusive, Result,
     cli::{CommandKind, GitCommand},
-    config::{OpAccumulator, other, run_one},
+    config::other,
+    internal::{
+        names,
+        outcome::{Collected, run_one},
+    },
 };
 
 const REMOTE_MUTATED: RefreshSet = RefreshSet::REMOTES.union(RefreshSet::CONFIG);
 const REMOTE_RENAMED: RefreshSet = REMOTE_MUTATED
     .union(RefreshSet::BRANCHES)
     .union(RefreshSet::LOG);
-
-fn check_name(name: &str) -> Result<()> {
-    let valid = !name.is_empty()
-        && !name.starts_with('-')
-        && !name.chars().any(|c| c.is_whitespace() || c.is_control())
-        && gix::validate::reference::name_partial(name.as_bytes().as_bstr()).is_ok();
-    if valid {
-        Ok(())
-    } else {
-        Err(GitError::InvalidName {
-            what: "remote",
-            name: name.to_owned(),
-        })
-    }
-}
 
 fn check_url(url: &str) -> Result<()> {
     if url.trim().is_empty() || url.starts_with('-') {
@@ -48,7 +37,7 @@ fn remote_exists(repo: &Repo, name: &str) -> bool {
 }
 
 fn require_remote(repo: &Repo, name: &str) -> Result<()> {
-    check_name(name)?;
+    names::remote_name(name)?;
     if remote_exists(repo, name) {
         Ok(())
     } else {
@@ -60,7 +49,9 @@ fn require_remote(repo: &Repo, name: &str) -> Result<()> {
 }
 
 fn git(repo: &Repo) -> GitCommand {
-    GitCommand::new(repo, CommandKind::Mutation).arg("remote")
+    GitCommand::new(repo, CommandKind::Mutation)
+        .with_hooks()
+        .arg("remote")
 }
 
 /// `git remote add`.
@@ -74,7 +65,7 @@ pub fn add_remote(
 ) -> Result<OpOutcome<()>> {
     let _ = perm;
     ctx.cancel.check()?;
-    check_name(name)?;
+    names::remote_name(name)?;
     check_url(fetch_url)?;
     if let Some(push) = push_url {
         check_url(push)?;
@@ -104,11 +95,11 @@ pub fn add_remote(
 }
 
 fn push_all(
-    mut acc: OpAccumulator,
+    mut acc: Collected,
     repo: &Repo,
     cmd: GitCommand,
     ctx: &OpContext,
-) -> Result<OpAccumulator> {
+) -> Result<Collected> {
     acc.push(crate::cli::run_checked(repo, cmd, ctx, OpClass::Remote)?);
     Ok(acc)
 }
@@ -177,7 +168,7 @@ pub fn rename_remote(
 ) -> Result<OpOutcome<()>> {
     let _ = perm;
     ctx.cancel.check()?;
-    check_name(new)?;
+    names::remote_name(new)?;
     require_remote(repo, old)?;
     if remote_exists(repo, new) {
         return Err(GitError::AlreadyExists {
@@ -187,7 +178,9 @@ pub fn rename_remote(
     }
     let acc = run_one(
         repo,
-        git(repo).args(["rename", "--", old, new]),
+        // No `--`: `git remote rename|remove` of Git 2.34 does not accept it. Both names are checked not to start
+        // with a dash (`names::remote_name` for the new one, `require_remote` found the old one).
+        git(repo).args(["rename", old, new]),
         ctx,
         OpClass::Remote,
     )?;
@@ -205,12 +198,7 @@ pub fn remove_remote(
     let _ = perm;
     ctx.cancel.check()?;
     require_remote(repo, name)?;
-    let acc = run_one(
-        repo,
-        git(repo).args(["remove", "--", name]),
-        ctx,
-        OpClass::Remote,
-    )?;
+    let acc = run_one(repo, git(repo).args(["remove", name]), ctx, OpClass::Remote)?;
     repo.reload()?;
     Ok(acc.finish((), REMOTE_RENAMED))
 }

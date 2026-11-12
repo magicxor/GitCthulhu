@@ -15,7 +15,7 @@ use std::{
 };
 
 use gitbutler_git::askpass_harness::{
-    AskpassError, AskpassSession, HarnessLocation, http_stall_limit_args, ssh_env,
+    AskpassError, AskpassSession, HarnessLocation, http_stall_limit_args, ssh_env_in,
 };
 
 use crate::{
@@ -26,15 +26,32 @@ use crate::{
 /// Environment and `-c` arguments every Mutation and Network command gets from the harness (§1.7): the default
 /// `GIT_SSH_COMMAND` unless the user configured ssh, and `-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60` for keys the
 /// user has not set. `repo_dir` is where configuration is looked up (`None`: global configuration only). Blocking.
+///
+/// `GIT_SSH_COMMAND` and `GIT_SSH` are looked up in `base_env`, the environment the child gets, not in the live
+/// process environment (the two differ when the application changed its own environment after the runtime started).
 pub(super) fn transport_settings(
     repo_dir: Option<&Path>,
     host_key_policy: HostKeyPolicy,
+    base_env: &[(OsString, OsString)],
 ) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
     let location = match repo_dir {
         Some(dir) => HarnessLocation::Repo(dir),
         None => HarnessLocation::Global,
     };
-    let env = ssh_env(location, host_key_policy)
+    let lookup = |name: &str| -> Option<String> {
+        base_env
+            .iter()
+            .rev()
+            .find(|(key, _)| {
+                if cfg!(windows) {
+                    key.to_string_lossy().eq_ignore_ascii_case(name)
+                } else {
+                    key.as_os_str() == name
+                }
+            })
+            .and_then(|(_, value)| value.to_str().map(str::to_owned))
+    };
+    let env = ssh_env_in(location, host_key_policy, &lookup)
         .into_iter()
         .map(|(key, value)| (key.into(), value.into()))
         .collect();
@@ -136,7 +153,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{CancelToken, GitRuntime, CredentialPrompter, RuntimeConfig, Sensitive, types::NoProgress};
+    use crate::{
+        CancelToken, CredentialPrompter, GitRuntime, RuntimeConfig, Sensitive, types::NoProgress,
+    };
 
     /// Answers the user name with a trailing line break, the first password with "first", and refuses any later
     /// password prompt; records every request.
@@ -269,6 +288,54 @@ mod tests {
                 && r.raw_prompt.ends_with("': ")),
             "label, repository and raw prompt are passed on: {requests:?}"
         );
+    }
+
+    #[test]
+    fn ssh_variables_come_from_the_child_environment() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        gix::init(dir.path()).expect("repository can be initialised");
+        let os = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect()
+        };
+        let (env, _) = transport_settings(
+            Some(dir.path()),
+            HostKeyPolicy::Ask,
+            &os(&[
+                ("GIT_SSH", "plink"),
+                ("GIT_SSH_COMMAND", "first-ssh"),
+                ("GIT_SSH_COMMAND", "my-ssh -q"),
+            ]),
+        );
+        assert_eq!(
+            env,
+            os(&[("GIT_SSH_COMMAND", "my-ssh -q")]),
+            "the user's command wins over GIT_SSH, and the last occurrence counts like in the child"
+        );
+        let (env, _) = transport_settings(
+            Some(dir.path()),
+            HostKeyPolicy::Ask,
+            &os(&[("GIT_SSH", "plink")]),
+        );
+        assert_eq!(
+            env,
+            os(&[("GIT_SSH", "plink")]),
+            "GIT_SSH of the child environment is kept"
+        );
+        if cfg!(windows) {
+            let (env, _) = transport_settings(
+                Some(dir.path()),
+                HostKeyPolicy::Ask,
+                &os(&[("Git_Ssh_Command", "my-ssh")]),
+            );
+            assert_eq!(
+                env,
+                os(&[("GIT_SSH_COMMAND", "my-ssh")]),
+                "Windows environment names are case-insensitive"
+            );
+        }
     }
 
     #[test]

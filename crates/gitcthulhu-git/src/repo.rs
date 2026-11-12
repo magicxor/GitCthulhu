@@ -538,7 +538,6 @@ impl Repo {
                     stderr,
                 },
                 prompt_refused: None,
-                removed_stale_locks: Vec::new(),
                 warnings: Vec::new(),
             };
             return Err(classify(OpClass::Generic, &out, &PostState::default()));

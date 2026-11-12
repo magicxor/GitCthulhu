@@ -1182,7 +1182,6 @@ impl Run {
         let out = cli::run_checked(repo, cmd, ctx, class)?;
         self.log.commands.push(out.record);
         self.log.hooks.extend(out.hooks);
-        self.log.removed_stale_locks.extend(out.removed_stale_locks);
         self.warnings.extend(out.warnings);
         Ok(())
     }

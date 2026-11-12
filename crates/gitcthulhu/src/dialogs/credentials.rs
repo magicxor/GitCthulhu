@@ -341,7 +341,7 @@ impl CredentialDialog {
         let token = offer.password(cx);
         let reply = self.reply.borrow_mut().take();
         let label = format!("The {} account {}", offer.forge, offer.user);
-        window.close_dialog(cx);
+        close_layer_or_top(window, cx, self.layer);
         cx.spawn(async move |_, cx| {
             let response = match token.await {
                 Ok(Some(token)) => CredentialResponse::Answer(token),

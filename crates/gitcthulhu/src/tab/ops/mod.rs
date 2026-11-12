@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::{App, AppContext as _, Context, SharedString, Window};
+use gpui_kit::{AppContext as _, Context, SharedString, Window};
 
 use super::{RepoTab, RepoTabEvent};
 use crate::backend::handle::{RepoHandle, TabBackend};
@@ -1219,17 +1219,6 @@ impl RepoTab {
                 );
             }
         }
-    }
-
-    /// Shows the Info toast of a catalogue method that its owner has not implemented yet.
-    pub(crate) fn not_implemented(&self, op: &str, cx: &mut App) {
-        crate::app_view::show_toast(
-            cx,
-            Some(self.ctx.id),
-            ToastKind::Positive,
-            format!("Not implemented yet: {op}"),
-            None,
-        );
     }
 }
 

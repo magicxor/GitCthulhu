@@ -1855,6 +1855,21 @@ dependencies = [
 [[package]]
 name = "gitcthulhu-oplog"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bstr",
+ "but-core",
+ "but-testsupport",
+ "gitcthulhu-oplog",
+ "gix",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "snapbox",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "gitcthulhu-services"

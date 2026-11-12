@@ -224,8 +224,9 @@ fn worktree_paths_compare_case_insensitively_only_on_windows() {
     } else {
         assert_eq!(
             r.undo,
-            vec![(2, 2, 2)],
-            "case-sensitive file systems treat them as different directories"
+            vec![],
+            "case-sensitive file systems treat them as different directories: entry 2 is foreign, so it \
+             clears the stacks and is not undoable itself"
         );
     }
 }

@@ -7,13 +7,6 @@
 /// Places in the oplog where a test can inject a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-#[cfg_attr(
-    not(feature = "test-hooks"),
-    allow(
-        dead_code,
-        reason = "the restore points are reached by the restore engine (OP-WP3)"
-    )
-)]
 pub enum FailPoint {
     /// At the start of every capture (`prepare`, `finish`, and the captures of a restore).
     Capture,

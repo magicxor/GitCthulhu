@@ -42,7 +42,6 @@ pub(crate) struct StoredEntry {
     /// The `before/` snapshot tree (absent for markers and barriers).
     pub before: Option<gix::ObjectId>,
     /// The `after/` snapshot tree (absent for markers, barriers and failed after-captures).
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub after: Option<gix::ObjectId>,
 }
 
@@ -81,18 +80,6 @@ pub(crate) fn read_head(
         Target::Symbolic(target) => Err(OplogError::Other(anyhow::anyhow!(
             "oplog ref {ref_name} is symbolic (points to {target}); it must point to a commit"
         ))),
-    }
-}
-
-/// Load the whole chain the oplog ref points to.
-#[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
-pub(crate) fn load_chain(
-    repo: &gix::Repository,
-    ref_name: &FullNameRef,
-) -> Result<Chain, OplogError> {
-    match read_head(repo, ref_name)? {
-        None => Ok(Chain::default()),
-        Some(head) => load_chain_at(repo, head, None),
     }
 }
 
@@ -533,10 +520,6 @@ pub(crate) fn remove_journal_files(journal_dir: &std::path::Path) -> Result<(), 
 }
 
 /// Read the raw bytes of a `keep-tags/<hex>` blob of entry commit `commit`, if present.
-#[allow(
-    dead_code,
-    reason = "used by the restore engine (WP3) to re-create pruned tag objects"
-)]
 pub(crate) fn kept_tag(
     repo: &gix::Repository,
     commit: gix::ObjectId,

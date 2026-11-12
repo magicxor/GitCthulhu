@@ -102,7 +102,12 @@ pub(crate) fn classify(
         return OplogError::RepositoryLocked { path };
     }
     let locked_code = err.chain().find_map(|cause| {
-        let io = cause.downcast_ref::<std::io::Error>()?;
+        // gix wraps I/O errors in its own error tree, which `anyhow`'s chain does not expand.
+        let io = cause.downcast_ref::<std::io::Error>().or_else(|| {
+            cause
+                .downcast_ref::<gix::error::Error>()?
+                .downcast_any_ref::<std::io::Error>()
+        })?;
         let code = io.raw_os_error()?;
         LOCKED_FILE_OS_ERRORS.contains(&code).then_some(code)
     });

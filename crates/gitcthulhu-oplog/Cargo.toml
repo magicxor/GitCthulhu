@@ -24,6 +24,8 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+# Atomic restore-journal writes (NamedTempFile::persist).
+tempfile.workspace = true
 
 [dev-dependencies]
 but-testsupport.workspace = true
@@ -37,3 +39,7 @@ workspace = true
 [[test]]
 name = "record"
 path = "tests/record/main.rs"
+
+[[test]]
+name = "restore"
+path = "tests/restore/main.rs"

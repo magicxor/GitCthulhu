@@ -655,13 +655,11 @@ impl ConfirmToken {
     }
 
     /// `true` if `reason` was acknowledged by this token.
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub(crate) fn acknowledges(&self, reason: &ConfirmReason) -> bool {
         self.digests.binary_search(&reason.digest()).is_ok()
     }
 
     /// `true` if every one of `reasons` was acknowledged by this token.
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub(crate) fn acknowledges_all(&self, reasons: &[ConfirmReason]) -> bool {
         reasons.iter().all(|r| self.acknowledges(r))
     }

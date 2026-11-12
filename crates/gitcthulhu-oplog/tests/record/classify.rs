@@ -275,7 +275,6 @@ fn capture_failure_keeps_the_stacks() {
 }
 
 #[test]
-#[ignore = "needs OP-WP3 (restore engine)"]
 fn undo_after_an_unrecorded_operation_asks_about_moved_refs() {
     let fx = Fixture::new();
     let oplog = fx.oplog();

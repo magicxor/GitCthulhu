@@ -35,7 +35,6 @@ pub(crate) fn index_flag_bits(flags: gix::index::entry::Flags) -> u16 {
 }
 
 /// Map [`FileState::index_flags`] bits back to index entry flags.
-#[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
 pub(crate) fn index_flags_from_bits(bits: u16) -> gix::index::entry::Flags {
     use gix::index::entry::Flags;
     let mut flags = Flags::empty();
@@ -64,7 +63,6 @@ pub(crate) enum HeadState {
 
 impl HeadState {
     /// The target to write into `HEAD` (`Unborn(n)` => `Symbolic(n)`).
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub(crate) fn to_target(&self) -> gix::refs::Target {
         match self {
             HeadState::Symbolic(name) | HeadState::Unborn(name) => {
@@ -95,7 +93,6 @@ pub(crate) enum RefValue {
 
 impl RefValue {
     /// The target to write into the ref.
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub(crate) fn to_target(&self) -> gix::refs::Target {
         match self {
             RefValue::Direct(id) => gix::refs::Target::Object(*id),
@@ -130,7 +127,6 @@ pub(crate) struct FileState {
 
 impl FileState {
     /// head_tree = worktree = index = `tree`, no conflicts, no flags (the carry base after an external HEAD move, §3.3 B2).
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub(crate) fn clean(tree: gix::ObjectId) -> FileState {
         FileState {
             head_tree: tree,
@@ -289,7 +285,6 @@ impl CapturedState {
     }
 
     /// Read a snapshot tree written by [`Self::write_tree()`].
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub(crate) fn read_tree(
         repo: &gix::Repository,
         tree: gix::ObjectId,
@@ -451,7 +446,6 @@ impl CapturedState {
 
     /// Paths in files.worktree that are absent from files.index and files.index_conflicts (tree diff, additions only).
     /// Empty for RefsOnly.
-    #[allow(dead_code, reason = "used by the restore engine (OP-WP3)")]
     pub(crate) fn untracked_paths(&self, repo: &gix::Repository) -> anyhow::Result<Vec<BString>> {
         let Some(files) = &self.files else {
             return Ok(Vec::new());

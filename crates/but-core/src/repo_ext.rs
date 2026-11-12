@@ -90,7 +90,8 @@ pub trait RepositoryExt: Sized {
     /// Create a tree that represents the current worktree and index state on top of `HEAD^{tree}`.
     ///
     /// This includes conflicted index entries and optionally skips untracked files larger than
-    /// `untracked_limit_in_bytes` if that limit is non-zero.
+    /// `untracked_limit_in_bytes` if that limit is non-zero, without reading or hashing them.
+    /// Tracked files are never subject to the limit.
     #[deprecated = "Gitizen alert: Do not soak up the entire working tree including untracked files, find a different solution"]
     fn create_wd_tree(&self, untracked_limit_in_bytes: u64) -> anyhow::Result<gix::ObjectId>;
 
@@ -231,13 +232,10 @@ impl RepositoryExt for gix::Repository {
         let mut added_worktree_file = |rela_path: &BStr,
                                        head_tree_editor: &mut gix::object::tree::Editor<'_>|
          -> anyhow::Result<bool> {
-            let Some((id, kind, md)) = pipeline.worktree_file_to_object(rela_path, &index)? else {
+            let Some((id, kind, _md)) = pipeline.worktree_file_to_object(rela_path, &index)? else {
                 head_tree_editor.remove(rela_path)?;
                 return Ok(false);
             };
-            if untracked_limit_in_bytes != 0 && md.len() > untracked_limit_in_bytes {
-                return Ok(false);
-            }
             head_tree_editor.upsert(rela_path, kind, id)?;
             Ok(true)
         };
@@ -369,7 +367,21 @@ impl RepositoryExt for gix::Repository {
             }
         }
 
+        let workdir = self.workdir();
         for rela_path in untracked_items {
+            // The limit applies to untracked files only, and is checked before hashing so that
+            // large files are never read nor written to the object database.
+            // Directories (untracked nested repositories) and symlinks are never subject to it.
+            if untracked_limit_in_bytes != 0
+                && let Some(workdir) = workdir
+                && let Ok(md) = gix::path::from_bstr(rela_path.as_bstr())
+                    .map_err(|_| ())
+                    .and_then(|rela| std::fs::symlink_metadata(workdir.join(rela)).map_err(|_| ()))
+                && md.is_file()
+                && md.len() > untracked_limit_in_bytes
+            {
+                continue;
+            }
             added_worktree_file(rela_path.as_ref(), &mut head_tree_editor)?;
         }
 

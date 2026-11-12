@@ -6,7 +6,7 @@ pub use create_tree::function::create_tree;
 
 /// Utilities related to resolving previously created snapshots.
 pub mod resolve_tree;
-pub use resolve_tree::function::resolve_tree;
+pub use resolve_tree::function::{resolve_tree, restore_conflicts_into_index};
 
 /// Utilities for associating snapshot-trees with commits and additional metadata.
 mod commit {

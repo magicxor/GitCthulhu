@@ -104,7 +104,7 @@ pub(super) mod function {
         let index = match (&head_tree, index, index_conflicts) {
             (_, Some(index_tree), Some(index_conflicts)) => {
                 let (mut index, _path) = repo.index_from_tree(&index_tree.id())?.into_parts();
-                replace_entries_with_their_restored_conflicts(&mut index, index_conflicts.id())?;
+                restore_conflicts_into_index(&mut index, index_conflicts.id())?;
                 Some(index)
             }
             (_, Some(index_tree), None) => {
@@ -113,7 +113,7 @@ pub(super) mod function {
             }
             (Some(worktree_base), None, Some(index_conflicts)) => {
                 let (mut index, _path) = repo.index_from_tree(&worktree_base.id())?.into_parts();
-                replace_entries_with_their_restored_conflicts(&mut index, index_conflicts.id())?;
+                restore_conflicts_into_index(&mut index, index_conflicts.id())?;
                 Some(index)
             }
             (None, None, Some(_index_conflicts)) => bail!(
@@ -131,9 +131,11 @@ pub(super) mod function {
         })
     }
 
-    fn replace_entries_with_their_restored_conflicts(
+    /// Replace the entries of `index` at every path in `conflict_tree` (format `<path>/<stage>`, stage 1..=3,
+    /// as written by [`create_tree()`](crate::snapshot::create_tree()) into `index-conflicts`) by those conflict stages.
+    pub fn restore_conflicts_into_index(
         index: &mut gix::index::State,
-        conflict_tree: gix::Id,
+        conflict_tree: gix::Id<'_>,
     ) -> anyhow::Result<()> {
         let conflict_tree = conflict_tree.object()?.try_into_tree()?;
         // Since we don't expect a lot of entries, quickly record everything.

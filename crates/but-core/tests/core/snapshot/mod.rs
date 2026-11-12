@@ -1,4 +1,5 @@
 mod index_create_and_resolve;
+mod restore_conflicts;
 mod worktree_create_and_resolve;
 
 mod utils {

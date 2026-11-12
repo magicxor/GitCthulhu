@@ -30,6 +30,7 @@ pub fn safe_checkout_from_head(
         merge_base_override,
         allow_conflicted_commit_checkout,
         allow_uncommitted_changes_to_conflict_with_new_head,
+        untracked_size_limit,
     }: Options,
 ) -> anyhow::Result<Outcome> {
     let new_object = new_head_id.attach(repo).object()?;
@@ -61,6 +62,7 @@ pub fn safe_checkout_from_head(
                 [old_tree, new_tree],
                 index,
                 allow_uncommitted_changes_to_conflict_with_new_head,
+                untracked_size_limit,
             )?;
         } else if carried {
             index.write()?;
@@ -101,6 +103,7 @@ fn write_merged_worktree(
     [old_tree, new_tree]: [gix::ObjectId; 2],
     index: write::LockedIndex,
     allow_conflicts: bool,
+    untracked_size_limit: Option<u64>,
 ) -> anyhow::Result<bool> {
     // Reopen to ensure that there is no "object memory" (i.e. all object
     // writes actually happen on disk).
@@ -121,7 +124,7 @@ fn write_merged_worktree(
         );
     }
     #[allow(deprecated)]
-    let wd_tree_id = repo.create_wd_tree(u64::MAX)?;
+    let wd_tree_id = repo.create_wd_tree(untracked_size_limit.unwrap_or(0))?;
     repo.config_snapshot_mut()
         .set_value(&gix::config::tree::Merge::RENORMALIZE, "true")?;
     let mut outcome = repo.merge_trees(
@@ -152,15 +155,13 @@ fn write_merged_worktree(
                 }
             }
         } else {
-            let mut paths = outcome
+            let paths = outcome
                 .conflicts
                 .iter()
                 .filter(|c| c.is_unresolved(unresolved))
-                .map(|c| format!("{:?}", c.ours.location()))
+                .map(|c| c.ours.location().to_owned())
                 .collect::<Vec<_>>();
-            paths.sort();
-            paths.dedup();
-            return Err(UncommittedChangesInTheWay::refusal(&paths));
+            return Err(UncommittedChangesInTheWay::refusal(paths));
         }
     }
 

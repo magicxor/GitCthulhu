@@ -97,3 +97,42 @@ Several agents usually work at once, each in its own git worktree outside the ma
 - `combine_highlights` picks the winner of two colors in hash order: where two layers set the same field, split the runs
   by hand.
 - The focused input's caret blink repaints about twice a second: idle-CPU and idle-frame checks must account for it.
+
+## QA scenarios: looking at the real window (feature `qa`)
+
+Headless gpui tests do not catch everything (a crash on startup, a layout that differs from the Gitnuro specs). The
+sanctioned way to look at the REAL window is the in-process QA runner of the `qa` feature (`crates/gitcthulhu/src/qa`,
+`tools/qa`). It drives the app through its own actions and entry points (never OS input), waits until the app is idle
+and writes PNG screenshots of the app's own window by capture only (`PrintWindow` of its HWND: nothing is clicked,
+typed, moved or focused).
+
+```powershell
+# once per machine/session: a sandbox with synthetic fixture repositories (below a "scratch" folder or %TEMP%)
+pwsh -NoProfile -File tools\qa\new-sandbox.ps1 -Dest C:\git\opensource\GitCthulhu.plan\scratch\<task>\sbx
+# one scenario: builds with --features qa, runs the app, prints the report and the screenshot paths
+pwsh -NoProfile -File tools\qa\run-gui.ps1 -Sandbox <sbx> -Scenario tools\qa\scenarios\main-window.qa
+```
+
+Then `Read` the PNG files (the output directory defaults to `<sbx>\out\<scenario>`; `report.txt` has one PASS/FAIL/SKIP
+line per step, `verbs.txt` lists every verb of the build). The window opens briefly on the desktop at 1280x720 and
+does not take the keyboard focus; keep runs short and few (one scenario per question, several `shot` steps per run).
+Exit codes: 0 passed, 1 a step failed, 2 usage error, 3 the gate refused, 124 timeout (the app's watchdog, or the
+script kills the process it started 15 s later), 125 no report (crash: see `stderr.txt`, `panic.txt`). A qa build
+only runs scenarios: it never opens an interactive window.
+
+- **Scenario language** (`tools/qa/scenarios/*.qa`, one step per line, `#` comments): `open repository <fixture|path>`,
+  `select tab|log row|commit|branch|tag|stash|file|uncommitted row ...`, `open diff`, `set diff split|unified`,
+  `toggle diff`, `open dialog <name>`, `open context menu <target>`, `open settings page <name>`, `set theme
+  dark|light`, `resize WxH`, `key`/`type`/`action`, `wait idle`, `shot <name>`, `assert no error`, `quit`. Fixtures:
+  `linear`, `rich` (branches, merge, tags, stashes, local bare remote, ahead/behind, a merge in progress with staged,
+  unstaged, untracked and conflicted files) and `rebase` (rebase stopped by a conflict).
+- **Extending** (regions): add verbs with `crate::qa::register_verb(cx, Verb::new(name, usage, help, handler))` from the
+  region's `register(cx)` under `#[cfg(feature = "qa")]`, and idle conditions with `crate::qa::register_idle_probe`
+  (see `qa/verbs.rs`). A handler runs on the UI thread and calls the region's public entry points.
+- **The sandbox gate:** a qa build refuses to start (exit 3) unless `GITCTHULHU_QA_SANDBOX` names a directory with the
+  marker written by `new-sandbox.ps1` (never a drive root or the real profile directory or above it), `GITCTHULHU_HOME`, the profile variables and `GIT_CONFIG_GLOBAL` lie inside it,
+  `GIT_CONFIG_NOSYSTEM=1` and `GIT_ALLOW_PROTOCOL=file` (no network). `run-gui.ps1` sets all of that, resets the
+  sandbox's app data before each run and the runner only opens repositories inside the sandbox; services and
+  update checks are off in QA mode. Never run a qa build outside `run-gui.ps1`, never point a sandbox at real data,
+  and keep scenarios, fixtures and screenshots synthetic.
+- Tests of the runner: `cargo test -p gitcthulhu --features qa --lib qa::`.

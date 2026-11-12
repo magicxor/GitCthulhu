@@ -36,6 +36,8 @@ pub mod menus;
 pub mod metrics;
 pub mod notifications;
 pub mod paths;
+#[cfg(feature = "qa")]
+pub mod qa;
 pub mod rebase_interactive;
 pub mod registry;
 pub mod settings;

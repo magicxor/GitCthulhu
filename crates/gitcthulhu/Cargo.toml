@@ -30,6 +30,7 @@ terminal = ["dep:but-tty", "dep:shell-words"]         # needs Zig 0.17 + network
 services = ["dep:gitcthulhu-services", "dep:but-secret"]   # forge + AI + update
 gpui-fast = ["gpui-kit/gpui-fast"]                    # benchmark passthrough only
 test-support = ["gpui-kit/test-support"]
+qa = ["dep:png", "dep:raw-window-handle", "dep:windows-sys"]   # in-process QA scenario runner + capture-only screenshots (src/qa, tools/qa); never in releases
 
 [dependencies]
 gpui-kit = { version = "=0.7.3" }                     # default features: component + assets
@@ -57,10 +58,16 @@ rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "dump-load", "regex-fancy"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 shell-words = { version = "1", optional = true }
+# Screenshot capture of the app's own window (feature `qa`, Windows only: PrintWindow); versions already in Cargo.lock.
+png = { version = "0.18", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
 
 [dev-dependencies]
 gpui-kit = { version = "=0.7.3", features = ["test-support"] }
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

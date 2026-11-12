@@ -120,6 +120,12 @@ pub fn start_git_runtime(cx: &mut App, settings: Settings) {
 
 /// Starts the services in the background; a failure is logged and shown as a Warning toast.
 fn start_services(cx: &mut App, settings: Settings) {
+    // QA runs never touch the network: no forge, AI or update service.
+    #[cfg(feature = "qa")]
+    if crate::qa::active() {
+        tracing::info!("QA mode: services are not started");
+        return;
+    }
     let task = backend::bg(cx, move || backend::services::start_services(&settings));
     cx.spawn(async move |cx| {
         let result = task.await;
@@ -233,6 +239,9 @@ fn load_settings() -> (Settings, UiState, RepoPrefs) {
 
 /// Starts the application and blocks until the last window is closed.
 pub fn run() {
+    // A qa build refuses to start outside a QA sandbox, before anything is read.
+    #[cfg(feature = "qa")]
+    let qa = crate::qa::enter();
     logging::init();
     if let Err(err) = paths::ensure_dirs() {
         tracing::warn!("cannot create the application directories: {err}");
@@ -243,6 +252,8 @@ pub fn run() {
         .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            #[cfg(feature = "qa")]
+            crate::qa::init(cx, &qa);
             fonts::register(cx);
             settings::init(cx, settings.clone());
             settings::state::init(cx, ui_state.clone());
@@ -254,7 +265,8 @@ pub fn run() {
             start_git_runtime(cx, settings.clone());
             start_services(cx, settings.clone());
 
-            let options = WindowOptions {
+            #[allow(unused_mut)]
+            let mut options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("GitCthulhu".into()),
                     ..Default::default()
@@ -263,11 +275,21 @@ pub fn run() {
                 app_id: Some("gitcthulhu".into()),
                 ..Default::default()
             };
+            // QA runs open a fixed 1280x720 window and never take the focus from the user's work.
+            #[cfg(feature = "qa")]
+            {
+                options.window_bounds = Some(crate::qa::window_bounds());
+                options.focus = false;
+            }
+            // A qa run opens repositories only through its scenario (its arguments are not repository paths).
+            #[cfg(feature = "qa")]
+            let cli = None;
+            #[cfg(not(feature = "qa"))]
             let cli = cli_repository();
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {
                 cx.new(|cx| AppView::new(requests, cli, window, cx))
             });
-            if let Err(err) = opened {
+            if let Err(err) = &opened {
                 tracing::error!("cannot open the main window: {err}");
                 cx.quit();
                 return;
@@ -279,6 +301,11 @@ pub fn run() {
                 }
             })
             .detach();
+            #[cfg(feature = "qa")]
+            if let Ok((handle, _)) = &opened {
+                crate::qa::attach(&qa, *handle, cx);
+            }
+            #[cfg(not(feature = "qa"))]
             cx.activate(true);
         });
 }

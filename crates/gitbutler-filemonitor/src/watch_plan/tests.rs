@@ -28,7 +28,19 @@ mod compute_watch_plan {
     ),
     (
         Recursive,
-        ".git/refs/heads",
+        ".git/refs",
+    ),
+    (
+        NonRecursive,
+        ".git/modules",
+    ),
+    (
+        NonRecursive,
+        ".git/modules/submodule-worktree",
+    ),
+    (
+        Recursive,
+        ".git/modules/submodule-worktree/refs",
     ),
     (
         NonRecursive,
@@ -55,8 +67,12 @@ mod compute_watch_plan {
         "submodule-repo/.git/logs",
     ),
     (
+        NonRecursive,
+        "submodule-repo/.git/logs/refs",
+    ),
+    (
         Recursive,
-        "submodule-repo/.git/refs/heads",
+        "submodule-repo/.git/refs",
     ),
     (
         NonRecursive,
@@ -101,8 +117,24 @@ submodule-worktree/
         ".git/logs",
     ),
     (
+        NonRecursive,
+        ".git/logs/refs",
+    ),
+    (
         Recursive,
-        ".git/refs/heads",
+        ".git/refs",
+    ),
+    (
+        NonRecursive,
+        ".git/modules",
+    ),
+    (
+        NonRecursive,
+        ".git/modules/submodule-worktree",
+    ),
+    (
+        Recursive,
+        ".git/modules/submodule-worktree/refs",
     ),
     (
         NonRecursive,
@@ -161,7 +193,14 @@ submodule-worktree/
                 let relative = path
                     .strip_prefix(worktree)
                     .expect("fixture repositories keep all watched paths in the worktree");
-                (mode, relative.to_owned())
+                (
+                    mode,
+                    PathBuf::from(
+                        relative
+                            .to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/"),
+                    ),
+                )
             })
             .collect()
     }
@@ -202,5 +241,89 @@ submodule-worktree/
         let plan = compute_watch_plan(worktree).expect("plan computed");
         let worktree_real = gix::path::realpath(worktree).expect("realpath worktree");
         canonicalize_plan(plan, &worktree_real)
+    }
+}
+
+mod git_dir_watches {
+    use std::path::{Path, PathBuf};
+
+    use notify::RecursiveMode;
+
+    use crate::watch_plan::emit_git_dir_watches;
+
+    /// A scratch directory removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn scratch() -> Scratch {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "filemonitor-git-dir-watches-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch directory can be created");
+        Scratch(dir)
+    }
+
+    fn module_repo(dir: &Path) {
+        std::fs::create_dir_all(dir.join("refs/heads")).expect("refs can be created");
+        std::fs::create_dir_all(dir.join("objects/pack")).expect("objects can be created");
+        std::fs::create_dir_all(dir.join("logs")).expect("logs can be created");
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD can be written");
+    }
+
+    #[test]
+    fn submodules_with_slashes_in_their_name_and_nested_submodules_are_watched() {
+        let tmp = scratch();
+        let git_dir = tmp.0.join("git");
+        module_repo(&git_dir);
+        module_repo(&git_dir.join("modules/plain"));
+        module_repo(&git_dir.join("modules/libs/foo"));
+        module_repo(&git_dir.join("modules/plain/modules/inner"));
+
+        let mut watches = Vec::new();
+        let _flow = emit_git_dir_watches(&git_dir, &mut |path, mode| {
+            let relative = path
+                .strip_prefix(&git_dir)
+                .expect("all watches are in the git dir")
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            watches.push((mode, relative));
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+        .expect("the watches can be listed");
+
+        let modules: Vec<_> = watches
+            .iter()
+            .filter(|(_, path)| path.starts_with("modules"))
+            .map(|(mode, path)| (*mode, path.as_str()))
+            .collect();
+        assert_eq!(
+            modules,
+            [
+                (RecursiveMode::NonRecursive, "modules"),
+                (RecursiveMode::NonRecursive, "modules/libs"),
+                (RecursiveMode::NonRecursive, "modules/libs/foo"),
+                (RecursiveMode::Recursive, "modules/libs/foo/refs"),
+                (RecursiveMode::NonRecursive, "modules/plain"),
+                (RecursiveMode::Recursive, "modules/plain/refs"),
+                (RecursiveMode::NonRecursive, "modules/plain/modules"),
+                (RecursiveMode::NonRecursive, "modules/plain/modules/inner"),
+                (RecursiveMode::Recursive, "modules/plain/modules/inner/refs"),
+            ],
+            "every submodule repository is found, whatever its name; never its objects or logs"
+        );
+        assert!(
+            !watches.iter().any(|(_, path)| path.contains("objects")),
+            "no object database is watched: {watches:?}"
+        );
     }
 }

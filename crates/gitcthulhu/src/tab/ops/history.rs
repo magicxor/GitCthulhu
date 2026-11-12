@@ -79,7 +79,7 @@ struct KnownCommit {
 
 impl RepoTab {
     /// HEAD for oplog titles: the branch's short name, the short id when detached.
-    fn head_label(&self, cx: &App) -> String {
+    pub(super) fn head_label(&self, cx: &App) -> String {
         let model = self.ctx.model.read(cx);
         let head = model
             .state

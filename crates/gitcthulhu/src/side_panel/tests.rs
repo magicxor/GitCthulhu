@@ -1798,6 +1798,16 @@ fn checkout_remote_name_collision_asks_name(cx: &mut TestAppContext) {
         cx.update(|cx| app.read(cx).errors_opened.is_empty() && app.read(cx).pending_errors() == 0),
         "the collision is handled by asking for a name, not by an error dialog"
     );
+    cx.update_window(handle, |_, window, cx| {
+        use gpui_kit::component::WindowExt as _;
+        assert!(
+            window.has_active_dialog(cx),
+            "the name dialog is open (it holds back error dialogs)"
+        );
+        window.close_dialog(cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
 
     fail::<crate::backend::FullName>(
         &tab,

@@ -14,6 +14,8 @@ use super::{SelKey, SelSide};
 use crate::backend::{DiffContent, LineKind};
 use crate::diff::model::{DiffDoc, DiffMode};
 
+/// The marker the display text carries at each end where a long line was cut (`model::display_line`).
+const WINDOW_MARKER: &str = "\u{2026}";
 const SIDE_SHIFT: u32 = 30;
 const OFFSET_MASK: u64 = (1 << SIDE_SHIFT) - 1;
 
@@ -229,18 +231,36 @@ pub(super) fn source_offset(source: &str, display: &str, offset: usize, edge: Ed
         return source.len();
     }
     let expanded = expand_tabs(source);
-    let front = if expanded.starts_with(display) {
-        Some(0)
+    let locate = |text: &str| {
+        if expanded.starts_with(text) {
+            Some(0)
+        } else {
+            expanded.find(text)
+        }
+    };
+    // A display cut to a window (deviation 23) carries an ellipsis marker at each cut end; the markers are not
+    // part of the source, so the window is located without them and the offset is shifted past the leading one.
+    let (front, lead) = if let Some(front) = locate(display) {
+        (front, 0)
     } else {
-        expanded.find(display)
-    };
-    let Some(front) = front else {
-        return match edge {
-            Edge::Start => 0,
-            Edge::End => source.len(),
+        let lead = if display.starts_with(WINDOW_MARKER) {
+            WINDOW_MARKER.len()
+        } else {
+            0
         };
+        let core = &display[lead..];
+        let core = core.strip_suffix(WINDOW_MARKER).unwrap_or(core);
+        match locate(core).filter(|_| !core.is_empty()) {
+            Some(front) => (front, lead),
+            None => {
+                return match edge {
+                    Edge::Start => 0,
+                    Edge::End => source.len(),
+                };
+            }
+        }
     };
-    let target = front + offset;
+    let target = front + offset.saturating_sub(lead).min(display.len() - lead);
     let mut position = 0;
     for (ix, ch) in source.char_indices() {
         let width = if ch == '\t' { 4 } else { ch.len_utf8() };

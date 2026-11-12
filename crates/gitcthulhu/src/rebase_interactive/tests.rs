@@ -2,6 +2,7 @@ use core::prelude::v1::test;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
@@ -9,14 +10,17 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::plan::{self, action_label};
 use super::{ids, open};
-use crate::backend::{ObjectId, RebaseAction, RebasePlan, RebaseStep};
+use crate::backend::present::OpFailure;
+use crate::backend::{
+    GitError, ObjectId, OpOutcome, RebaseAction, RebaseOutcome, RebasePlan, RebaseStep,
+};
 use crate::tab::ops::OpKind;
 use crate::tab::ui::{RepoUiEvent, RightContent, Selection};
 use crate::tab::{RepoTab, RepoTabEvent};
 use crate::test_support::seed::{full, oid};
 use crate::test_support::{
     DEFAULT_SIZE, Fixture, RepoSeed, geometry::assert_rect, geometry::bounds, mount_fixture,
-    mount_seeded, toast_texts,
+    mount_seeded, script_op, toast_texts,
 };
 
 thread_local! {
@@ -565,6 +569,17 @@ fn complete_starts_op_with_plan(cx: &mut TestAppContext) {
         plan_of(&[RebaseAction::Pick, RebaseAction::Squash, RebaseAction::Pick]),
     );
     let before = started().len();
+    // The operation fails to start, so the plan stays for a retry.
+    cx.update(|cx| {
+        script_op(
+            &tab,
+            cx,
+            Err::<OpOutcome<RebaseOutcome>, _>(OpFailure::Git(Arc::new(GitError::Unsupported {
+                what: "a scripted failure",
+            }))),
+            Duration::ZERO,
+        )
+    });
     // Reorder first: the plan handed over is the edited one.
     click_row_padding(cx, handle, 2);
     cx.update_window(handle, |_, window, cx| window.press("alt-up", cx))

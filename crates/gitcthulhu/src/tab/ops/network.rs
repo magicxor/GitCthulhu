@@ -682,23 +682,6 @@ impl RepoTab {
         let refs: Option<&RefList> = model.refs.value.as_deref();
         split_remote_branch(refs.map_or(&[][..], |r| r.remotes.as_slice()), full)
     }
-
-    /// The short name of the current branch for oplog titles ("HEAD" when detached or unknown).
-    fn head_label(&self, cx: &gpui_kit::App) -> String {
-        let model = self.ctx.model.read(cx);
-        let head = model
-            .refs
-            .value
-            .as_ref()
-            .map(|refs| &refs.head)
-            .or_else(|| model.state.value.as_ref().map(|state| &state.head));
-        match head {
-            Some(HeadState::Branch { name, .. } | HeadState::Unborn { name }) => {
-                name.shorten().to_str_lossy().into_owned()
-            }
-            _ => "HEAD".to_owned(),
-        }
-    }
 }
 
 #[cfg(test)]

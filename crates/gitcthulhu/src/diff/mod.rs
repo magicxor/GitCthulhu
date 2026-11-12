@@ -13,8 +13,8 @@ use std::time::Duration;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
-    KeyBinding, ListAlignment, ListOffset, ListState, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Subscription, Task, Window, div, list, px,
+    KeyBinding, ListAlignment, ListOffset, ListState, MouseButton, ParentElement as _, Pixels,
+    Render, SharedString, Styled as _, Subscription, Task, Window, div, list, px,
 };
 
 use crate::backend::{
@@ -119,8 +119,8 @@ pub mod ids {
     pub const OPEN_SUBMODULE: &str = "diff-open-submodule";
 }
 
-/// Key context of the diff view (navigation keys here, copy / select all from G7b).
-pub const DIFF_CONTEXT: &str = "Diff";
+/// Key context of the diff view (navigation keys here, copy / select all from the selection).
+pub use selection::DIFF_CONTEXT;
 
 gpui_kit::actions!(
     gitcthulhu_diff,
@@ -304,8 +304,10 @@ impl DiffView {
         let rem_size = px(metrics::BASE_REM);
         let line_h = rem_size * (m::LINE_H / metrics::BASE_REM);
         let selection = DiffSelection::new(cx);
+        let focus = cx.focus_handle();
+        selection.focus_on_drag(&focus, cx);
         Self {
-            focus: cx.focus_handle(),
+            focus,
             source,
             wanted: None,
             loaded: None,
@@ -790,7 +792,13 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::page_up))
             .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::top))
-            .on_action(cx.listener(Self::bottom));
+            .on_action(cx.listener(Self::bottom))
+            // Clicks on gutters and headers focus the diff too, so copy and select all reach it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
+            );
+        let root = self.selection.key_actions(root);
         let root = if self.show_loading || (self.loaded.is_none() && self.error.is_some()) {
             let path = self
                 .wanted

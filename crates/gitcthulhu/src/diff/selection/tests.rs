@@ -386,7 +386,7 @@ fn copy_uses_source_not_display_cut(cx: &mut TestAppContext) {
         .expect("the long line is in the diff") as u32;
     let display = doc.texts[long_ix as usize].clone();
     assert!(
-        display.len() <= MAX_DISPLAY_BYTES && display.starts_with("    let"),
+        display.len() <= MAX_DISPLAY_BYTES + "\u{2026}".len() && display.starts_with("    let"),
         "the display text is tab-expanded and cut"
     );
 

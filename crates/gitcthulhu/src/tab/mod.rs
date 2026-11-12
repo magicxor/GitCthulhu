@@ -130,7 +130,8 @@ pub enum PrompterMode {
 /// Options of a new tab.
 #[derive(Clone, Copy, Debug)]
 pub struct TabOptions {
-    /// Start the repository watcher (default true; false in fixture tests).
+    /// Start the repository watcher (default true; false in unit tests, where a watcher thread would feed events
+    /// into the deterministic test scheduler).
     pub watch: bool,
     pub prompter: PrompterMode,
 }
@@ -138,7 +139,7 @@ pub struct TabOptions {
 impl Default for TabOptions {
     fn default() -> Self {
         Self {
-            watch: true,
+            watch: !cfg!(test),
             prompter: PrompterMode::Gui,
         }
     }

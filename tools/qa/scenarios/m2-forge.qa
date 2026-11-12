@@ -1,0 +1,63 @@
+# Milestone 2 (X4): the forge integration on the feature-rich fixture. Everything runs through the real code paths
+# (forge detection, refresh, badge map, Accounts page, create pull request dialog, sign-in dialogs) against a fake
+# GitHub Enterprise server on loopback with an in-memory keychain: nothing leaves the machine and no real keychain
+# entry is written. Compare with 21 section 5.4 and 5.5.
+resize 1280x720
+set theme dark
+open repository rich
+wait idle
+# A fake forge with two pull requests (an open one with passing checks, a draft with running checks); origin of the
+# repository points at it. The branch docs/rewrite has no pull request.
+forge mock start feature/login=open:passed fix/typo=draft:running
+wait idle
+forge mock sign in
+wait idle
+assert forge status idle
+assert forge badge feature/login open passed
+assert forge badge fix/typo draft running
+assert forge badge docs/rewrite none
+shot m2-forge-01-badges
+# The branch menus: Open pull request, Create pull request.
+open context menu branch feature/login at 120 190
+wait idle
+shot m2-forge-02-menu-open-pr
+close menu
+open context menu branch docs/rewrite at 120 230
+wait idle
+shot m2-forge-03-menu-create-pr
+close menu
+# The create pull request dialog (the branch has no upstream: "Push the branch first").
+open dialog pull-request docs/rewrite
+wait idle
+shot m2-forge-04-create-pr
+close dialog
+# A merge on the forge shows as a merged badge after the next refresh.
+forge mock merge feature/login
+wait idle
+assert forge badge feature/login merged
+shot m2-forge-05-merged
+# The Accounts page and the sign-in dialogs.
+open settings page accounts
+wait idle
+shot m2-forge-06-accounts
+close dialog
+open forge dialog device
+wait idle
+shot m2-forge-07-device-flow
+close dialog
+open forge dialog enterprise
+wait idle
+shot m2-forge-08-token-dialog
+close dialog
+# Offline: the badges stay (from the cache), the tooltips say so, polling backs off.
+forge mock offline on
+forge refresh
+wait idle
+assert forge status offline
+assert forge badge fix/typo draft running
+shot m2-forge-09-offline
+set theme light
+wait idle
+shot m2-forge-10-light
+set theme dark
+assert no error

@@ -14,7 +14,7 @@ pub use client::{
 pub use project::{GitLabProjectId, fetch_project};
 mod token;
 use serde::Serialize;
-pub use token::GitlabAccountIdentifier;
+pub use token::{GitlabAccountIdentifier, get_gl_access_token};
 
 #[derive(Debug, Clone)]
 pub struct AuthStatusResponse {

@@ -24,6 +24,7 @@ use crate::icons::AppIcon;
 use crate::metrics::dialogs::{CREDENTIAL_W, HOST_KEY_W};
 use crate::metrics::{self, dp};
 use crate::theme::{ActiveTokens as _, TextStyleExt as _};
+use crate::widgets::CheckboxText;
 use crate::widgets::field::{FieldEvent, OutlinedField};
 
 /// How often the dialog checks the request's cancel token.
@@ -43,6 +44,8 @@ pub mod ids {
     pub const CREDENTIAL_RETRY: &str = "credential-retry";
     /// The host-key fingerprint line.
     pub const CREDENTIAL_FINGERPRINT: &str = "credential-fingerprint";
+    /// The "Use {forge} account {user}" checkbox of an HTTPS prompt (X4).
+    pub const CREDENTIAL_USE_ACCOUNT: &str = "credential-use-account";
 }
 
 /// What a prompt looks like: icon, texts and whether the field is masked.
@@ -196,6 +199,8 @@ pub fn open(
     reply: SyncSender<CredentialResponse>,
 ) {
     let texts = prompt_texts(&request);
+    // A connected forge account of the prompt's host can answer instead of the user (20 §6.3, X4).
+    let offer = crate::forge::accounts::https_offer(&request, cx);
     let field = texts.hint.map(|hint| {
         cx.new(|cx| {
             let field = if texts.masked {
@@ -231,6 +236,8 @@ pub fn open(
             texts,
             reply: Rc::new(RefCell::new(Some(reply))),
             field,
+            offer,
+            use_account: false,
             typed: false,
             shown: false,
             focus: FocusOnce::default(),
@@ -274,6 +281,10 @@ pub struct CredentialDialog {
     texts: PromptTexts,
     reply: Rc<RefCell<Option<SyncSender<CredentialResponse>>>>,
     field: Option<Entity<OutlinedField>>,
+    /// The connected forge account that can answer an HTTPS prompt.
+    offer: Option<crate::forge::accounts::AccountOffer>,
+    /// "Use {forge} account {user}" is checked: the account answers, the field is ignored.
+    use_account: bool,
     /// The user typed since the dialog opened (hides the retry banner).
     typed: bool,
     /// A masked field currently shows its text.
@@ -300,11 +311,64 @@ impl CredentialDialog {
     }
 
     fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.use_account
+            && let Some(offer) = self.offer.clone()
+        {
+            self.accept_with_account(&offer, window, cx);
+            return;
+        }
         let response = match &self.field {
             Some(field) => CredentialResponse::Answer(Sensitive::new(common::text_of(field, cx))),
             None => CredentialResponse::Answer(Sensitive::new("yes".to_owned())),
         };
         self.answer(response, window, cx);
+    }
+
+    /// Answers with the connected account: its user name for a user name prompt, its token (read from the keychain
+    /// in the background) for a password prompt.
+    fn accept_with_account(
+        &mut self,
+        offer: &crate::forge::accounts::AccountOffer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_password = matches!(self.request.kind, PromptKind::HttpsPassword { .. });
+        if !is_password {
+            let answer = CredentialResponse::Answer(Sensitive::new(offer.username().to_owned()));
+            self.answer(answer, window, cx);
+            return;
+        }
+        let token = offer.password(cx);
+        let reply = self.reply.borrow_mut().take();
+        let label = format!("The {} account {}", offer.forge, offer.user);
+        window.close_dialog(cx);
+        cx.spawn(async move |_, cx| {
+            let response = match token.await {
+                Ok(Some(token)) => CredentialResponse::Answer(token),
+                // No stored token (or no keychain access): the prompt is declined, Git reports the failure; the
+                // toast says why.
+                other => {
+                    let reason = match other {
+                        Err(failure) => failure.message,
+                        _ => "no token is stored for it".to_owned(),
+                    };
+                    cx.update(|cx| {
+                        crate::app_view::show_toast(
+                            cx,
+                            None,
+                            crate::notifications::ToastKind::Warning,
+                            format!("{label} cannot answer the password prompt: {reason}"),
+                            None,
+                        );
+                    });
+                    CredentialResponse::Cancel
+                }
+            };
+            if let Some(reply) = reply {
+                let _ = reply.send(response);
+            }
+        })
+        .detach();
     }
 
     /// What Cancel (or "No") answers.
@@ -394,6 +458,19 @@ impl Render for CredentialDialog {
         } else {
             HOST_KEY_W
         };
+        let offer_toggle = self.offer.as_ref().map(|offer| {
+            let this = this.clone();
+            div().w(dp(CREDENTIAL_W)).pt(dp(8.)).child(
+                CheckboxText::new(ids::CREDENTIAL_USE_ACCOUNT, self.use_account, offer.label())
+                    .on_toggle(move |checked, _, cx| {
+                        this.update(cx, |d, cx| {
+                            d.use_account = checked;
+                            cx.notify();
+                        })
+                        .ok();
+                    }),
+            )
+        });
         let content = div()
             .w(dp(width))
             .flex()
@@ -411,6 +488,7 @@ impl Render for CredentialDialog {
                 )
             })
             .when_some(field_block, |col, block| col.child(block))
+            .when_some(offer_toggle, |col, toggle| col.child(toggle))
             .when_some(retry, |col, text| {
                 col.child(
                     crate::widgets::observed(ids::CREDENTIAL_RETRY)

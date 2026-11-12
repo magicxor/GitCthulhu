@@ -13,7 +13,7 @@ pub use client::{
 pub use repo::fetch_repo;
 mod token;
 use serde::Serialize;
-pub use token::BitbucketAccountIdentifier;
+pub use token::{BitbucketAccountIdentifier, get_bb_access_token};
 
 #[derive(Debug, Clone)]
 pub struct AuthStatusResponse {

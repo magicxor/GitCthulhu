@@ -2955,6 +2955,7 @@ dependencies = [
  "gix",
  "gpui-kit",
  "indexmap",
+ "keyring",
  "parking_lot",
  "png 0.18.1",
  "raw-window-handle",

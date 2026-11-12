@@ -135,6 +135,26 @@ impl ForgeHub {
             .map(|user| self.account(user))
     }
 
+    /// The HTTPS answer for `user` (20 section 6.3): the user name Git is asked for and the account's token.
+    /// Reads the keychain: blocking, off the UI thread only. `Ok(None)` when no token is stored.
+    ///
+    /// The user name is the login for GitHub, `oauth2` for GitLab and `x-bitbucket-api-token-auth` for
+    /// Bitbucket Cloud.
+    pub fn https_credential(
+        &self,
+        user: &ForgeUser,
+    ) -> Result<Option<(String, Sensitive<String>)>, ForgeError> {
+        let storage = &self.inner.storage;
+        Ok(match user {
+            ForgeUser::GitHub(id) => but_github::get_gh_access_token(id, storage)?
+                .map(|token| (id.username().to_owned(), token)),
+            ForgeUser::GitLab(id) => but_gitlab::get_gl_access_token(id, storage)?
+                .map(|token| ("oauth2".to_owned(), token)),
+            ForgeUser::Bitbucket(id) => but_bitbucket::get_bb_access_token(id, storage)?
+                .map(|token| ("x-bitbucket-api-token-auth".to_owned(), token)),
+        })
+    }
+
     /// Start a GitHub device-flow sign-in (needs `ForgeConfig::github_oauth_client_id`): show the user
     /// `user_code` and `verification_uri`, then call [`Self::github_device_poll()`] until it answers.
     pub fn github_device_start(&self) -> Result<DeviceCode, ForgeError> {

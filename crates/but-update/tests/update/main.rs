@@ -1,4 +1,5 @@
-mod app_name;
 mod available_update;
-mod response_parsing;
+mod check_status;
+mod manifest;
+mod support;
 mod suppress_update;

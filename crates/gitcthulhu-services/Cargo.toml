@@ -49,6 +49,7 @@ keyring.workspace = true
 tempfile.workspace = true
 tiny_http = "0.12"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+chrono = { workspace = true, features = ["clock"] }
 
 [lints]
 workspace = true

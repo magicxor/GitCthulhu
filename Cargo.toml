@@ -194,15 +194,23 @@ lto = false
 opt-level = 3
 debug = "line-tables-only"
 
+# Incremental compilation stays ON in dev and test (cargo's default; it used to be disabled here).
+# Only workspace crates are compiled incrementally, which is what agents iterating in a worktree
+# rebuild all day. Measured on gitcthulhu-git (Windows, 12 cores, rebuild after a one-line change):
+# `cargo check --all-targets` 5.4 s instead of 8.9 s, `cargo test --lib --no-run` 3.7 s instead of
+# 8.3 s, all 32 test binaries `cargo test --no-run` 28 s instead of 38 s; a no-change run is the
+# same (about 1 s). The price is the first build of a crate (check 14.6 s instead of 10.7 s) and
+# target/debug/incremental, which the seed script skips; CI's rust-cache drops it too.
 [profile.dev]
-incremental = false
 debug = "line-tables-only"
-
-[profile.test]
-incremental = false
 
 # Assure that `gix` is always fast so debug builds aren't unnecessarily slow.
 [profile.dev.package]
+# No debug info for dependencies (workspace crates keep line tables, see [profile.dev]): halves
+# target/ and the PDBs and shortens linking, and panics and backtraces in workspace code still show
+# file:line. A name-specific entry below still wins for the fields it sets. To debug into a
+# dependency, set `debug = true` for that package here.
+"*" = { debug = false }
 foldhash = { opt-level = 3 }
 gix-imara-diff = { opt-level = 3 }
 gix = { opt-level = 3 }
@@ -233,6 +241,14 @@ libghostty-vt-sys = { opt-level = 3, debug = false }
 gpui-pre = { opt-level = 3 }
 gpui-pre-platform = { opt-level = 3 }
 gpui-pre-sum-tree = { opt-level = 3 }
+gpui-pre-windows = { opt-level = 3 }
+gpui-pre-macos = { opt-level = 3 }
+gpui-pre-linux = { opt-level = 3 }
+gpui-pre-wgpu = { opt-level = 3 }
+gpui-base = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
 taffy = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }

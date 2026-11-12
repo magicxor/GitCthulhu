@@ -16,6 +16,7 @@ pub mod loaders;
 pub mod oplog;
 pub mod present;
 pub mod prompt;
+pub mod proxy_secret;
 pub mod services;
 
 pub mod details;
@@ -289,7 +290,9 @@ pub fn runtime_config(settings: &Settings) -> RuntimeConfig {
 ///
 /// Errors: `GitNotFound`, `GitTooOld`.
 pub fn start_runtime(settings: &Settings) -> Result<Arc<GitRuntime>, GitError> {
-    GitRuntime::new(runtime_config(settings))
+    let mut config = runtime_config(settings);
+    proxy_secret::apply(&mut config, settings);
+    GitRuntime::new(config)
 }
 
 /// Runs a blocking backend call on GPUI's background executor (on Windows the OS thread pool, so blocking git

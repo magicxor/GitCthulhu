@@ -233,7 +233,8 @@ impl ActiveTokens for App {
 }
 
 /// Tokens of a custom theme JSON: Gitnuro's format, 28 camelCase colour keys as ARGB hex strings plus `isLight`.
-/// Missing colour keys take the Dark value. (Export and the settings UI belong to `custom.rs`.)
+/// Missing colour keys take the Dark value; malformed values are errors. (Export and the settings UI belong to
+/// `custom.rs`.)
 pub fn parse_custom(json: &str) -> Result<Tokens, CustomThemeError> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| CustomThemeError(e.to_string()))?;
@@ -242,18 +243,25 @@ pub fn parse_custom(json: &str) -> Result<Tokens, CustomThemeError> {
         .ok_or_else(|| CustomThemeError("expected a JSON object".into()))?;
     let mut table: Vec<(String, u32)> = Vec::new();
     for (key, value) in object {
-        let Some(text) = value.as_str() else { continue };
-        let digits = text.trim().trim_start_matches('#');
-        if let Ok(argb) = u64::from_str_radix(digits, 16) {
-            // Compose masks to the low 32 bits (07 §13.1); do the same.
-            table.push((key.clone(), (argb & 0xFFFF_FFFF) as u32));
+        // Unknown keys are ignored; a known colour key with an unusable value is an error (the settings UI
+        // reports it instead of silently showing the Dark colour).
+        if !custom::is_colour_key(key) {
+            continue;
         }
+        let argb = value.as_str().and_then(custom::parse_argb).ok_or_else(|| {
+            CustomThemeError(format!(
+                "`{key}` must be an ARGB hex string such as \"FF0070D8\""
+            ))
+        })?;
+        table.push((key.clone(), argb));
     }
     let table: Vec<(&str, u32)> = table.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    let is_light = object
-        .get("isLight")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_light = match object.get("isLight") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| CustomThemeError("`isLight` must be true or false".into()))?,
+    };
     Ok(Tokens::from_argb(&table, is_light))
 }
 

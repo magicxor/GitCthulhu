@@ -13,7 +13,8 @@ seq 5 18 >file && chmod +x file
 seq 5 18 >file-in-index
 seq 5 18 >file-to-be-renamed
 seq 5 18 >file-to-be-renamed-in-index
-git add . && git commit -m "init"
+# Record the executable bit through Git, as filesystems without one (Windows) ignore `chmod`.
+git add . && git update-index --chmod=+x file && git commit -m "init"
 
 cat <<EOF >file
 1
@@ -38,7 +39,8 @@ chmod -x file
 
 cp file file-in-index && \
   chmod +x file-in-index && \
-  git add file-in-index
+  git add file-in-index && \
+  git update-index --chmod=+x file-in-index
 
 
 seq 2 18 >file-to-be-renamed && \

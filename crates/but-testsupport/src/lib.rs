@@ -10,6 +10,10 @@ use gix::{
 pub use gix_testtools;
 use gix_testtools::{Creation, FixtureState, PostResult, tempfile};
 
+mod bash;
+pub use bash::{
+    BASH_OVERRIDE_ENV_VAR, bash_program, path_with_bash_dir, prepare_fixture_environment,
+};
 mod in_memory_meta;
 pub use in_memory_meta::{InMemoryRefMetadata, InMemoryRefMetadataHandle, StackState};
 
@@ -67,11 +71,13 @@ pub fn invoke_bash(script: &str, repo: &gix::Repository) {
     invoke_bash_at_dir(script, repo.workdir().unwrap_or(repo.git_dir()))
 }
 /// Run the given `script` in bash, with the `cwd` set to `dir`.
+/// The bash is [`bash_program()`], with its directory first on `PATH` for nested `bash` calls.
 /// Panic if the script fails.
 pub fn invoke_bash_at_dir(script: &str, dir: &Path) {
-    let mut cmd = std::process::Command::new("bash");
+    let mut cmd = std::process::Command::new(bash_program());
     cmd.current_dir(dir);
     isolate_env_std_cmd(&mut cmd);
+    cmd.env("PATH", path_with_bash_dir());
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -586,6 +592,7 @@ pub fn read_only_in_memory_scenario_named(
     script_name: &str,
     dirname: &str,
 ) -> anyhow::Result<gix::Repository> {
+    prepare_fixture_environment();
     let root = gix_testtools::scripted_fixture_read_only(format!("scenario/{script_name}.sh"))
         .map_err(anyhow::Error::from_boxed)?;
     let repo = open_repo(&root.join(dirname))?.with_object_memory();
@@ -616,6 +623,7 @@ fn read_only_in_memory_scenario_named_with_post_inner<T>(
     dirname: &str,
     post_fn: Option<(u32, impl FnMut(FixtureState<'_>) -> PostResult<T>)>,
 ) -> anyhow::Result<(gix::Repository, Option<T>)> {
+    prepare_fixture_environment();
     let path = format!("scenario/{script_name}.sh");
     let (root, value) = match post_fn {
         Some((v, f)) => gix_testtools::scripted_fixture_read_only_with_post(path, v, f)
@@ -633,6 +641,7 @@ fn writable_scenario_inner<T>(
     args: impl IntoIterator<Item = impl Into<String>>,
     post_fn: Option<(u32, impl FnMut(FixtureState<'_>) -> PostResult<T>)>,
 ) -> anyhow::Result<(gix::Repository, tempfile::TempDir, Option<T>)> {
+    prepare_fixture_environment();
     let script_name = format!("scenario/{name}.sh");
     let (tmp, post) = match post_fn {
         Some((v, f)) => gix_testtools::scripted_fixture_writable_with_args_with_post(

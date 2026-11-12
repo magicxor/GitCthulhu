@@ -235,6 +235,11 @@ impl GitRuntime {
             .expect("the runtime is only taken out when dropping")
     }
 
+    /// The isolation of a test runtime; `None` in production.
+    pub(crate) fn test_isolation(&self) -> Option<&TestIsolation> {
+        self.config.test_isolation.as_ref()
+    }
+
     /// The options every gix open of this runtime uses.
     fn gix_open_options(&self) -> gix::open::Options {
         match &self.config.test_isolation {

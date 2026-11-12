@@ -2,21 +2,48 @@
 //!
 //! The executor (`cli::run`) does, for a command with askpass enabled:
 //!
-//! 1. `let askpass = Askpass::start(rt, ctx, repo).await?` before spawning, and adds `askpass.env()` to the child;
+//! 1. `let askpass = Askpass::start(askpass_exe, ctx, repo).await?` before spawning, and adds `askpass.env()` to the child;
 //! 2. runs `askpass.serve()` concurrently with the child. It never finishes while Git is happy; when it does, the
 //!    [`Stop`] says why: [`Stop::Refused`] (the prompter cancelled; keep waiting for Git to fail by itself and report
 //!    the prompt in `GitOutput::prompt_refused`) or [`Stop::Failed`] (infrastructure error).
 
-#![allow(dead_code)] // The executor (WP-B0b) is the user.
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    mem::Discriminant,
+    path::{Path, PathBuf},
+};
 
-use std::{collections::HashMap, mem::Discriminant, path::PathBuf};
-
-use gitbutler_git::askpass_harness::{AskpassError, AskpassSession};
+use gitbutler_git::askpass_harness::{
+    AskpassError, AskpassSession, HarnessLocation, http_stall_limit_args, ssh_env,
+};
 
 use crate::{
-    CredentialRequest, CredentialResponse, GitError, GitRuntime, OpContext, PromptKind,
+    CredentialRequest, CredentialResponse, GitError, HostKeyPolicy, OpContext, PromptKind,
     credentials::classify,
 };
+
+/// Environment and `-c` arguments every Mutation and Network command gets from the harness (§1.7): the default
+/// `GIT_SSH_COMMAND` unless the user configured ssh, and `-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60` for keys the
+/// user has not set. `repo_dir` is where configuration is looked up (`None`: global configuration only). Blocking.
+pub(super) fn transport_settings(
+    repo_dir: Option<&Path>,
+    host_key_policy: HostKeyPolicy,
+) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
+    let location = match repo_dir {
+        Some(dir) => HarnessLocation::Repo(dir),
+        None => HarnessLocation::Global,
+    };
+    let env = ssh_env(location, host_key_policy)
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+    let args = http_stall_limit_args(location)
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    (env, args)
+}
 
 /// An askpass server for one git invocation, answering through the operation's prompter.
 pub(super) struct Askpass {
@@ -37,11 +64,11 @@ pub(super) enum Stop {
 impl Askpass {
     /// Create the session for a command run in `repo`. Fails when the helper program is missing.
     pub(super) async fn start(
-        rt: &GitRuntime,
+        askpass_exe: &Path,
         ctx: &OpContext,
         repo: Option<PathBuf>,
     ) -> Result<Askpass, GitError> {
-        let session = AskpassSession::new(rt.askpass_exe().to_owned())
+        let session = AskpassSession::new(askpass_exe.to_owned())
             .await
             .map_err(infrastructure_error)?;
         Ok(Askpass {
@@ -109,7 +136,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::{CancelToken, CredentialPrompter, RuntimeConfig, Sensitive, types::NoProgress};
+    use crate::{CancelToken, GitRuntime, CredentialPrompter, RuntimeConfig, Sensitive, types::NoProgress};
 
     /// Answers the user name with a trailing line break, the first password with "first", and refuses any later
     /// password prompt; records every request.
@@ -188,7 +215,7 @@ mod tests {
         let repo = PathBuf::from("some/repo");
 
         let (stop, answers) = rt.tokio().block_on(async {
-            let askpass = Askpass::start(&rt, &ctx, Some(repo.clone()))
+            let askpass = Askpass::start(rt.askpass_exe(), &ctx, Some(repo.clone()))
                 .await
                 .expect("the session starts");
             let env = askpass.env();
@@ -254,7 +281,7 @@ mod tests {
         let ctx = OpContext::silent(CancelToken::new());
         let err = rt
             .tokio()
-            .block_on(Askpass::start(&rt, &ctx, None))
+            .block_on(Askpass::start(rt.askpass_exe(), &ctx, None))
             .err()
             .expect("a missing helper fails the start");
         assert!(

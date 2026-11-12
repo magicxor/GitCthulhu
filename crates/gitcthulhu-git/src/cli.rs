@@ -546,7 +546,7 @@ async fn drive(spawn: Spawn) -> Result<Driven> {
         ctx,
     } = spawn;
     let session = match &askpass {
-        Some(spec) => Some(askpass::Session::start(&spec.exe, &ctx, spec.repo.clone()).await?),
+        Some(spec) => Some(askpass::Askpass::start(&spec.exe, &ctx, spec.repo.clone()).await?),
         None => None,
     };
 
@@ -632,8 +632,8 @@ async fn drive(spawn: Spawn) -> Result<Driven> {
                     serving = false;
                     match served {
                         // Git fails by itself without an answer; keep waiting for it.
-                        Ok(prompt) => prompt_refused = Some(prompt),
-                        Err(err) => {
+                        askpass::Stop::Refused(prompt) => prompt_refused = Some(prompt),
+                        askpass::Stop::Failed(err) => {
                             tracing::warn!(%err, "The askpass server failed; prompts can no longer be answered");
                             askpass_error = Some(err);
                         }

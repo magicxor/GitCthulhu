@@ -9,11 +9,6 @@ rust-version.workspace = true
 path = "src/lib.rs"
 doctest = false
 
-[[bin]]
-name = "gitbutler-git-askpass"
-path = "src/bin/askpass.rs"
-test = false
-
 [features]
 default = ["tokio"]
 tokio = ["dep:tokio"]
@@ -23,9 +18,7 @@ benches = []
 askpass = []
 
 [dependencies]
-but-askpass.workspace = true
 but-core.workspace = true
-but-error.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

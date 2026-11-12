@@ -4,59 +4,50 @@ use std::{
 };
 
 use futures::{FutureExt, select};
-use gix::bstr::ByteSlice;
-use rand::{Rng, SeedableRng};
 
-use super::executor::{AskpassServer, GitExecutor, Pid, Socket};
-use crate::RefSpec;
-
-/// The number of characters in the secret used for checking
-/// askpass invocations by ssh/git when connecting to our process.
-const ASKPASS_SECRET_LENGTH: usize = 24;
+use super::executor::GitExecutor;
+use crate::{
+    RefSpec,
+    askpass_harness::{
+        AskpassError, AskpassSession, HarnessLocation, HostKeyPolicy,
+        askpass_exe_next_to_current_exe, http_stall_limit_args, ssh_env,
+    },
+};
 
 /// Higher level errors that can occur when interacting with the CLI.
 ///
 /// You probably don't want to use this type. Use [`Error`] instead.
 #[derive(Debug, thiserror::Error)]
-pub enum RepositoryError<
-    Eexec: std::error::Error + core::fmt::Debug + Send + Sync + 'static,
-    Easkpass: std::error::Error + core::fmt::Debug + Send + Sync + 'static,
-    Esocket: std::error::Error + core::fmt::Debug + Send + Sync + 'static,
-> {
+pub enum RepositoryError<Eexec: std::error::Error + core::fmt::Debug + Send + Sync + 'static> {
+    /// The git command could not be executed.
     #[error("failed to execute git command: {0}")]
     Exec(Eexec),
-    #[error("failed to accept connection to askpass server: {0}")]
-    AskpassServer(Easkpass),
-    #[error("i/o error communicating with askpass utility: {0}")]
-    AskpassIo(Esocket),
+    /// The askpass machinery failed or the prompt was refused.
+    #[error(transparent)]
+    Askpass(#[from] AskpassError),
+    /// The git command exited with a non-zero exit code.
     #[error(
-        "git command exited with non-zero exit code {status}:\n\nARGS:\n{args:?}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
+        "git command exited with non-zero exit code {status}:
+
+ARGS:
+{args:?}
+
+STDOUT:
+{stdout}
+
+STDERR:
+{stderr}"
     )]
     Failed {
+        /// The exit code.
         status: usize,
+        /// The arguments.
         args: Vec<String>,
+        /// Captured stdout.
         stdout: String,
+        /// Captured stderr.
         stderr: String,
     },
-    #[error("failed to determine path to this executable: {0}")]
-    NoSelfExe(std::io::Error),
-    #[error("askpass secret mismatch")]
-    AskpassSecretMismatch,
-    #[error("git requires authorization credentials but none were provided: prompt was {0:?}")]
-    NeedsAuthorization(String),
-    #[error("unable to determine PID of askpass peer: {0}")]
-    NoPid(Esocket),
-    #[cfg(unix)]
-    #[error("unable to determine UID of askpass peer: {0}")]
-    NoUid(Esocket),
-    #[error("failed to perform askpass security check; no such PID: {0}")]
-    NoSuchPid(Pid),
-    #[error("failed to perform askpass security check; device mismatch")]
-    AskpassDeviceMismatch,
-    #[error("failed to perform askpass security check; executable mismatch")]
-    AskpassExecutableMismatch,
-    #[error("Run `{prefix}cargo build -p gitbutler-git` to get the askpass binary at '{path}'")]
-    AskpassExecutableNotFound { path: String, prefix: String },
     /// The remote configuration could not be read.
     #[error("failed to read configuration for remote `{remote}`: {source}")]
     RemoteConfiguration {
@@ -78,17 +69,28 @@ pub enum RepositoryError<
 }
 
 /// Higher level errors that can occur when interacting with the CLI.
-pub type Error<E> = RepositoryError<
-    <E as GitExecutor>::Error,
-    <<E as GitExecutor>::ServerHandle as AskpassServer>::Error,
-    <<<E as GitExecutor>::ServerHandle as AskpassServer>::SocketHandle as Socket>::Error,
->;
+pub type Error<E> = RepositoryError<<E as GitExecutor>::Error>;
 
 enum HarnessEnv<P: AsRef<Path>> {
     /// The contained P is the repository's worktree directory or its `.git` directory.
     Repo(P),
     /// The contained P is the path that the command should be executed in
     Global(P),
+}
+
+impl<P: AsRef<Path>> HarnessEnv<P> {
+    fn location(&self) -> HarnessLocation<'_> {
+        match self {
+            HarnessEnv::Repo(p) => HarnessLocation::Repo(p.as_ref()),
+            HarnessEnv::Global(_) => HarnessLocation::Global,
+        }
+    }
+
+    fn cwd(&self) -> &Path {
+        match self {
+            HarnessEnv::Repo(p) | HarnessEnv::Global(p) => p.as_ref(),
+        }
+    }
 }
 
 #[cold]
@@ -101,340 +103,48 @@ async fn execute_with_auth_harness<P, F, Fut, E>(
 where
     P: AsRef<Path>,
     E: GitExecutor,
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
+    F: FnMut(String) -> Fut + Send,
+    Fut: std::future::Future<Output = Option<String>> + Send + 'static,
 {
-    let envs = new_env_with_git_ssh_configured(&harness_env);
-    let stall_limits = http_stall_limit_args(&harness_env);
+    let mut envs: HashMap<String, String> =
+        ssh_env(harness_env.location(), HostKeyPolicy::AcceptNew)
+            .into_iter()
+            .collect();
+    let stall_limits = http_stall_limit_args(harness_env.location());
     let args: Vec<&str> = stall_limits
         .iter()
         .map(String::as_str)
         .chain(args.iter().copied())
         .collect();
 
-    if let Some(on_prompt) = on_prompt {
-        execute_with_indirect_askpass(harness_env, executor, &args, envs, on_prompt).await
-    } else {
-        execute_direct(harness_env, executor, &args, envs).await
-    }
-}
-
-/// Git's HTTP transport has no timeout, so a remote that accepts the connection and then goes
-/// silent hangs the operation forever. These settings abort a transfer that moves less than
-/// 1 byte per second for 60 seconds, while slow transfers that still make progress keep going.
-const HTTP_STALL_LIMITS: [(&str, &str); 2] =
-    [("http.lowSpeedLimit", "1"), ("http.lowSpeedTime", "60")];
-
-/// Returns `-c` arguments for each of [`HTTP_STALL_LIMITS`] the user hasn't configured.
-fn http_stall_limit_args<P>(harness_env: &HarnessEnv<P>) -> Vec<String>
-where
-    P: AsRef<Path>,
-{
-    let config = match harness_env {
-        HarnessEnv::Repo(repo_path) => gix::open(repo_path.as_ref())
-            .ok()
-            .map(|repo| repo.config_snapshot().plumbing().clone()),
-        HarnessEnv::Global(_) => gix::config::File::from_globals().ok().map(|mut config| {
-            // Git applies `GIT_CONFIG_*` overrides on top; a repository's config has them already.
-            if let Ok(overrides) = gix::config::File::from_environment_overrides() {
-                config.append(overrides).ok();
-            }
-            config
-        }),
+    let cwd = harness_env.cwd();
+    let Some(on_prompt) = on_prompt else {
+        // Directly execute the Git command without the askpass machinery. This is useful for the CLI, as the child
+        // process simply inherits stdin from the parent process, and doesn't need the askpass helper.
+        return executor
+            .execute(&args, cwd, Some(envs))
+            .await
+            .map_err(Error::<E>::Exec);
     };
-    HTTP_STALL_LIMITS
-        .into_iter()
-        .filter(|(key, _)| {
-            config
-                .as_ref()
-                .is_none_or(|config| config.raw_value(*key).is_err())
-        })
-        .flat_map(|(key, value)| ["-c".to_owned(), format!("{key}={value}")])
-        .collect()
-}
 
-/// Askpass-aware execution of Git commands, allowing the GUI to communicate with the askpass
-/// process over a pipe or socket.
-async fn execute_with_indirect_askpass<P, F, Fut, E>(
-    harness_env: HarnessEnv<P>,
-    executor: &E,
-    args: &[&str],
-    mut envs: HashMap<String, String>,
-    mut on_prompt: F,
-) -> Result<(usize, String, String), Error<E>>
-where
-    P: AsRef<Path>,
-    E: GitExecutor,
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
-{
-    let mut current_exe = std::env::current_exe().map_err(Error::<E>::NoSelfExe)?;
-    // On Windows, we get these \\? prefix that have issues. Let's do nothing there for now,
-    // and otherwise switch to `gix::path::realpath()` everywhere.
-    if cfg!(unix) {
-        current_exe = current_exe.canonicalize().unwrap_or(current_exe);
-    }
+    let session = AskpassSession::new(askpass_exe_next_to_current_exe()?).await?;
+    envs.extend(session.env());
 
-    // TODO(qix-): Get parent PID of connecting processes to make sure they're us.
-    // This is a bit of a hack. Under a test environment, Cargo is running a
-    // test runner with a quasi-random suffix. The actual executables live in
-    // the parent directory. Thus, we have to do this under test. It's not
-    // ideal, but it works for now.
-    //
-    // TODO: remove this special case once `gitbutler-branch-actions` is gone.
-    if current_exe.iter().nth_back(1) == Some("deps".as_ref()) {
-        current_exe = current_exe.parent().unwrap().to_path_buf();
-    }
-
-    let askpath_path = current_exe
-        .with_file_name("gitbutler-git-askpass")
-        .with_extension(std::env::consts::EXE_EXTENSION);
-
-    let res = executor.stat(&askpath_path).await.map_err(Error::<E>::Exec);
-    if res.is_err() {
-        let (path, prefix) = if let Some(workdir) = std::env::current_dir().ok().and_then(|cwd| {
-            gix::discover::upwards(&cwd)
-                .ok()
-                .and_then(|p| p.0.into_repository_and_work_tree_directories().1)
-        }) {
-            let prefix = std::env::var_os("CARGO_TARGET_DIR")
-                .map(std::path::PathBuf::from)
-                .map(|path| {
-                    format!(
-                        "CARGO_TARGET_DIR={path} ",
-                        path = path.strip_prefix(&workdir).unwrap_or(&path).display()
-                    )
-                })
-                .unwrap_or_default();
-            (
-                askpath_path.strip_prefix(&workdir).unwrap_or(&askpath_path),
-                prefix,
-            )
-        } else {
-            (askpath_path.as_path(), "".into())
-        };
-        return Err(Error::<E>::AskpassExecutableNotFound {
-            path: path.display().to_string(),
-            prefix,
-        });
-    }
-    let askpath_stat = res?;
-
-    #[expect(unsafe_code)]
-    let sock_server = unsafe { executor.create_askpass_server() }
-        .await
-        .map_err(Error::<E>::Exec)?;
-
-    // NB: StdRng is always a cryptographically secure random generator.
-    let secret = rand::rngs::StdRng::from_os_rng()
-        .sample_iter(&rand::distr::Alphanumeric)
-        .take(ASKPASS_SECRET_LENGTH)
-        .map(char::from)
-        .collect::<String>();
-
-    envs.insert("GITBUTLER_ASKPASS_PIPE".into(), sock_server.to_string());
-    envs.insert("GITBUTLER_ASKPASS_SECRET".into(), secret.clone());
-
-    // Note: SSH_ASKPASS_REQUIRE is available since SSH 8.4, which was released in 2020, and as
-    // such has further backwards compatibility than we do with the GUI in general. At this
-    // point it is therefore relatively safe to depend on this behavior.
-    //
-    // See https://www.openssh.org/txt/release-8.4
-    //
-    // At the time of writing, our oldest supported Linux distro is Ubuntu 22.04, and it has OpenSSH 8.9: https://packages.ubuntu.com/jammy/openssh-client
-    //
-    // macOS has shipped with OpenSSH 8.6 since Monterey (2021): https://www.reddit.com/r/MacOSBeta/comments/nzouk2/monterey_ssh_version/
-    //
-    // Windows 11 does not have a concept of a controlling terminal, but appears to require
-    // SSH_ASKPASS_REQUIRE=force to look at SSH_ASKPASS: https://github.com/PowerShell/Win32-OpenSSH/issues/2115
-    //
-    // Note that when setting SSH_ASKPASS_REQUIRE to force, we do NOT need to set DISPLAY and we do
-    // NOT need to disconnect from the controlling terminal, as is otherwise the case for SSH to
-    // consider having a peek at the SSH_ASKPASS variable.
-    //
-    // See the OpenSSH client manual for more info.
-    envs.insert("SSH_ASKPASS".into(), askpath_path.display().to_string());
-    envs.insert("SSH_ASKPASS_REQUIRE".into(), "force".into());
-
-    let cwd = match harness_env {
-        HarnessEnv::Repo(p) | HarnessEnv::Global(p) => p,
-    };
     let mut child_process = core::pin::pin! {
         async {
             executor
-                .execute(args, cwd, Some(envs))
+                .execute(&args, cwd, Some(envs))
                 .await
                 .map_err(Error::<E>::Exec)
         }.fuse()
     };
-
-    loop {
-        select! {
-            res = child_process => {
-                return res;
-            },
-            res = sock_server.accept().fuse() => {
-                let mut sock = res.map_err(Error::<E>::AskpassServer)?;
-
-                // get the PID of the peer
-                let peer_pid = sock.pid().map_err(Error::<E>::NoPid)?;
-
-                // get the full image path of the peer id; this is pretty expensive at the moment.
-                // TODO(qix-): see if dropping sysinfo for a more bespoke implementation is worth it.
-                let mut system = sysinfo::System::new();
-                system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-                #[cfg(unix)]
-                let peer_pid_u32: u32 = peer_pid
-                    .try_into()
-                    .map_err(|_| Error::<E>::NoSuchPid(peer_pid))?;
-                #[cfg(windows)]
-                let peer_pid_u32: u32 = peer_pid;
-
-                let peer_path = system
-                    .process(sysinfo::Pid::from_u32(peer_pid_u32))
-                    .and_then(|p| p.exe().map(|exe| exe.to_string_lossy().into_owned()))
-                    .ok_or(Error::<E>::NoSuchPid(peer_pid))?;
-
-                // stat the askpass executable that is being invoked
-                let peer_stat = executor.stat(&peer_path).await.map_err(Error::<E>::Exec)?;
-
-                let valid_executable = if peer_stat.ino == askpath_stat.ino {
-                    if peer_stat.dev != askpath_stat.dev {
-                        Err(Error::<E>::AskpassDeviceMismatch)?;
-                    }
-
-                    true
-                } else {
-                    false
-                };
-
-                if !valid_executable {
-                    Err(Error::<E>::AskpassExecutableMismatch)?;
-                }
-
-                // await for peer to send secret
-                let peer_secret = sock.read_line().await.map_err(Error::<E>::AskpassIo)?;
-
-                // check the secret
-                if peer_secret.trim() != secret {
-                    Err(Error::<E>::AskpassSecretMismatch)?;
-                }
-
-                // get the prompt
-                let prompt = sock.read_line().await.map_err(Error::<E>::AskpassIo)?;
-
-                // call the prompt handler
-                let response = on_prompt(prompt.clone()).await;
-                if let Some(response) = response {
-                    sock.write_line(&response).await.map_err(Error::<E>::AskpassIo)?;
-                } else {
-                    return Err(Error::<E>::NeedsAuthorization(prompt));
-                }
-            }
-        }
-    }
-}
-
-/// Directly execute the Git command without invoking the askpass pipe machinery. This is useful
-/// for the CLI, as the child process simply inherits stdin from the parent process and therefore
-/// doesn't need the askpass mechanism.
-///
-/// It's doubly useful in the sense that the CLI then does not need the askpass binary.
-async fn execute_direct<P, E>(
-    harness_env: HarnessEnv<P>,
-    executor: &E,
-    args: &[&str],
-    envs: HashMap<String, String>,
-) -> Result<(usize, String, String), Error<E>>
-where
-    P: AsRef<Path>,
-    E: GitExecutor,
-{
-    let cwd = match harness_env {
-        HarnessEnv::Repo(p) | HarnessEnv::Global(p) => p,
-    };
-
-    executor
-        .execute(args, cwd, Some(envs))
-        .await
-        .map_err(Error::<E>::Exec)
-}
-
-/// Create an environment variable mapping that is guaranteed to have the Git SSH command configured
-/// in either GIT_SSH_COMMAND or GIT_SSH.
-///
-/// Resolution order reflects Git: GIT_SSH_COMMAND -> core.sshCommand -> GIT_SSH
-/// See https://github.com/git/git/blob/60f07c4f5c5f81c8a994d9e06b31a4a3a1679864/connect.c#L1382-L1397
-///
-/// If no configuration is encountered in any of these locations, we set our own default
-/// configuration for `ssh` in GIT_SSH_COMMAND. This should be the case hit by the vast majority of
-/// users, and it is tuned for what we believe is a good balance between security and convenience.
-///
-/// Note that we never add any options to existing configuration. If the user has made explicit
-/// choices about how SSH should behave, we respect those choices and leave it to the user to deal
-/// with the consequences.
-fn new_env_with_git_ssh_configured<P>(harness_env: &HarnessEnv<P>) -> HashMap<String, String>
-where
-    P: AsRef<Path>,
-{
-    let mut envs = HashMap::new();
-
-    // Minor correctness issue: Neither GIT_SSH_COMMAND nor GIT_SSH are required to be unicode.
-    // It's entirely possible to have non-unicode byte sequences in paths, for example. This should
-    // be rewritten to use `std::env::var_os()` and the executor should be tweaked to let `envs`
-    // contain raw binary strings. This is however exceedingly unlikely to be a problem in practice
-    // so we'll keep it like this for now.
-    if let Ok(Some(git_ssh_command)) = get_git_ssh_command(harness_env) {
-        envs.insert("GIT_SSH_COMMAND".into(), git_ssh_command);
-        return envs;
-    }
-
-    if let Ok(git_ssh) = std::env::var("GIT_SSH") {
-        envs.insert("GIT_SSH".into(), git_ssh);
-        return envs;
-    }
-
-    // There is nothing preconfigured - we apply our own defaults.
-    let additional_options = {
-        // In test environments, we don't want to pollute the user's known hosts file.
-        // So, we just use /dev/null instead.
-        #[cfg(test)]
-        {
-            " -o UserKnownHostsFile=/dev/null"
-        }
-        #[cfg(not(test))]
-        {
-            ""
-        }
-    };
-
-    // Keepalives close the connection once the server hasn't answered for 60 seconds
-    // (4 probes, 15 seconds apart); without them a half-open connection hangs forever.
-    let git_ssh_command = format!(
-        "ssh -o StrictHostKeyChecking=accept-new -o KbdInteractiveAuthentication=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4{additional_options}"
-    );
-    envs.insert("GIT_SSH_COMMAND".into(), git_ssh_command);
-    envs
-}
-
-/// Gets GIT_SSH_COMMAND from env first, config second.
-///
-/// Correctness issue: If the command is not valid UTF8, this function returns Ok(None). When the
-/// executor is updated to be able to handle binary strings for envs, this should be rewritten
-/// accordingly.
-fn get_git_ssh_command<P>(harness_env: &HarnessEnv<P>) -> anyhow::Result<Option<String>>
-where
-    P: AsRef<Path>,
-{
-    match harness_env {
-        HarnessEnv::Repo(repo_path) => Ok(gix::open(repo_path.as_ref())?
-            .config_snapshot()
-            .trusted_program(gix::config::tree::Core::SSH_COMMAND)?
-            .and_then(|program| program.to_str().map(String::from))),
-        HarnessEnv::Global(_) => Ok(gix::config::File::from_globals()?
-            .string(gix::config::tree::Core::SSH_COMMAND)
-            .and_then(|program| program.to_str().ok().map(String::from))),
+    let mut serving = core::pin::pin!(session.serve(on_prompt).fuse());
+    select! {
+        res = child_process => res,
+        res = serving => match res {
+            Ok(never) => match never {},
+            Err(err) => Err(err.into()),
+        },
     }
 }
 
@@ -453,8 +163,8 @@ pub async fn fetch<P, F, Fut, E>(
 where
     P: AsRef<Path>,
     E: GitExecutor,
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
+    F: FnMut(String) -> Fut + Send,
+    Fut: std::future::Future<Output = Option<String>> + Send + 'static,
 {
     let repo_path = repo_path.as_ref();
     let repo = gix::open(repo_path).map_err(|source| Error::<E>::RepositoryOpen {
@@ -520,8 +230,8 @@ pub async fn prune<P, F, Fut, E>(
 where
     P: AsRef<Path>,
     E: GitExecutor,
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
+    F: FnMut(String) -> Fut + Send,
+    Fut: std::future::Future<Output = Option<String>> + Send + 'static,
 {
     let repo_path = repo_path.as_ref();
     let args = ["remote", "prune", remote];
@@ -574,10 +284,10 @@ pub async fn push<P, F, Fut, E>(
 where
     P: AsRef<Path>,
     E: GitExecutor,
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
+    F: FnMut(String) -> Fut + Send,
+    Fut: std::future::Future<Output = Option<String>> + Send + 'static,
 {
-    let mut args = vec!["push", "--quiet", "--no-verify"];
+    let mut args = vec!["push", "--quiet"];
 
     let is_deletion = refspec.source.is_none();
     let refspec = refspec.to_string();
@@ -670,8 +380,8 @@ pub async fn clone<P, F, Fut, E>(
 where
     P: AsRef<Path>,
     E: GitExecutor,
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
+    F: FnMut(String) -> Fut + Send,
+    Fut: std::future::Future<Output = Option<String>> + Send + 'static,
 {
     let target_dir = target_dir.as_ref();
 

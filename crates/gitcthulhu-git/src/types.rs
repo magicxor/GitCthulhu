@@ -1949,18 +1949,8 @@ pub enum ExportPatch {
     Commit(ObjectId),
 }
 
-/// How unknown SSH host keys are treated.
-///
-/// Will be replaced by a re-export of `gitbutler_git::askpass_harness::HostKeyPolicy` once WP-B0c has introduced
-/// the harness module; the variants are the same.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum HostKeyPolicy {
-    /// `StrictHostKeyChecking=accept-new`: trust unknown hosts on first use, refuse changed keys.
-    #[default]
-    AcceptNew,
-    /// `StrictHostKeyChecking=ask`: confirm every unknown host through the credential prompter.
-    Ask,
-}
+/// How unknown SSH host keys are treated (`AcceptNew` by default, or `Ask` through the credential prompter).
+pub use gitbutler_git::askpass_harness::HostKeyPolicy;
 
 /// Options of `rebase::rebase` and `rebase::start_interactive`.
 #[derive(Debug, Clone, Default)]

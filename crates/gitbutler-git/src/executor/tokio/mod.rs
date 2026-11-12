@@ -12,8 +12,12 @@ use tokio::process::Command;
 
 #[cfg(unix)]
 pub use self::unix::TokioAskpassServer;
+#[cfg(unix)]
+pub(crate) use self::unix::stat;
 #[cfg(windows)]
 pub use self::windows::TokioAskpassServer;
+#[cfg(windows)]
+pub(crate) use self::windows::stat;
 
 /// A Git executor implementation using the `git` command-line tool
 /// via [`tokio::process::Command`].
@@ -48,18 +52,7 @@ unsafe impl super::GitExecutor for TokioExecutor {
         }
 
         if let Some(envs) = envs {
-            #[cfg(not(windows))]
             cmd.envs(envs);
-
-            // On Windows, we have to escape backslashes in
-            // environment variable values. Not sure why.
-            #[cfg(windows)]
-            {
-                cmd.envs(envs.iter().map(|(k, v)| {
-                    let v = v.replace('\\', "\\\\");
-                    (k, v)
-                }));
-            }
         }
 
         let output = cmd.output().await?;
@@ -106,8 +99,8 @@ unsafe impl super::GitExecutor for TokioExecutor {
 }
 
 fn debug_log_sanitised_git_cmd(cmd: &mut Command) {
-    cmd.env_remove("GITBUTLER_ASKPASS_SECRET")
-        .env_remove("GITBUTLER_ASKPASS_PIPE")
+    cmd.env_remove("GITCTHULHU_ASKPASS_SECRET")
+        .env_remove("GITCTHULHU_ASKPASS_PIPE")
         .env_remove("SSH_ASKPASS");
     tracing::debug!(?cmd, "sanitised Git invocation");
 }

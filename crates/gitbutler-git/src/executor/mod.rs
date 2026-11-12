@@ -90,15 +90,15 @@ pub unsafe trait GitExecutor {
     }
 
     /// Creates a named pipe server that is compatible with
-    /// the `askpass` utility (see `bin/askpass.rs` and platform-specific
-    /// adjacent sources).
+    /// the askpass helper (`gitcthulhu_git::helper_main::askpass_main` and
+    /// its platform-specific modules).
     ///
     /// ## Unix
     ///
     /// On Unix-like systems (including macOS), this is a unix
     /// domain socket. The path of the socket is returned as
     /// a handle type that is format-able as a string which is
-    /// passed to the askpass utility as `GITBUTLER_ASKPASS_SOCKET`.
+    /// passed to the askpass utility as `GITCTHULHU_ASKPASS_PIPE`.
     ///
     /// The socket itself should be created as read/write for the user
     /// with no access to group or everyone (`0600` or `u+rw ag-a`).
@@ -113,7 +113,7 @@ pub unsafe trait GitExecutor {
     ///
     /// On Windows, this is a named pipe. The handle returned must be
     /// format-able as a string which is passed to the askpass utility
-    /// as `GITBUTLER_ASKPASS_SOCKET` and corresponds to the named
+    /// as `GITCTHULHU_ASKPASS_PIPE` and corresponds to the named
     /// pipe.
     ///
     /// The pipe name MUST start with `\.\pipe\LOCAL\`. Given that this

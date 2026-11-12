@@ -1789,9 +1789,7 @@ name = "gitbutler-git"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "but-askpass",
  "but-core",
- "but-error",
  "but-testsupport",
  "file-id",
  "futures",

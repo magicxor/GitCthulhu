@@ -146,10 +146,10 @@ impl Render for ConfirmDialog {
                             .child(self.request.title.clone()),
                     )
                     .child(
+                        // A flex row would not wrap the text: long messages (the undo confirmations list ref
+                        // changes) were clipped on both sides.
                         div()
                             .w_full()
-                            .flex()
-                            .justify_center()
                             .text_center()
                             .text_body2()
                             .child(self.request.message.clone()),

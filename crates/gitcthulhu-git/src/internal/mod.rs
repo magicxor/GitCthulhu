@@ -1,10 +1,11 @@
 //! Crate-internal helpers shared by several modules. Nothing in here is public API.
-// B-INT: `content`, `linediff` and `partial` are not consumed yet: diff.rs (B2) and stage.rs (B3) still carry private
-// copies of the line engine and content reads. Remove this allow when they are migrated (spec 4.3).
-#![allow(dead_code)]
 
 pub(crate) mod content;
 pub(crate) mod linediff;
+// Not consumed yet: branch.rs, tag.rs, remote.rs and worktree.rs still validate names themselves, with rules that
+// differ in detail (see the module docs). Adopting `names` changes what those modules accept, so it is their owners'
+// follow-up; until then this one module is exempt.
+#[allow(dead_code)]
 pub(crate) mod names;
 pub(crate) mod partial;
 pub(crate) mod pathspec;

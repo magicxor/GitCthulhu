@@ -1,15 +1,16 @@
 //! File and commit diffs (WP-B2): the line diff of one file, the files of a commit, budgeted staged patch text for
 //! AI prompts, exact patch export and raw blob reads.
 //!
-//! Reads run in-process on `gix`; only [`export_patch`] runs the `git` executable. The line diff is computed by one
-//! engine (`lines` below): the line numbers a [`DiffLine`] carries are exactly the edit-script indexes a staging
-//! operation replays.
+//! Reads run in-process on `gix`; only [`export_patch`] runs the `git` executable. The line diff comes from the
+//! crate's one line engine (`internal::linediff`, shared with `stage.rs`); side contents come from
+//! `internal::content` and partial availability from `internal::partial`, so the line numbers a [`DiffLine`]
+//! carries are exactly the edit-script indexes a staging operation replays, and `TextDiff::partial` is exactly what
+//! the staging functions enforce.
 
 use std::{
     borrow::Cow,
     collections::HashMap,
     ffi::OsString,
-    io::Read,
     num::NonZeroUsize,
     ops::Range,
     path::{Path, PathBuf},
@@ -24,10 +25,16 @@ use lru::LruCache;
 
 use crate::{
     Against, BlobSide, CancelToken, ChangeKind, CommitDetails, CommitFile, CommitFilesOptions,
-    CommitInfo, DiffAlgorithm, DiffContent, DiffLine, DiffOptions, DiffTarget, EntryKind, Eol,
-    EolStyle, ExportPatch, FileDiff, FileStat, GitError, GitTime, Hunk, HunkHeader, ImageData,
-    LineKind, PartialAvailability, PartialBlock, PatchText, PatchTextOptions, Person, RelaPath,
-    Repo, Result, Side, Signature, SubmoduleSummary, TextDiff, WhitespaceMode, types::ArenaRange,
+    CommitInfo, DiffContent, DiffLine, DiffOptions, DiffTarget, EntryKind, ExportPatch, FileDiff,
+    FileStat, GitError, GitTime, Hunk, ImageData, LineKind, OpContext, PartialAvailability,
+    PatchText, PatchTextOptions, Person, RelaPath, Repo, Result, Side, Signature, SizeUnit,
+    SubmoduleSummary, TextDiff, WhitespaceMode,
+    cli::{self, CommandKind, GitCommand},
+    internal::{
+        content::{self, SideContent, WorktreeReader},
+        linediff, partial,
+    },
+    types::ArenaRange,
 };
 
 impl Default for DiffOptions {
@@ -93,17 +100,6 @@ fn not_found(what: &'static str, name: impl ToString) -> GitError {
     }
 }
 
-fn to_gix_kind(kind: EntryKind) -> gix::object::tree::EntryKind {
-    use gix::object::tree::EntryKind as K;
-    match kind {
-        EntryKind::Blob => K::Blob,
-        EntryKind::BlobExecutable => K::BlobExecutable,
-        EntryKind::Link => K::Link,
-        EntryKind::Submodule => K::Commit,
-        EntryKind::Tree => K::Tree,
-    }
-}
-
 /// Regular files of either flavour count as the same class for "type change" decisions.
 fn kind_class(kind: EntryKind) -> u8 {
     match kind {
@@ -114,19 +110,9 @@ fn kind_class(kind: EntryKind) -> u8 {
     }
 }
 
+/// The entry kind of an index mode; an invalid mode counts as a regular file (status lists must not fail on it).
 fn index_kind(mode: gix::index::entry::Mode) -> EntryKind {
-    use gix::index::entry::Mode as M;
-    if mode == M::SYMLINK {
-        EntryKind::Link
-    } else if mode == M::COMMIT {
-        EntryKind::Submodule
-    } else if mode == M::DIR {
-        EntryKind::Tree
-    } else if mode == M::FILE_EXECUTABLE {
-        EntryKind::BlobExecutable
-    } else {
-        EntryKind::Blob
-    }
+    content::entry_kind_from_mode(mode).unwrap_or(EntryKind::Blob)
 }
 
 /// Whether the file name ends in one of the image extensions previews are offered for.
@@ -156,20 +142,50 @@ fn is_blob(kind: EntryKind) -> bool {
     matches!(kind, EntryKind::Blob | EntryKind::BlobExecutable)
 }
 
-fn compute_blob_id(repo: &gix::Repository, data: &[u8]) -> Result<ObjectId> {
-    gix::objs::compute_hash(repo.object_hash(), gix::object::Kind::Blob, data).map_err(eh)
-}
-
 // ───────────────────────────── target resolution ─────────────────────────────
 
+/// Where a resolved side's content comes from.
+enum Source {
+    /// A blob (or submodule commit) in the object database, read only when needed.
+    Object,
+    /// The worktree file, already read in git form while resolving (its kind depends on what is on disk).
+    Worktree(SideContent),
+}
+
 /// One resolved side of a diff.
-#[derive(Clone)]
 struct Resolved {
-    path: RelaPath,
     kind: EntryKind,
-    /// The blob (or submodule commit); null for the worktree file.
+    /// The blob or submodule commit. For a worktree side: the hash of its git form, null if it was too large to read
+    /// (or a nested repository without `HEAD`).
     id: ObjectId,
-    worktree: bool,
+    source: Source,
+}
+
+impl Resolved {
+    fn object(side: Side) -> Self {
+        Resolved {
+            kind: side.kind,
+            id: side.id,
+            source: Source::Object,
+        }
+    }
+
+    fn is_worktree(&self) -> bool {
+        matches!(self.source, Source::Worktree(_))
+    }
+
+    /// The side without reading anything: worktree sides as read, object sides with `size`.
+    fn cheap_side(&self, size: u64) -> BlobSide {
+        match &self.source {
+            Source::Worktree(content) => content.side,
+            Source::Object => BlobSide {
+                id: self.id,
+                kind: self.kind,
+                size,
+                from_worktree: false,
+            },
+        }
+    }
 }
 
 struct Plan {
@@ -178,27 +194,27 @@ struct Plan {
     kind: ChangeKind,
     old: Option<Resolved>,
     new: Option<Resolved>,
-    /// An unstaged rename (index to worktree).
-    unstaged_rename: bool,
+    /// Which images are compared (decides the rename rule of §4.2).
+    sides: partial::Sides,
 }
 
-fn tree_entry(tree: &gix::Tree<'_>, path: &BStr) -> Result<Option<(ObjectId, EntryKind)>> {
-    let entry = tree
-        .lookup_entry(path.split_str("/").map(|c| c.as_bstr().to_owned()))
-        .map_err(eh)?;
-    Ok(entry.and_then(|entry| {
-        let kind = EntryKind::from(entry.mode().kind());
-        (kind != EntryKind::Tree).then(|| (entry.object_id(), kind))
-    }))
-}
-
-fn head_tree(repo: &gix::Repository) -> Result<Option<gix::Tree<'_>>> {
-    let head = repo.head().map_err(eh)?;
-    if head.is_unborn() {
+/// The non-directory entry at `path` in `tree`.
+fn tree_resolved(
+    g: &gix::Repository,
+    tree: Option<ObjectId>,
+    path: &RelaPath,
+) -> Result<Option<Resolved>> {
+    let Some(tree) = tree else {
         return Ok(None);
-    }
-    let commit = repo.head_commit().map_err(eh)?;
-    Ok(Some(commit.tree().map_err(eh)?))
+    };
+    Ok(content::tree_entry(g, tree, path.as_bstr())?
+        .filter(|side| side.kind != EntryKind::Tree)
+        .map(Resolved::object))
+}
+
+fn head_tree(repo: &gix::Repository) -> Result<Option<ObjectId>> {
+    let tree = repo.head_tree_id_or_empty().map_err(eh)?.detach();
+    Ok((tree != ObjectId::empty_tree(repo.object_hash())).then_some(tree))
 }
 
 fn peel_tree(repo: &gix::Repository, id: ObjectId) -> Result<gix::Tree<'_>> {
@@ -228,127 +244,6 @@ fn against_tree<'repo>(
     })
 }
 
-fn tree_resolved(tree: Option<&gix::Tree<'_>>, path: &RelaPath) -> Result<Option<Resolved>> {
-    let Some(tree) = tree else {
-        return Ok(None);
-    };
-    Ok(
-        tree_entry(tree, path.as_bstr())?.map(|(id, kind)| Resolved {
-            path: path.clone(),
-            kind,
-            id,
-            worktree: false,
-        }),
-    )
-}
-
-fn index_resolved(
-    index: &gix::index::State,
-    path: &RelaPath,
-    stage: gix::index::entry::Stage,
-) -> Option<(Resolved, bool)> {
-    let entry = index.entry_by_path_and_stage(path.as_bstr(), stage)?;
-    Some((
-        Resolved {
-            path: path.clone(),
-            kind: index_kind(entry.mode),
-            id: entry.id,
-            worktree: false,
-        },
-        entry
-            .flags
-            .contains(gix::index::entry::Flags::INTENT_TO_ADD),
-    ))
-}
-
-/// The worktree file at `path`, if any, with its size. `old_kind` decides the executable bit when the file system
-/// does not carry one.
-fn worktree_resolved(
-    repo: &gix::Repository,
-    workdir: &Path,
-    path: &RelaPath,
-    old_kind: Option<EntryKind>,
-) -> Result<Option<(Resolved, u64)>> {
-    let full = workdir.join(path_of(path.as_bstr())?);
-    let md = match std::fs::symlink_metadata(&full) {
-        Ok(md) => md,
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(err) => return Err(GitError::io(&full, err)),
-    };
-    let (kind, size) = if md.is_symlink() {
-        (EntryKind::Link, md.len())
-    } else if md.is_dir() {
-        if !full.join(".git").exists() {
-            return Ok(None);
-        }
-        (EntryKind::Submodule, 0)
-    } else if md.is_file() && old_kind == Some(EntryKind::Link) && !symlinks_enabled(repo) {
-        // `core.symlinks=false` (the Git for Windows default): Git checks a link out as a plain file holding the
-        // target and keeps the index entry a link, so this is still a link and not a type change.
-        (EntryKind::Link, md.len())
-    } else if md.is_file() {
-        let honours_exec_bit = repo
-            .config_snapshot()
-            .boolean("core.filemode")
-            .unwrap_or(cfg!(unix));
-        let executable = if honours_exec_bit {
-            is_executable(&md)
-        } else {
-            old_kind == Some(EntryKind::BlobExecutable)
-        };
-        (
-            if executable {
-                EntryKind::BlobExecutable
-            } else {
-                EntryKind::Blob
-            },
-            md.len(),
-        )
-    } else {
-        return Ok(None);
-    };
-    let id = if kind == EntryKind::Submodule {
-        gix::open(&full)
-            .ok()
-            .and_then(|sub| sub.head_id().ok().map(|id| id.detach()))
-            .unwrap_or_else(|| repo.object_hash().null())
-    } else {
-        repo.object_hash().null()
-    };
-    Ok(Some((
-        Resolved {
-            path: path.clone(),
-            kind,
-            id,
-            worktree: true,
-        },
-        size,
-    )))
-}
-
-/// `core.symlinks` (gix' default: `true`).
-fn symlinks_enabled(repo: &gix::Repository) -> bool {
-    repo.filesystem_options().map_or(true, |caps| caps.symlink)
-}
-
-#[cfg(unix)]
-fn is_executable(md: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    md.permissions().mode() & 0o100 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_md: &std::fs::Metadata) -> bool {
-    false
-}
-
 fn change_kind(old: &Resolved, new: &Resolved, renamed: bool) -> ChangeKind {
     if renamed {
         ChangeKind::Renamed
@@ -359,7 +254,7 @@ fn change_kind(old: &Resolved, new: &Resolved, renamed: bool) -> ChangeKind {
     }
 }
 
-fn plan_target(repo: &Repo, g: &gix::Repository, target: &DiffTarget) -> Result<Plan> {
+fn plan_target(g: &gix::Repository, target: &DiffTarget, opts: &DiffOptions) -> Result<Plan> {
     use gix::index::entry::Stage;
     match target {
         DiffTarget::Staged {
@@ -367,10 +262,15 @@ fn plan_target(repo: &Repo, g: &gix::Repository, target: &DiffTarget) -> Result<
             previous_path,
         } => {
             let index = g.index_or_empty().map_err(eh)?;
-            let tree = head_tree(g)?;
             let old_path = previous_path.as_ref().unwrap_or(path);
-            let old = tree_resolved(tree.as_ref(), old_path)?;
-            let new = index_resolved(&index, path, Stage::Unconflicted).map(|(r, _)| r);
+            let old = tree_resolved(g, head_tree(g)?, old_path)?;
+            let new =
+                content::index_entry(&index, path.as_bstr(), Stage::Unconflicted)?.map(|entry| {
+                    Resolved::object(Side {
+                        id: entry.id,
+                        kind: entry.kind,
+                    })
+                });
             let kind = match (&old, &new) {
                 (None, None) => return Err(not_found("file", path)),
                 (None, Some(_)) => ChangeKind::Added,
@@ -383,37 +283,45 @@ fn plan_target(repo: &Repo, g: &gix::Repository, target: &DiffTarget) -> Result<
                 kind,
                 old,
                 new,
-                unstaged_rename: false,
+                sides: partial::Sides::HeadToIndex,
             })
         }
         DiffTarget::Unstaged {
             path,
             previous_path,
         } => {
-            let workdir = repo.workdir().ok_or(GitError::BareRepository)?;
-            let index = g.index_or_empty().map_err(eh)?;
+            let mut reader = WorktreeReader::new(g)?;
+            let index = reader.index();
             let old_path = previous_path.as_ref().unwrap_or(path);
-            let conflicted = [Stage::Base, Stage::Ours, Stage::Theirs]
-                .into_iter()
-                .any(|stage| {
-                    index
-                        .entry_by_path_and_stage(path.as_bstr(), stage)
-                        .is_some()
-                });
-            let (old, kind_hint) = if conflicted {
+            let conflicted = content::is_conflicted(index, path.as_bstr());
+            let (entry, kind_hint) = if conflicted {
                 (
-                    index_resolved(&index, path, Stage::Ours).map(|(r, _)| r),
+                    content::index_entry(index, path.as_bstr(), Stage::Ours)?,
                     Some(ChangeKind::Conflicted),
                 )
             } else {
-                match index_resolved(&index, old_path, Stage::Unconflicted) {
-                    Some((_, true)) => (None, Some(ChangeKind::IntentToAdd)),
-                    Some((resolved, false)) => (Some(resolved), None),
-                    None => (None, None),
-                }
+                let entry = content::index_entry(index, old_path.as_bstr(), Stage::Unconflicted)?;
+                let hint = entry
+                    .is_some_and(|entry| entry.intent_to_add)
+                    .then_some(ChangeKind::IntentToAdd);
+                (entry, hint)
             };
-            let new = worktree_resolved(g, workdir, path, old.as_ref().map(|o| o.kind))?
-                .map(|(resolved, _)| resolved);
+            // An intent-to-add entry has no old side (the diff shows the file like an untracked one), but its mode
+            // still decides the executable bit without `core.fileMode`.
+            let index_kind = entry.map(|entry| entry.kind);
+            let old = entry.filter(|entry| !entry.intent_to_add).map(|entry| {
+                Resolved::object(Side {
+                    id: entry.id,
+                    kind: entry.kind,
+                })
+            });
+            let new = reader
+                .read(path.as_bstr(), opts.max_file_bytes, index_kind)?
+                .map(|content| Resolved {
+                    kind: content.side.kind,
+                    id: content.side.id,
+                    source: Source::Worktree(content),
+                });
             let renamed = previous_path.is_some() && old.is_some();
             let kind = match (kind_hint, &old, &new) {
                 (Some(hint), _, _) => hint,
@@ -428,7 +336,7 @@ fn plan_target(repo: &Repo, g: &gix::Repository, target: &DiffTarget) -> Result<
                 kind,
                 old,
                 new,
-                unstaged_rename: renamed,
+                sides: partial::Sides::IndexToWorktree,
             })
         }
         DiffTarget::Commit {
@@ -456,8 +364,8 @@ fn plan_target(repo: &Repo, g: &gix::Repository, target: &DiffTarget) -> Result<
                 (object.peel_to_tree().map_err(eh)?, old_tree)
             };
             let old_path = previous_path.as_ref().unwrap_or(path);
-            let old = tree_resolved(old_tree.as_ref(), old_path)?;
-            let new = tree_resolved(Some(&new_tree), path)?;
+            let old = tree_resolved(g, old_tree.map(|tree| tree.id), old_path)?;
+            let new = tree_resolved(g, Some(new_tree.id), path)?;
             let kind = match (&old, &new) {
                 (None, None) => return Err(not_found("file", path)),
                 (None, Some(_)) => ChangeKind::Added,
@@ -470,7 +378,7 @@ fn plan_target(repo: &Repo, g: &gix::Repository, target: &DiffTarget) -> Result<
                 kind,
                 old,
                 new,
-                unstaged_rename: false,
+                sides: partial::Sides::Commit,
             })
         }
     }
@@ -490,106 +398,41 @@ pub fn file_diff(
 ) -> Result<FileDiff> {
     check_cancel(cancel)?;
     let g = repo.local();
-    let plan = plan_target(repo, &g, target)?;
-    let (content, old, new) = diff_sides(repo, &g, &plan, opts, cancel)?;
+    let Plan {
+        path,
+        previous_path,
+        kind,
+        old,
+        new,
+        sides,
+    } = plan_target(&g, target, opts)?;
+    let facts = Facts {
+        path: &path,
+        previous_path: previous_path.as_ref(),
+        kind,
+        sides,
+    };
+    let (content, old, new) = diff_sides(repo, &g, &facts, old, new, opts, cancel)?;
     Ok(FileDiff {
         target: target.clone(),
-        path: plan.path,
-        previous_path: plan.previous_path,
-        kind: plan.kind,
+        path,
+        previous_path,
+        kind,
         old,
         new,
         content,
     })
 }
 
-type Sides = (DiffContent, Option<BlobSide>, Option<BlobSide>);
-
-fn blob_size(g: &gix::Repository, id: ObjectId) -> Result<u64> {
-    Ok(g.try_find_header(id)
-        .map_err(eh)?
-        .ok_or_else(|| not_found("blob", id))?
-        .size())
+/// What `diff_sides` needs to know about the change besides its two sides.
+struct Facts<'a> {
+    path: &'a RelaPath,
+    previous_path: Option<&'a RelaPath>,
+    kind: ChangeKind,
+    sides: partial::Sides,
 }
 
-/// The content of a worktree file in the form Git would store, via the repository's filter pipeline.
-fn read_worktree_git_form(g: &gix::Repository, workdir: &Path, path: &RelaPath) -> Result<Vec<u8>> {
-    let full = workdir.join(path_of(path.as_bstr())?);
-    let (mut pipeline, index) = g.filter_pipeline(None).map_err(eh)?;
-    let md = gix::index::fs::Metadata::from_path_no_follow(&full)
-        .map_err(|err| GitError::io(&full, err))?;
-    let mut buf = Vec::new();
-    but_core::worktree::worktree_file_to_git_in_buf(
-        &mut buf,
-        &md,
-        path.as_bstr(),
-        &full,
-        &mut pipeline,
-        &index,
-    )
-    .map_err(eh)?;
-    Ok(buf)
-}
-
-fn read_raw(g: &gix::Repository, workdir: Option<&Path>, side: &Resolved) -> Result<Vec<u8>> {
-    if side.worktree {
-        let workdir = workdir.ok_or(GitError::BareRepository)?;
-        read_worktree_git_form(g, workdir, &side.path)
-    } else {
-        Ok(g.find_blob(side.id)
-            .map_err(|_| not_found("blob", side.id))?
-            .detach()
-            .data)
-    }
-}
-
-/// The side of `side` whose (git-form) content is `raw`: worktree sides get the hash of that content as id.
-fn side_from_bytes(
-    g: &gix::Repository,
-    side: Option<&Resolved>,
-    raw: Option<&[u8]>,
-) -> Result<Option<BlobSide>> {
-    let (Some(side), Some(raw)) = (side, raw) else {
-        return Ok(None);
-    };
-    Ok(Some(BlobSide {
-        id: if side.worktree {
-            compute_blob_id(g, raw)?
-        } else {
-            side.id
-        },
-        kind: side.kind,
-        size: raw.len() as u64,
-        from_worktree: side.worktree,
-    }))
-}
-
-/// The bytes the line diff runs on: the textconv output if a driver produced one, else the git form (for worktree
-/// sides the index-aware conversion in `raw`).
-fn diffable_bytes<'a>(
-    data: gix::diff::blob::platform::resource::Data<'a>,
-    side: Option<&Resolved>,
-    raw: Option<&'a [u8]>,
-) -> &'a [u8] {
-    use gix::diff::blob::platform::resource::Data;
-    match data {
-        Data::Buffer {
-            buf,
-            is_derived: true,
-        } => buf,
-        _ if side.is_some_and(|s| s.worktree) => raw.unwrap_or_default(),
-        _ => data.as_slice().unwrap_or_default(),
-    }
-}
-
-fn cheap_side(side: &Resolved, size: u64) -> BlobSide {
-    BlobSide {
-        id: side.id,
-        kind: side.kind,
-        size,
-        from_worktree: side.worktree,
-    }
-}
+type DiffSides = (DiffContent, Option<BlobSide>, Option<BlobSide>);
 
 fn submodule_summary(
     workdir: Option<&Path>,
@@ -638,176 +481,132 @@ fn submodule_summary(
     })
 }
 
-fn diff_algorithm(
-    g: &gix::Repository,
-    opts: &DiffOptions,
-    from_platform: gix::diff::blob::Algorithm,
-) -> gix::diff::blob::Algorithm {
-    use gix::diff::blob::Algorithm as A;
-    match opts.algorithm {
-        Some(DiffAlgorithm::Myers) => A::Myers,
-        Some(DiffAlgorithm::MyersMinimal) => A::MyersMinimal,
-        Some(DiffAlgorithm::Histogram) => A::Histogram,
-        None if g.config_snapshot().string("diff.algorithm").is_some() => from_platform,
-        // Git's own default; gix' blob default is Histogram.
-        None => A::Myers,
-    }
-}
-
-/// Whether `.gitattributes` routes `path` through the LFS filter.
-fn is_lfs(g: &gix::Repository, path: &RelaPath) -> bool {
-    let attempt = || -> Option<bool> {
-        let index = g.index_or_empty().ok()?;
-        let mut attributes = g
-            .attributes_only(
-                &index,
-                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-            )
-            .ok()?;
-        let mut selected = attributes.selected_attribute_matches(Some("filter"));
-        let at_path = attributes
-            .at_entry(path.as_bstr(), Some(gix::index::entry::Mode::FILE))
-            .ok()?;
-        if !at_path.matching_attributes(&mut selected) {
-            return Some(false);
-        }
-        Some(selected.iter().any(|attribute| {
-            attribute
-                .assignment
-                .state
-                .as_bstr()
-                .is_some_and(|name| name == "lfs")
-        }))
-    };
-    attempt().unwrap_or(false)
-}
-
 fn diff_sides(
     repo: &Repo,
     g: &gix::Repository,
-    plan: &Plan,
+    facts: &Facts<'_>,
+    old: Option<Resolved>,
+    new: Option<Resolved>,
     opts: &DiffOptions,
     cancel: &CancelToken,
-) -> Result<Sides> {
+) -> Result<DiffSides> {
     let workdir = repo.workdir();
-    let (old, new) = (plan.old.as_ref(), plan.new.as_ref());
+    let (old_ref, new_ref) = (old.as_ref(), new.as_ref());
 
     // (1) submodules.
-    if old.is_some_and(|s| s.kind == EntryKind::Submodule)
-        || new.is_some_and(|s| s.kind == EntryKind::Submodule)
+    if old_ref.is_some_and(|s| s.kind == EntryKind::Submodule)
+        || new_ref.is_some_and(|s| s.kind == EntryKind::Submodule)
     {
         let commit_of = |side: Option<&Resolved>| {
             side.filter(|s| s.kind == EntryKind::Submodule && !s.id.is_null())
                 .map(|s| s.id)
         };
-        let (old_commit, new_commit) = (commit_of(old), commit_of(new));
-        let both_submodules = old
-            .zip(new)
+        let (old_commit, new_commit) = (commit_of(old_ref), commit_of(new_ref));
+        let both_submodules = old_ref
+            .zip(new_ref)
             .is_none_or(|(o, n)| o.kind == EntryKind::Submodule && n.kind == EntryKind::Submodule);
         if both_submodules {
+            let side = |side: &Resolved| BlobSide {
+                id: side.id,
+                kind: side.kind,
+                size: 0,
+                from_worktree: side.is_worktree(),
+            };
             return Ok((
                 DiffContent::Submodule {
                     old_commit,
                     new_commit,
                     dirty: None,
-                    summary: submodule_summary(workdir, &plan.path, old_commit, new_commit),
+                    summary: submodule_summary(workdir, facts.path, old_commit, new_commit),
                 },
-                old.map(|s| cheap_side(s, 0)),
-                new.map(|s| cheap_side(s, 0)),
+                old_ref.map(side),
+                new_ref.map(side),
             ));
         }
     }
 
-    // (2) kind changes (file <-> link <-> submodule).
-    if let Some((o, n)) = old.zip(new)
+    // (2) kind changes (file <-> link <-> submodule). Worktree file/link sides are hashed (staleness checks of a
+    // whole-file stage) unless they are too large.
+    if let Some((o, n)) = old_ref.zip(new_ref)
         && kind_class(o.kind) != kind_class(n.kind)
     {
-        // Worktree file/link sides are hashed (staleness checks of a whole-file stage) unless they are too large.
-        let type_change_side = |side: &Resolved| -> Result<BlobSide> {
-            if !side.worktree || side.kind == EntryKind::Submodule {
-                return Ok(cheap_side(side, 0));
-            }
-            let workdir = workdir.ok_or(GitError::BareRepository)?;
-            let full = workdir.join(path_of(side.path.as_bstr())?);
-            let size = std::fs::symlink_metadata(&full)
-                .map(|md| md.len())
-                .map_err(|err| GitError::io(full, err))?;
-            if size > opts.max_file_bytes {
-                return Ok(cheap_side(side, size));
-            }
-            let raw = read_raw(g, workdir.into(), side)?;
-            Ok(side_from_bytes(g, Some(side), Some(&raw))?
-                .unwrap_or_else(|| cheap_side(side, size)))
-        };
         return Ok((
             DiffContent::TypeChange {
                 old: o.kind,
                 new: n.kind,
             },
-            Some(type_change_side(o)?),
-            Some(type_change_side(n)?),
+            Some(o.cheap_side(0)),
+            Some(n.cheap_side(0)),
         ));
     }
 
-    // (3) size thresholds, before anything is read.
+    // (3) size thresholds, before any object is read (worktree sides above the limit were not read either).
     let size_of = |side: &Resolved| -> Result<u64> {
-        if side.worktree {
-            let workdir = workdir.ok_or(GitError::BareRepository)?;
-            let full = workdir.join(path_of(side.path.as_bstr())?);
-            std::fs::symlink_metadata(&full)
-                .map(|md| md.len())
-                .map_err(|err| GitError::io(full, err))
-        } else {
-            blob_size(g, side.id)
-        }
+        Ok(match &side.source {
+            Source::Worktree(content) => content.side.size,
+            Source::Object => g.find_header(side.id)?.size(),
+        })
     };
-    let old_size = old.map(size_of).transpose()?;
-    let new_size = new.map(size_of).transpose()?;
+    let old_size = old_ref.map(size_of).transpose()?;
+    let new_size = new_ref.map(size_of).transpose()?;
     if old_size
         .into_iter()
         .chain(new_size)
         .any(|s| s > opts.max_file_bytes)
     {
-        let null = g.object_hash().null();
         let side = |side: Option<&Resolved>, size: Option<u64>| {
-            side.zip(size).map(|(s, size)| BlobSide {
-                id: if s.worktree { null } else { s.id },
-                kind: s.kind,
-                size,
-                from_worktree: s.worktree,
-            })
+            side.zip(size).map(|(s, size)| s.cheap_side(size))
         };
         return Ok((
             DiffContent::TooLarge {
                 threshold: opts.max_file_bytes,
+                unit: SizeUnit::Bytes,
             },
-            side(old, old_size),
-            side(new, new_size),
+            side(old_ref, old_size),
+            side(new_ref, new_size),
         ));
     }
     check_cancel(cancel)?;
 
-    let old_path = plan.previous_path.as_ref().unwrap_or(&plan.path);
+    let old_path = facts.previous_path.unwrap_or(facts.path);
+    let kinds = (old_ref.map(|s| s.kind), new_ref.map(|s| s.kind));
+    let load = |side: Resolved| -> Result<SideContent> {
+        match side.source {
+            Source::Worktree(content) => Ok(content),
+            Source::Object => content::read_blob(
+                g,
+                Side {
+                    id: side.id,
+                    kind: side.kind,
+                },
+                opts.max_file_bytes,
+            ),
+        }
+    };
+    let old = old.map(load).transpose()?;
+    let new = new.map(load).transpose()?;
+    let old_side = old.as_ref().map(|c| c.side);
+    let new_side = new.as_ref().map(|c| c.side);
+    let old_data = old.and_then(|c| c.data);
+    let new_data = new.and_then(|c| c.data);
 
     // (4) images: by extension, confirmed by sniffing the bytes, each side within `max_image_bytes`. Checked before
     // the binary decision (spec order), so an image with a textconv driver is still previewed as an image.
-    let mut old_raw: Option<Vec<u8>> = None;
-    let mut new_raw: Option<Vec<u8>> = None;
-    let image_candidate = old.is_some_and(|s| is_blob(s.kind) && has_image_extension(old_path))
-        || new.is_some_and(|s| is_blob(s.kind) && has_image_extension(&plan.path));
+    let image_candidate = kinds
+        .0
+        .is_some_and(|k| is_blob(k) && has_image_extension(old_path))
+        || kinds
+            .1
+            .is_some_and(|k| is_blob(k) && has_image_extension(facts.path));
     let within_image_limit = |size: Option<u64>| size.is_none_or(|s| s <= opts.max_image_bytes);
     if image_candidate && within_image_limit(old_size) && within_image_limit(new_size) {
-        old_raw = old.map(|s| read_raw(g, workdir, s)).transpose()?;
-        new_raw = new.map(|s| read_raw(g, workdir, s)).transpose()?;
-        let old_mime = old_raw.as_deref().map(|b| image_mime(old_path, b));
-        let new_mime = new_raw.as_deref().map(|b| image_mime(&plan.path, b));
+        let old_mime = old_data.as_deref().map(|b| image_mime(old_path, b));
+        let new_mime = new_data.as_deref().map(|b| image_mime(facts.path, b));
         if [old_mime, new_mime]
             .into_iter()
             .flatten()
             .all(|m| m.is_some())
         {
-            let old_side = side_from_bytes(g, old, old_raw.as_deref())?;
-            let new_side = side_from_bytes(g, new, new_raw.as_deref())?;
             let image = |bytes: Option<Vec<u8>>, mime: Option<Option<&'static str>>| {
                 bytes.zip(mime.flatten()).map(|(bytes, mime)| ImageData {
                     mime,
@@ -816,8 +615,8 @@ fn diff_sides(
             };
             return Ok((
                 DiffContent::Image {
-                    old: image(old_raw, old_mime),
-                    new: image(new_raw, new_mime),
+                    old: image(old_data, old_mime),
+                    new: image(new_data, new_mime),
                 },
                 old_side,
                 new_side,
@@ -826,79 +625,24 @@ fn diff_sides(
     }
     check_cancel(cancel)?;
 
-    // (5) - (8): gix decides binary / textconv (attributes, diff drivers, the NUL heuristic).
-    let missing_kind = gix::object::tree::EntryKind::Blob;
-    let null = g.object_hash().null();
-    let symlinks = symlinks_enabled(g);
-    // A link checked out as a plain file (`core.symlinks=false`) is read as a file.
-    let gix_kind = |side: &Resolved| {
-        if side.worktree && side.kind == EntryKind::Link && !symlinks {
-            gix::object::tree::EntryKind::Blob
-        } else {
-            to_gix_kind(side.kind)
-        }
-    };
-    let mut cache = g
-        .diff_resource_cache(
-            gix::diff::blob::pipeline::Mode::ToGitUnlessBinaryToTextIsPresent,
-            gix::diff::blob::pipeline::WorktreeRoots {
-                old_root: None,
-                new_root: new
-                    .filter(|n| n.worktree)
-                    .and_then(|_| workdir.map(ToOwned::to_owned)),
-            },
-        )
-        .map_err(eh)?;
-    cache
-        .set_resource(
-            old.map_or(null, |s| s.id),
-            old.map_or(missing_kind, gix_kind),
-            old_path.as_bstr(),
-            gix::diff::blob::ResourceKind::OldOrSource,
-            &g.objects,
-        )
-        .map_err(eh)?;
-    cache
-        .set_resource(
-            new.map_or(null, |s| s.id),
-            new.map_or(missing_kind, gix_kind),
-            plan.path.as_bstr(),
-            gix::diff::blob::ResourceKind::NewOrDestination,
-            &g.objects,
-        )
-        .map_err(eh)?;
-    let prepared = cache.prepare_diff().map_err(eh)?;
-
-    let algorithm = match prepared.operation {
-        gix::diff::blob::platform::prepare_diff::Operation::InternalDiff { algorithm } => {
-            diff_algorithm(g, opts, algorithm)
-        }
-        _ => gix::diff::blob::Algorithm::Myers,
-    };
-    use gix::diff::blob::platform::resource::Data;
-    let (old_data, new_data) = (prepared.old.data, prepared.new.data);
-    let is_binary =
-        matches!(old_data, Data::Binary { .. }) || matches!(new_data, Data::Binary { .. });
-    let derived = prepared.old_or_new_is_derived;
-
-    // Worktree sides: the git form exactly as `git add` would store it, hashed (stage/discard staleness checks).
-    // gix' diff pipeline converts worktree files without the index, so it misses Git's "CRLF already in the index"
-    // rule of `core.autocrlf`; the side is read again through the index-aware filter pipeline.
-    if old.is_some_and(|s| s.worktree) && old_raw.is_none() {
-        old_raw = old.map(|s| read_raw(g, workdir, s)).transpose()?;
+    // (5)-(8): the diff platform decides binary and textconv (attributes, diff drivers, the NUL heuristic) and the
+    // algorithm Git would use for this path.
+    fn resource(side: Option<BlobSide>, path: &RelaPath) -> Option<content::Resource<'_>> {
+        side.map(|side| content::Resource {
+            id: side.id,
+            kind: side.kind,
+            path: path.as_bstr(),
+            worktree: side.from_worktree,
+        })
     }
-    if new.is_some_and(|s| s.worktree) && new_raw.is_none() {
-        new_raw = new.map(|s| read_raw(g, workdir, s)).transpose()?;
-    }
-    let side_of = |side: Option<&Resolved>, raw: Option<&[u8]>, size: Option<u64>| match raw {
-        Some(_) => side_from_bytes(g, side, raw),
-        None => Ok(side.map(|s| cheap_side(s, size.unwrap_or_default()))),
-    };
-    let old_side = side_of(old, old_raw.as_deref(), old_size)?;
-    let new_side = side_of(new, new_raw.as_deref(), new_size)?;
+    let prepared = content::prepare_text(
+        g,
+        resource(old_side, old_path),
+        resource(new_side, facts.path),
+    )?;
 
-    // (5) binary content.
-    if is_binary {
+    // (5) binary content (attributes, diff drivers, the NUL heuristic: decided by the diff platform).
+    if prepared.binary {
         return Ok((DiffContent::Binary, old_side, new_side));
     }
 
@@ -918,44 +662,42 @@ fn diff_sides(
     }
 
     // The bytes to diff: textconv output if a driver produced it, else the git form (for worktree sides the
-    // index-aware conversion read above).
-    let old_bytes = diffable_bytes(old_data, old, old_raw.as_deref());
-    let new_bytes = diffable_bytes(new_data, new, new_raw.as_deref());
+    // index-aware conversion of `WorktreeReader`).
+    let textconv = prepared.old_textconv.is_some() || prepared.new_textconv.is_some();
+    let old_bytes = prepared.old_textconv.or(old_data).unwrap_or_default();
+    let new_bytes = prepared.new_textconv.or(new_data).unwrap_or_default();
 
     // (7) an empty file added or deleted.
-    if old_bytes.is_empty() && new_bytes.is_empty() && (old.is_none() || new.is_none()) {
+    if old_bytes.is_empty() && new_bytes.is_empty() && (old_side.is_none() || new_side.is_none()) {
         return Ok((DiffContent::Empty, old_side, new_side));
     }
 
-    // Why partial operations are not available, if they are not (spec §4.2).
-    let partial = if plan.kind == ChangeKind::Conflicted {
-        Some(PartialBlock::Conflict)
-    } else if old.is_some_and(|s| s.kind == EntryKind::Link)
-        || new.is_some_and(|s| s.kind == EntryKind::Link)
-    {
-        Some(PartialBlock::Symlink)
-    } else if derived {
-        Some(PartialBlock::TextConv)
-    } else if is_lfs(g, &plan.path) {
-        Some(PartialBlock::Lfs)
-    } else if plan.unstaged_rename {
-        Some(PartialBlock::Rename)
-    } else if opts.whitespace != WhitespaceMode::None {
-        Some(PartialBlock::WhitespaceIgnored)
-    } else {
-        None
-    };
-    let partial = partial.map_or(
-        PartialAvailability::Allowed,
-        PartialAvailability::WholeFileOnly,
-    );
+    // Why partial operations are not available, if they are not (spec §4.2): the rules `stage.rs` enforces.
+    let index = g.index_or_empty().map_err(eh)?;
+    let partial = partial::partial_availability(
+        g,
+        &index,
+        facts.path.as_bstr(),
+        facts.sides,
+        &partial::Kinds {
+            old: kinds.0,
+            new: kinds.1,
+            content: partial::ContentClass::Text,
+            renamed: facts.previous_path.is_some() && old_side.is_some(),
+            conflicted: facts.kind == ChangeKind::Conflicted,
+            whitespace: opts.whitespace,
+        },
+        textconv,
+    )?;
 
     check_cancel(cancel)?;
-    match lines::text_diff(old_bytes, new_bytes, algorithm, opts, derived, partial) {
+    let algorithm = linediff::resolve_algorithm(opts.algorithm, prepared.algorithm);
+    match lines::text_diff(&old_bytes, &new_bytes, algorithm, opts, textconv, partial) {
         Some(text) => Ok((DiffContent::Text(Arc::new(text)), old_side, new_side)),
         None => Ok((
             DiffContent::TooLarge {
                 threshold: u64::from(opts.max_lines),
+                unit: SizeUnit::Lines,
             },
             old_side,
             new_side,
@@ -963,114 +705,14 @@ fn diff_sides(
     }
 }
 
-// ───────────────────────────── the line diff engine ─────────────────────────────
+// ───────────────────────────── display of the line diff ─────────────────────────────
 
+/// Turns the shared line engine's edit script (`internal::linediff`) into the displayed [`TextDiff`]: decoded text,
+/// line numbers (= op indexes + 1, so selections replay exactly), hunks and inline word highlights.
 mod lines {
     use super::*;
-    use gix::diff::blob::{Algorithm, InternedInput, Interner};
-
-    pub(super) fn split_lines(bytes: &[u8]) -> Vec<Range<usize>> {
-        let mut out = Vec::new();
-        let mut start = 0;
-        for newline in bytes.find_iter(b"\n") {
-            out.push(start..newline + 1);
-            start = newline + 1;
-        }
-        if start < bytes.len() {
-            out.push(start..bytes.len());
-        }
-        out
-    }
-
-    fn line_eol(line: &[u8]) -> Eol {
-        if line.ends_with(b"\r\n") {
-            Eol::CrLf
-        } else if line.ends_with(b"\n") {
-            Eol::Lf
-        } else {
-            Eol::None
-        }
-    }
-
-    fn line_content(line: &[u8]) -> &[u8] {
-        let line = line.strip_suffix(b"\n").unwrap_or(line);
-        line.strip_suffix(b"\r").unwrap_or(line)
-    }
-
-    fn eol_style(bytes: &[u8], lines: &[Range<usize>]) -> EolStyle {
-        let (mut crlf, mut lf) = (0usize, 0usize);
-        for line in lines {
-            match line_eol(&bytes[line.clone()]) {
-                Eol::CrLf => crlf += 1,
-                Eol::Lf => lf += 1,
-                Eol::None => {}
-            }
-        }
-        let (major, minor, style) = if crlf >= lf {
-            (crlf, lf, EolStyle::CrLf)
-        } else {
-            (lf, crlf, EolStyle::Lf)
-        };
-        if major == 0 {
-            EolStyle::None
-        } else if minor >= 1 && minor * 20 > major + minor {
-            EolStyle::Mixed
-        } else {
-            style
-        }
-    }
-
-    fn normalise(line: &[u8], mode: WhitespaceMode) -> Cow<'_, [u8]> {
-        let is_ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c);
-        match mode {
-            WhitespaceMode::None => Cow::Borrowed(line),
-            WhitespaceMode::IgnoreAtEol => {
-                let end = line.iter().rposition(|b| !is_ws(b)).map_or(0, |i| i + 1);
-                Cow::Borrowed(&line[..end])
-            }
-            WhitespaceMode::IgnoreChange => {
-                let end = line.iter().rposition(|b| !is_ws(b)).map_or(0, |i| i + 1);
-                let mut out = Vec::with_capacity(end);
-                let mut in_ws = false;
-                for b in &line[..end] {
-                    if is_ws(b) {
-                        if !in_ws {
-                            out.push(b' ');
-                        }
-                        in_ws = true;
-                    } else {
-                        out.push(*b);
-                        in_ws = false;
-                    }
-                }
-                Cow::Owned(out)
-            }
-            WhitespaceMode::IgnoreAll => {
-                Cow::Owned(line.iter().copied().filter(|b| !is_ws(b)).collect())
-            }
-        }
-    }
-
-    /// The change blocks of the edit script as `(old range, new range)` of 0-based line indexes. Within a block all
-    /// removals precede all additions.
-    pub(super) fn change_blocks(
-        old: &[u8],
-        old_lines: &[Range<usize>],
-        new: &[u8],
-        new_lines: &[Range<usize>],
-        algorithm: Algorithm,
-        ws: WhitespaceMode,
-    ) -> Vec<(Range<u32>, Range<u32>)> {
-        let mut input: InternedInput<Cow<'_, [u8]>> = InternedInput {
-            before: Vec::new(),
-            after: Vec::new(),
-            interner: Interner::new(old_lines.len() + new_lines.len()),
-        };
-        input.update_before(old_lines.iter().map(|l| normalise(&old[l.clone()], ws)));
-        input.update_after(new_lines.iter().map(|l| normalise(&new[l.clone()], ws)));
-        let diff = gix::diff::blob::diff_with_slider_heuristics(algorithm, &input);
-        diff.hunks().map(|h| (h.before, h.after)).collect()
-    }
+    use crate::internal::linediff::{LineImage, Op};
+    use gix::diff::blob::Algorithm;
 
     /// Detect the encoding once per file: chardetng over the first 64 KiB of the new side, else the old side.
     fn detect_encoding(old: &[u8], new: &[u8]) -> &'static encoding_rs::Encoding {
@@ -1101,10 +743,8 @@ mod lines {
     }
 
     struct Builder<'a> {
-        old: &'a [u8],
-        old_lines: &'a [Range<usize>],
-        new: &'a [u8],
-        new_lines: &'a [Range<usize>],
+        old: &'a LineImage<'a>,
+        new: &'a LineImage<'a>,
         encoding: &'static encoding_rs::Encoding,
         text: String,
         spans: Vec<Range<u32>>,
@@ -1114,36 +754,31 @@ mod lines {
     }
 
     impl Builder<'_> {
-        fn push_line(
-            &mut self,
-            kind: LineKind,
-            old_index: Option<u32>,
-            new_index: Option<u32>,
-        ) -> usize {
-            let raw = match (kind, old_index, new_index) {
-                (LineKind::Removed, Some(i), _) => &self.old[self.old_lines[i as usize].clone()],
-                (_, _, Some(i)) => &self.new[self.new_lines[i as usize].clone()],
-                (_, Some(i), None) => &self.old[self.old_lines[i as usize].clone()],
-                (_, None, None) => &[],
+        /// Append one displayed line. Removed lines show the old image, context and added lines the new one.
+        fn push_line(&mut self, kind: LineKind, old_index: Option<u32>, new_index: Option<u32>) {
+            let (image, index) = match (kind, old_index, new_index) {
+                (LineKind::Removed, Some(i), _) => (self.old, i),
+                (_, _, Some(j)) => (self.new, j),
+                (_, Some(i), None) => (self.old, i),
+                // Every op names a line of at least one side.
+                (_, None, None) => return,
             };
-            let eol = line_eol(raw);
             let start = self.text.len() as u32;
             self.text
-                .push_str(&decode(self.encoding, line_content(raw)));
+                .push_str(&decode(self.encoding, image.content(index)));
             let end = self.text.len() as u32;
             let spans_at = self.spans.len() as u32;
             self.lines.push(DiffLine {
                 kind,
                 old_lineno: old_index.map(|i| i + 1),
-                new_lineno: new_index.map(|i| i + 1),
-                eol,
+                new_lineno: new_index.map(|j| j + 1),
+                eol: image.eol(index),
                 text: ArenaRange { start, end },
                 spans: ArenaRange {
                     start: spans_at,
                     end: spans_at,
                 },
             });
-            self.lines.len() - 1
         }
 
         fn line_text(&self, line: usize) -> &str {
@@ -1280,46 +915,23 @@ mod lines {
         textconv: bool,
         partial: PartialAvailability,
     ) -> Option<TextDiff> {
-        let old_lines = split_lines(old);
-        let new_lines = split_lines(new);
-        if old_lines.len() > opts.max_lines as usize || new_lines.len() > opts.max_lines as usize {
+        let old_img = linediff::split_lines(old);
+        let new_img = linediff::split_lines(new);
+        if old_img.len() > opts.max_lines as usize || new_img.len() > opts.max_lines as usize {
             return None;
         }
-        let blocks = change_blocks(old, &old_lines, new, &new_lines, algorithm, opts.whitespace);
-        let encoding = detect_encoding(old, new);
-        let (n_old, n_new) = (old_lines.len() as u32, new_lines.len() as u32);
-
-        // Git's hunk grouping: every change gets `context` lines around it; changes with at most 2 * context equal
-        // lines between them share a hunk. Full-file: one hunk over everything.
+        let ops = linediff::edit_script(&old_img, &new_img, algorithm, opts.whitespace);
         let context = if opts.full_file {
             u32::MAX
         } else {
             opts.context_lines
         };
-        let mut groups: Vec<Range<usize>> = Vec::new();
-        if opts.full_file {
-            if n_old > 0 || n_new > 0 {
-                groups.push(0..blocks.len());
-            }
-        } else {
-            let mut start = 0;
-            for i in 1..=blocks.len() {
-                let split = i == blocks.len()
-                    || u64::from(blocks[i].0.start - blocks[i - 1].0.end) > 2 * u64::from(context);
-                if split {
-                    if i > start {
-                        groups.push(start..i);
-                    }
-                    start = i;
-                }
-            }
-        }
+        let groups = linediff::group_hunks(&ops, context);
+        let encoding = detect_encoding(old, new);
 
         let mut builder = Builder {
-            old,
-            old_lines: &old_lines,
-            new,
-            new_lines: &new_lines,
+            old: &old_img,
+            new: &new_img,
             encoding,
             text: String::new(),
             spans: Vec::new(),
@@ -1328,65 +940,39 @@ mod lines {
             removed: 0,
         };
         let mut hunks = Vec::with_capacity(groups.len());
-        for group in groups {
-            let first = group.start;
-            let (lead_old, lead_new) = match blocks.get(first) {
-                Some((b, a)) => (b.start, a.start),
-                None => (n_old, n_new),
-            };
-            let lead = context.min(lead_old).min(lead_new);
-            let (old_start, new_start) = (lead_old - lead, lead_new - lead);
+        for (header, range) in groups {
             let first_line = builder.lines.len() as u32;
-            let (mut old_pos, mut new_pos) = (old_start, new_start);
-            for block in &blocks[group.clone()] {
-                while old_pos < block.0.start {
-                    builder.push_line(LineKind::Context, Some(old_pos), Some(new_pos));
-                    old_pos += 1;
-                    new_pos += 1;
+            let hunk_ops = &ops[range];
+            let mut i = 0;
+            while i < hunk_ops.len() {
+                if let Op::Equal { old, new } = hunk_ops[i] {
+                    builder.push_line(LineKind::Context, Some(old), Some(new));
+                    i += 1;
+                    continue;
                 }
+                // One change block: its deletes, then its inserts.
                 let removed_first = builder.lines.len();
-                for i in block.0.clone() {
-                    builder.push_line(LineKind::Removed, Some(i), None);
+                while let Some(&Op::Delete { old }) = hunk_ops.get(i) {
+                    builder.push_line(LineKind::Removed, Some(old), None);
                     builder.removed += 1;
+                    i += 1;
                 }
                 let added_first = builder.lines.len();
-                for j in block.1.clone() {
-                    builder.push_line(LineKind::Added, None, Some(j));
+                while let Some(&Op::Insert { new }) = hunk_ops.get(i) {
+                    builder.push_line(LineKind::Added, None, Some(new));
                     builder.added += 1;
+                    i += 1;
                 }
                 if opts.inline_highlights {
                     builder.highlight(removed_first..added_first, added_first..builder.lines.len());
                 }
-                old_pos = block.0.end;
-                new_pos = block.1.end;
             }
-            let trail = context.min(n_old - old_pos).min(n_new - new_pos);
-            for _ in 0..trail {
-                builder.push_line(LineKind::Context, Some(old_pos), Some(new_pos));
-                old_pos += 1;
-                new_pos += 1;
-            }
-            let (old_count, new_count) = (old_pos - old_start, new_pos - new_start);
             hunks.push(Hunk {
-                header: HunkHeader {
-                    old_start: if old_count == 0 {
-                        old_start
-                    } else {
-                        old_start + 1
-                    },
-                    old_lines: old_count,
-                    new_start: if new_count == 0 {
-                        new_start
-                    } else {
-                        new_start + 1
-                    },
-                    new_lines: new_count,
-                },
+                header,
                 lines: first_line..builder.lines.len() as u32,
             });
         }
 
-        let missing_final_newline = |bytes: &[u8]| !bytes.is_empty() && !bytes.ends_with(b"\n");
         Some(TextDiff {
             hunks,
             lines: builder.lines,
@@ -1395,10 +981,10 @@ mod lines {
             added: builder.added,
             removed: builder.removed,
             encoding: encoding.name(),
-            old_eol: eol_style(old, &old_lines),
-            new_eol: eol_style(new, &new_lines),
-            old_missing_final_newline: missing_final_newline(old),
-            new_missing_final_newline: missing_final_newline(new),
+            old_eol: old_img.eol_style(),
+            new_eol: new_img.eol_style(),
+            old_missing_final_newline: old_img.missing_final_newline(),
+            new_missing_final_newline: new_img.missing_final_newline(),
             textconv,
             partial,
         })
@@ -1841,10 +1427,7 @@ fn kind_label(kind: ChangeKind) -> &'static str {
 
 fn staged_changes(g: &gix::Repository) -> Result<Vec<(RelaPath, Option<RelaPath>, ChangeKind)>> {
     let index = g.index_or_empty().map_err(eh)?;
-    let head_tree = match head_tree(g)? {
-        Some(tree) => tree.id,
-        None => g.empty_tree().id,
-    };
+    let head_tree = g.head_tree_id_or_empty().map_err(eh)?.detach();
     let mut changes = Vec::new();
     g.tree_index_status(
         &head_tree,
@@ -2119,74 +1702,19 @@ pub fn staged_patch_text(
 
 // ───────────────────────────── export_patch / read_blob ─────────────────────────────
 
-/// Runs `git` with `args` in the repository and returns stdout. Reads do not need the full executor: no askpass, no
-/// hooks, no progress. Polls `cancel` and kills the child when it fires.
-fn run_git_read(repo: &Repo, args: &[OsString], cancel: &CancelToken) -> Result<Vec<u8>> {
-    let cwd = repo.workdir().unwrap_or_else(|| repo.git_dir());
-    let mut cmd = repo.runtime().blocking_git(Some(cwd));
-    cmd.args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let printable = || {
-        args.iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let mut child = cmd.spawn().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound && cwd.is_dir() {
-            GitError::GitNotFound {
-                searched: repo.runtime().git_path().display().to_string(),
-            }
-        } else {
-            GitError::io(cwd, err)
-        }
-    })?;
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(out) = stdout.as_mut() {
-            let _ = out.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let err_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(err) = stderr.as_mut() {
-            let _ = err.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let status = loop {
-        if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = out_thread.join();
-            let _ = err_thread.join();
-            return Err(GitError::Cancelled);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GitError::io(cwd, err));
-            }
-        }
-    };
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
-    if !status.success() {
-        return Err(GitError::CommandFailed {
-            args: printable(),
-            exit_code: status.code(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            stdout_tail: String::new(),
-        });
+/// Runs the read-only `git` command `args` through the executor (`CommandKind::Read`: no askpass, no optional locks,
+/// the process tree is killed on cancel) and returns stdout; a non-zero exit is `CommandFailed`.
+fn run_git_read(repo: &Repo, args: Vec<OsString>, cancel: &CancelToken) -> Result<Vec<u8>> {
+    let mut cmd = GitCommand::new(repo, CommandKind::Read).args(args);
+    // A patch is as large as the changes it exports; the executor's default cap guards commands with
+    // unbounded output, not this one.
+    cmd.stdout_cap = usize::MAX;
+    let out = cli::run(repo.runtime(), cmd, &OpContext::silent(cancel.clone()))?;
+    if out.exit_code == Some(0) {
+        Ok(out.stdout)
+    } else {
+        Err(crate::error::command_failed(&out))
     }
-    Ok(stdout)
 }
 
 /// The argument budget of one `git diff` invocation (Windows allows 32 767 characters in total).
@@ -2207,7 +1735,7 @@ pub fn export_patch(repo: &Repo, what: &ExportPatch, cancel: &CancelToken) -> Re
                 .into_iter()
                 .chain([OsString::from(commit.to_string())])
                 .collect::<Vec<_>>();
-            return run_git_read(repo, &args, cancel).map(BString::from);
+            return run_git_read(repo, args, cancel).map(BString::from);
         }
         ExportPatch::Unstaged(paths) => (paths, false),
         ExportPatch::Staged(paths) => (paths, true),
@@ -2230,7 +1758,7 @@ pub fn export_patch(repo: &Repo, what: &ExportPatch, cancel: &CancelToken) -> Re
     };
     let mut out = Vec::new();
     if paths.is_empty() {
-        out.extend(run_git_read(repo, &base(cached), cancel)?);
+        out.extend(run_git_read(repo, base(cached), cancel)?);
         return Ok(out.into());
     }
     let mut chunk: Vec<OsString> = Vec::new();
@@ -2242,7 +1770,7 @@ pub fn export_patch(repo: &Repo, what: &ExportPatch, cancel: &CancelToken) -> Re
         let mut args = base(cached);
         args.push("--".into());
         args.append(chunk);
-        out.extend(run_git_read(repo, &args, cancel)?);
+        out.extend(run_git_read(repo, args, cancel)?);
         Ok(())
     };
     // One `git diff` prints its files in path order; sorting the pathspecs keeps that order across chunks.
@@ -2265,14 +1793,19 @@ pub fn export_patch(repo: &Repo, what: &ExportPatch, cancel: &CancelToken) -> Re
 
 /// Raw blob bytes (image previews, "open file at revision"), refusing above `max_bytes`.
 ///
-/// Errors: `NotFound` (no such blob), `Unsupported` (the blob is larger than `max_bytes`; the check reads only the
+/// Errors: `NotFound` (no such blob), `TooLarge` (the blob is larger than `max_bytes`; the check reads only the
 /// object header).
 pub fn read_blob(repo: &Repo, id: ObjectId, max_bytes: u64) -> Result<Arc<[u8]>> {
     let g = repo.local();
-    let size = blob_size(&g, id)?;
+    let size = g
+        .try_find_header(id)
+        .map_err(eh)?
+        .ok_or_else(|| not_found("blob", id))?
+        .size();
     if size > max_bytes {
-        return Err(GitError::Unsupported {
-            what: "blob larger than the allowed size",
+        return Err(GitError::TooLarge {
+            size,
+            limit: max_bytes,
         });
     }
     let blob = g.find_blob(id).map_err(|_| not_found("blob", id))?;

@@ -5,6 +5,10 @@
 //! - [`WorktreeReader`]: a worktree side converted to git form (clean filters, `core.autocrlf`, `eol`,
 //!   `working-tree-encoding`) through the repository's filter pipeline, hashed with `gix::objs::compute_hash` so the
 //!   id equals what `git hash-object <path>` prints. It also converts back to worktree form for discards.
+//! - [`resolve_worktree_path`] / [`writable_worktree_path`]: the one place that walks a worktree path component by
+//!   component and refuses to look or write through a symbolic link or (Windows) junction.
+//! - [`prepare_text`]: the binary / textconv / algorithm decision of the diff platform (attributes, diff drivers,
+//!   the NUL heuristic) for both the displayed diff and the partial operations.
 //!
 //! Sizes are checked before reading (`find_header` / `metadata().len()`), so a side above the limit costs no read.
 
@@ -13,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bstr::BStr;
+use bstr::{BStr, ByteSlice};
 use gix::{ObjectId, index::entry::Stage};
 
 use crate::{BlobSide, EntryKind, GitError, Result, Side};
@@ -24,14 +28,14 @@ pub(crate) struct SideContent {
     /// Id, kind, git-form size (worktree size when not read) and origin. The id is null only for a worktree file
     /// above the size limit (not hashed) and for a worktree submodule (its commit comes from the status).
     pub side: BlobSide,
-    /// The git-form bytes. `None` above the size limit and for submodules.
+    /// The git-form bytes. `None` above the size limit, for submodules and for tree entries.
     pub data: Option<Vec<u8>>,
 }
 
 impl SideContent {
     /// `true` if the side was not read because it exceeds the size limit it was read with.
     pub fn is_too_large(&self) -> bool {
-        self.data.is_none() && self.side.kind != EntryKind::Submodule
+        self.data.is_none() && !matches!(self.side.kind, EntryKind::Submodule | EntryKind::Tree)
     }
 }
 
@@ -108,8 +112,8 @@ pub(crate) fn head_entry(repo: &gix::Repository, path: &BStr) -> Result<Option<S
     tree_entry(repo, tree, path)
 }
 
-/// Read the object side `side`. Submodules are not read. If the object is larger than `max_bytes` (known from the
-/// object header), its data is `None`.
+/// Read the object side `side`. Submodules and trees (a directory entry of a sparse index) are not read. If the
+/// object is larger than `max_bytes` (known from the object header), its data is `None`.
 pub(crate) fn read_blob(repo: &gix::Repository, side: Side, max_bytes: u64) -> Result<SideContent> {
     let blob_side = |size| BlobSide {
         id: side.id,
@@ -117,7 +121,7 @@ pub(crate) fn read_blob(repo: &gix::Repository, side: Side, max_bytes: u64) -> R
         size,
         from_worktree: false,
     };
-    if side.kind == EntryKind::Submodule {
+    if matches!(side.kind, EntryKind::Submodule | EntryKind::Tree) {
         return Ok(SideContent {
             side: blob_side(0),
             data: None,
@@ -137,15 +141,81 @@ pub(crate) fn read_blob(repo: &gix::Repository, side: Side, max_bytes: u64) -> R
     })
 }
 
+/// Where a worktree path leads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorktreePath {
+    /// The absolute path. No component before the last one is a symbolic link or junction; components that do not
+    /// exist are fine (nothing below them exists either). The last component itself may be a link.
+    Direct(PathBuf),
+    /// A leading component is a symbolic link or (Windows) junction, so the path would name a different file than
+    /// Git's path, possibly outside the worktree. Git treats such a path as missing (`has_symlinked_leading_path`).
+    BehindLink,
+}
+
+/// Resolve the slash-separated `rela` below `workdir`, checking every leading component with `symlink_metadata`.
+///
+/// This is done here rather than with gix's `SymlinkCheck`, which performs no verification on Windows. Rust's
+/// `FileType::is_symlink` is true for every name-surrogate reparse point on Windows, so directory symlinks and
+/// junctions (`mklink /J`) are both caught. A trailing `/` (a directory path) is ignored.
+///
+/// Errors: `InvalidName` for a component that is not a valid path on this platform, `Io` if a component cannot be
+/// inspected.
+pub(crate) fn resolve_worktree_path(workdir: &Path, rela: &BStr) -> Result<WorktreePath> {
+    let trimmed = rela.trim_end_with(|c| c == '/').as_bstr();
+    let mut current = workdir.to_owned();
+    let mut components = trimmed.split_str("/").peekable();
+    let mut checking = true;
+    while let Some(component) = components.next() {
+        current.push(gix::path::from_byte_slice(component).map_err(|_| invalid_path(rela))?);
+        if !checking || components.peek().is_none() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(md) if md.file_type().is_symlink() => return Ok(WorktreePath::BehindLink),
+            Ok(_) => {}
+            Err(err) if is_missing(&err) => checking = false,
+            Err(err) => return Err(GitError::io(&current, err)),
+        }
+    }
+    Ok(WorktreePath::Direct(current))
+}
+
+/// [`resolve_worktree_path`] for writes and deletions: a path behind a symbolic link or junction is refused with
+/// `InvalidName { what: "path inside the worktree" }`, even if the link stays inside the worktree (the write would
+/// land on another path than the one the user selected).
+pub(crate) fn writable_worktree_path(workdir: &Path, rela: &BStr) -> Result<PathBuf> {
+    match resolve_worktree_path(workdir, rela)? {
+        WorktreePath::Direct(path) => Ok(path),
+        WorktreePath::BehindLink => Err(invalid_path(rela)),
+    }
+}
+
+fn invalid_path(rela: &BStr) -> GitError {
+    GitError::InvalidName {
+        what: "path inside the worktree",
+        name: rela.to_str_lossy().into_owned(),
+    }
+}
+
 /// Reads worktree files in git form. Create one per operation; it holds the filter pipeline (with its attribute
 /// stack) and the index that configured it.
 pub(crate) struct WorktreeReader<'repo> {
     repo: &'repo gix::Repository,
     pipeline: gix::filter::Pipeline<'repo>,
     index: gix::worktree::IndexPersistedOrInMemory,
-    path_check: gix::status::plumbing::SymlinkCheck,
+    workdir: PathBuf,
     /// `core.fileMode`: if `false`, the executable bit comes from the index entry.
     executable_bit: bool,
+    /// `core.symlinks`: if `false`, Git checks links out as plain files holding the target.
+    symlinks: bool,
+}
+
+/// A worktree side together with the raw (worktree form) bytes it was converted from.
+pub(crate) struct RawSide {
+    /// The side in git form, as [`WorktreeReader::read`] returns it.
+    pub content: SideContent,
+    /// The bytes on disk; `None` when the side was not read (too large, submodule) and for symbolic links.
+    pub raw: Option<Vec<u8>>,
 }
 
 impl<'repo> WorktreeReader<'repo> {
@@ -153,12 +223,14 @@ impl<'repo> WorktreeReader<'repo> {
     pub fn new(repo: &'repo gix::Repository) -> Result<Self> {
         let workdir = repo.workdir().ok_or(GitError::BareRepository)?.to_owned();
         let (pipeline, index) = repo.filter_pipeline(None)?;
+        let fs = repo.filesystem_options()?;
         Ok(WorktreeReader {
             repo,
             pipeline,
             index,
-            path_check: gix::status::plumbing::SymlinkCheck::new(workdir),
-            executable_bit: repo.filesystem_options()?.executable_bit,
+            workdir,
+            executable_bit: fs.executable_bit,
+            symlinks: fs.symlink,
         })
     }
 
@@ -167,27 +239,48 @@ impl<'repo> WorktreeReader<'repo> {
         &self.index
     }
 
-    /// The absolute path of `rela`, verified not to lead through a symbolic link (on Unix; Windows only joins).
-    pub fn path(&mut self, rela: &BStr) -> Result<PathBuf> {
-        let display = || PathBuf::from(rela.to_string());
-        self.path_check
-            .verified_path_allow_nonexisting(rela)
-            .map(|p| p.into_owned())
-            .map_err(|err| GitError::io(display(), err))
+    /// Read the worktree file at `rela` in git form. `None` if nothing trackable is there (missing, behind a symbolic
+    /// link or junction, a plain directory, a FIFO). A nested repository is a submodule side without data whose id is
+    /// the nested repository's `HEAD` (null if it has none). If the file on disk is larger than `max_bytes`, it is
+    /// neither read nor hashed (null id, `data: None`, the on-disk size).
+    ///
+    /// `index_kind` is the kind of the index entry the file is compared with (stage 0, or "ours" for a conflict, at
+    /// the old path of a rename). The kind is a symlink for symbolic links, and for a plain file whose index entry is
+    /// a link while `core.symlinks` is false; executable if `core.fileMode` is true and the file has an executable
+    /// bit, or (with `core.fileMode=false`) if `index_kind` is executable.
+    pub fn read(
+        &mut self,
+        rela: &BStr,
+        max_bytes: u64,
+        index_kind: Option<EntryKind>,
+    ) -> Result<Option<SideContent>> {
+        Ok(self
+            .read_inner(rela, max_bytes, index_kind, false)?
+            .map(|side| side.content))
     }
 
-    /// Read the worktree file at `rela` in git form. `None` if nothing trackable is there (missing, or a plain
-    /// directory). A nested repository is a submodule side without data. If the file on disk is larger than
-    /// `max_bytes`, it is neither read nor hashed (null id, `data: None`).
-    ///
-    /// The kind is a symlink for symbolic links, executable if `core.fileMode` is true and the file has an executable
-    /// bit, or (with `core.fileMode=false`) if its index entry is executable.
-    pub fn read(&mut self, rela: &BStr, max_bytes: u64) -> Result<Option<SideContent>> {
-        let path = match self.path_check.verified_path_allow_nonexisting(rela) {
-            Ok(path) => path.into_owned(),
+    /// [`Self::read`], also returning the raw bytes the git form was converted from (one read, so both belong to the
+    /// same file content).
+    pub fn read_with_raw(
+        &mut self,
+        rela: &BStr,
+        max_bytes: u64,
+        index_kind: Option<EntryKind>,
+    ) -> Result<Option<RawSide>> {
+        self.read_inner(rela, max_bytes, index_kind, true)
+    }
+
+    fn read_inner(
+        &mut self,
+        rela: &BStr,
+        max_bytes: u64,
+        index_kind: Option<EntryKind>,
+        keep_raw: bool,
+    ) -> Result<Option<RawSide>> {
+        let path = match resolve_worktree_path(&self.workdir, rela)? {
+            WorktreePath::Direct(path) => path,
             // Git does not look behind a symbolic link either (`has_symlinked_leading_path`): the tracked file is gone.
-            Err(err) if is_missing(&err) || is_behind_symlink(&err) => return Ok(None),
-            Err(err) => return Err(GitError::io(PathBuf::from(rela.to_string()), err)),
+            WorktreePath::BehindLink => return Ok(None),
         };
         let md = match gix::index::fs::Metadata::from_path_no_follow(&path) {
             Ok(md) => md,
@@ -200,14 +293,29 @@ impl<'repo> WorktreeReader<'repo> {
             size,
             from_worktree: true,
         };
+        let unread = |content| RawSide { content, raw: None };
         let null = ObjectId::null(self.repo.object_hash());
         if md.is_dir() {
-            return Ok(path.join(".git").exists().then(|| SideContent {
-                side: side(null, EntryKind::Submodule, 0),
+            if !path.join(".git").exists() {
+                return Ok(None);
+            }
+            let head = gix::open(&path)
+                .ok()
+                .and_then(|sub| sub.head_id().ok().map(|id| id.detach()))
+                .unwrap_or(null);
+            return Ok(Some(unread(SideContent {
+                side: side(head, EntryKind::Submodule, 0),
                 data: None,
-            }));
+            })));
         }
         let kind = if md.is_symlink() {
+            EntryKind::Link
+        } else if !md.is_file() {
+            // FIFOs, sockets, devices: nothing Git can track.
+            return Ok(None);
+        } else if !self.symlinks && index_kind == Some(EntryKind::Link) {
+            // Without symlink support Git checks a link out as a plain file holding the target, and the index entry
+            // stays a link: this is still a link, not a type change.
             EntryKind::Link
         } else if self.executable_bit {
             if md.is_executable() {
@@ -215,47 +323,75 @@ impl<'repo> WorktreeReader<'repo> {
             } else {
                 EntryKind::Blob
             }
+        } else if index_kind == Some(EntryKind::BlobExecutable) {
+            EntryKind::BlobExecutable
         } else {
-            match index_entry(&self.index, rela, Stage::Unconflicted)?.map(|e| e.kind) {
-                // Without symlink support Git checks links out as plain files holding the target.
-                Some(kind @ (EntryKind::BlobExecutable | EntryKind::Link)) => kind,
-                Some(EntryKind::Blob | EntryKind::Submodule | EntryKind::Tree) | None => {
-                    EntryKind::Blob
-                }
-            }
+            EntryKind::Blob
         };
         if md.len() > max_bytes {
-            return Ok(Some(SideContent {
+            return Ok(Some(unread(SideContent {
                 side: side(null, kind, md.len()),
                 data: None,
-            }));
+            })));
         }
-        let mut data = Vec::with_capacity(md.len() as usize);
-        if let Err(err) = but_core::worktree::worktree_file_to_git_in_buf(
-            &mut data,
-            &md,
-            rela,
-            &path,
-            &mut self.pipeline,
-            &self.index,
-        ) {
-            return match err.downcast::<std::io::Error>() {
-                Ok(io) if is_missing(&io) => Ok(None),
-                Ok(io) => Err(GitError::io(path, io)),
-                Err(err) => Err(GitError::Other(err.context(format!(
-                    "could not convert '{}' to git form",
-                    path.display()
-                )))),
+        let (data, raw) = if md.is_symlink() {
+            let target = match std::fs::read_link(&path) {
+                Ok(target) => target,
+                Err(err) if is_missing(&err) => return Ok(None),
+                Err(err) => return Err(GitError::io(path, err)),
             };
-        }
+            let target =
+                gix::path::os_string_into_bstring(target.into()).map_err(|_| invalid_path(rela))?;
+            (Vec::from(target), None)
+        } else {
+            let raw = match std::fs::read(&path) {
+                Ok(raw) => raw,
+                Err(err) if is_missing(&err) => return Ok(None),
+                Err(err) => return Err(GitError::io(path, err)),
+            };
+            self.raw_to_git(raw, rela, keep_raw)?
+        };
         let id = hash_blob(self.repo, &data)?;
-        Ok(Some(SideContent {
-            side: side(id, kind, data.len() as u64),
-            data: Some(data),
+        Ok(Some(RawSide {
+            content: SideContent {
+                side: side(id, kind, data.len() as u64),
+                data: Some(data),
+            },
+            raw,
         }))
     }
 
-    /// Convert raw worktree bytes of `rela` to git form (`convert_to_git`). Used for the discard round-trip check.
+    /// Convert `raw` to git form; the raw bytes are handed back only if `keep_raw` (an unchanged file is then copied
+    /// once, otherwise it is moved).
+    fn raw_to_git(
+        &mut self,
+        raw: Vec<u8>,
+        rela: &BStr,
+        keep_raw: bool,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        use gix::filter::plumbing::pipeline::convert::ToGitOutcome;
+        let path = rela_to_path(rela)?;
+        let converted = match self.pipeline.convert_to_git(&raw[..], &path, &self.index)? {
+            ToGitOutcome::Unchanged(_) => None,
+            ToGitOutcome::Buffer(buf) => Some(buf.to_vec()),
+            ToGitOutcome::Process(mut stream) => {
+                let mut out = Vec::with_capacity(raw.len());
+                stream
+                    .read_to_end(&mut out)
+                    .map_err(|err| GitError::io(path.to_path_buf(), err))?;
+                Some(out)
+            }
+        };
+        Ok(match (converted, keep_raw) {
+            (Some(git), true) => (git, Some(raw)),
+            (Some(git), false) => (git, None),
+            (None, true) => (raw.clone(), Some(raw)),
+            (None, false) => (raw, None),
+        })
+    }
+
+    /// Convert raw worktree bytes of `rela` to git form (`convert_to_git`, with the index-aware `core.autocrlf`
+    /// rules). Used to verify a discard result before it is written.
     pub fn convert_to_git(&mut self, raw: &[u8], rela: &BStr) -> Result<Vec<u8>> {
         let path = rela_to_path(rela)?;
         let mut out = Vec::with_capacity(raw.len());
@@ -266,14 +402,148 @@ impl<'repo> WorktreeReader<'repo> {
         Ok(out)
     }
 
-    /// Convert git-form bytes of `rela` to worktree form (`convert_to_worktree`, delayed filters forbidden).
+    /// Convert git-form bytes of `rela` to worktree form (`convert_to_worktree`, delayed filters forbidden): what a
+    /// checkout writes.
     pub fn convert_to_worktree(&mut self, git_form: &[u8], rela: &BStr) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(git_form.len());
+        let mut out = Vec::with_capacity(git_form.len() + git_form.len() / 16);
         self.pipeline
-            .convert_to_worktree(git_form, rela, Default::default())?
+            .convert_to_worktree(
+                git_form,
+                rela,
+                gix::filter::plumbing::pipeline::convert::to_worktree::Options {
+                    can_delay: gix::filter::plumbing::driver::apply::Delay::Forbid,
+                    ..Default::default()
+                },
+            )?
             .read_to_end(&mut out)
             .map_err(|err| GitError::io(PathBuf::from(rela.to_string()), err))?;
         Ok(out)
+    }
+}
+
+/// One side as the diff platform sees it, for [`prepare_text`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Resource<'a> {
+    /// The object id; ignored for worktree sides (the platform reads the file itself).
+    pub id: ObjectId,
+    /// The entry kind.
+    pub kind: EntryKind,
+    /// The path whose attributes and diff driver apply.
+    pub path: &'a BStr,
+    /// The side is the worktree file.
+    pub worktree: bool,
+}
+
+/// What the diff platform decided for a pair of sides.
+#[derive(Debug)]
+pub(crate) struct Prepared {
+    /// Either side is binary (attributes, a diff driver's `binary`, or the NUL heuristic).
+    pub binary: bool,
+    /// The text a diff driver's textconv produced for the old side, if it ran.
+    pub old_textconv: Option<Vec<u8>>,
+    /// The text a diff driver's textconv produced for the new side, if it ran.
+    pub new_textconv: Option<Vec<u8>>,
+    /// The line algorithm Git would use: the diff driver's `algorithm`, else `diff.algorithm` (default Myers).
+    pub algorithm: gix::diff::blob::Algorithm,
+}
+
+/// Decide binary / textconv / algorithm like Git's diff machinery, through gix's diff resource cache in
+/// `ToGitUnlessBinaryToTextIsPresent` mode. A missing side counts as empty, with the other side's kind.
+///
+/// The displayed diff and the partial operations both call this, so `TextDiff::partial` and the refusal of a
+/// partial operation always agree. A worktree side is read by the platform itself (only to decide this); the bytes
+/// the line engine diffs come from [`WorktreeReader`], whose conversion knows the index.
+pub(crate) fn prepare_text(
+    repo: &gix::Repository,
+    old: Option<Resource<'_>>,
+    new: Option<Resource<'_>>,
+) -> Result<Prepared> {
+    use gix::diff::blob::{
+        ResourceKind,
+        pipeline::{Mode, WorktreeRoots},
+        platform::{prepare_diff::Operation, resource::Data},
+    };
+    let Some(any) = new.or(old) else {
+        return Ok(Prepared {
+            binary: false,
+            old_textconv: None,
+            new_textconv: None,
+            algorithm: repo.diff_algorithm()?,
+        });
+    };
+    let symlinks = repo.filesystem_options()?.symlink;
+    let root = |side: Option<Resource<'_>>| {
+        side.filter(|s| s.worktree)
+            .and_then(|_| repo.workdir().map(ToOwned::to_owned))
+    };
+    let mut cache = repo.diff_resource_cache(
+        Mode::ToGitUnlessBinaryToTextIsPresent,
+        WorktreeRoots {
+            old_root: root(old),
+            new_root: root(new),
+        },
+    )?;
+    let null = repo.object_hash().null();
+    for (side, role) in [
+        (old, ResourceKind::OldOrSource),
+        (new, ResourceKind::NewOrDestination),
+    ] {
+        let resource = side.unwrap_or(Resource {
+            id: null,
+            worktree: false,
+            ..any
+        });
+        // A link checked out as a plain file (`core.symlinks=false`) is read as a file.
+        let kind = if resource.worktree && resource.kind == EntryKind::Link && !symlinks {
+            EntryKind::Blob
+        } else {
+            resource.kind
+        };
+        let id = if resource.worktree || side.is_none() {
+            null
+        } else {
+            resource.id
+        };
+        cache
+            .set_resource(id, tree_kind(kind), resource.path, role, &repo.objects)
+            .map_err(|err| GitError::Other(err.into()))?;
+    }
+    let prepared = cache
+        .prepare_diff()
+        .map_err(|err| GitError::Other(err.into()))?;
+    let textconv = |data: Data<'_>| match data {
+        Data::Buffer {
+            buf,
+            is_derived: true,
+        } => Some(buf.to_vec()),
+        _ => None,
+    };
+    let binary = matches!(prepared.old.data, Data::Binary { .. })
+        || matches!(prepared.new.data, Data::Binary { .. })
+        || matches!(prepared.operation, Operation::SourceOrDestinationIsBinary);
+    let algorithm = match prepared.operation {
+        Operation::InternalDiff { algorithm } => algorithm,
+        Operation::ExternalCommand { .. } | Operation::SourceOrDestinationIsBinary => {
+            repo.diff_algorithm()?
+        }
+    };
+    Ok(Prepared {
+        binary,
+        old_textconv: textconv(prepared.old.data),
+        new_textconv: textconv(prepared.new.data),
+        algorithm,
+    })
+}
+
+/// The tree entry kind gix's diff platform expects for `kind`.
+fn tree_kind(kind: EntryKind) -> gix::object::tree::EntryKind {
+    use gix::object::tree::EntryKind as K;
+    match kind {
+        EntryKind::Blob => K::Blob,
+        EntryKind::BlobExecutable => K::BlobExecutable,
+        EntryKind::Link => K::Link,
+        EntryKind::Submodule => K::Commit,
+        EntryKind::Tree => K::Tree,
     }
 }
 
@@ -297,13 +567,6 @@ fn is_missing(err: &std::io::Error) -> bool {
         err.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
     )
-}
-
-/// The error of `SymlinkCheck` for a path whose leading directories contain a symbolic link (Unix only; gix does not
-/// export a predicate, so the stable message is matched).
-fn is_behind_symlink(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::Other
-        && err.to_string().contains("Cannot step through symlink")
 }
 
 /// Throw-away repositories for the unit tests of `internal`, built with the `git` executable in an isolated
@@ -421,7 +684,7 @@ mod tests {
         let mut reader = WorktreeReader::new(&local).expect("worktree");
 
         let crlf = reader
-            .read(b"crlf.txt".as_bstr(), u64::MAX)
+            .read(b"crlf.txt".as_bstr(), u64::MAX, None)
             .expect("readable")
             .expect("present");
         assert_eq!(
@@ -439,7 +702,7 @@ mod tests {
         assert_eq!(crlf.side.kind, EntryKind::Blob, "a plain file");
 
         let plain = reader
-            .read(b"plain.txt".as_bstr(), u64::MAX)
+            .read(b"plain.txt".as_bstr(), u64::MAX, None)
             .expect("readable")
             .expect("present");
         assert_eq!(
@@ -450,21 +713,21 @@ mod tests {
 
         assert!(
             reader
-                .read(b"missing.txt".as_bstr(), u64::MAX)
+                .read(b"missing.txt".as_bstr(), u64::MAX, None)
                 .expect("no error")
                 .is_none(),
             "missing is None"
         );
         assert!(
             reader
-                .read(b"plain.txt/below".as_bstr(), u64::MAX)
+                .read(b"plain.txt/below".as_bstr(), u64::MAX, None)
                 .expect("no error")
                 .is_none(),
             "a path below a file is missing, not an error"
         );
 
         let large = reader
-            .read(b"plain.txt".as_bstr(), 3)
+            .read(b"plain.txt".as_bstr(), 3, None)
             .expect("readable")
             .expect("present");
         assert!(large.is_too_large(), "6 bytes exceed the limit of 3");
@@ -498,9 +761,11 @@ mod tests {
         let mut reader = WorktreeReader::new(&local).expect("worktree");
 
         let read = |reader: &mut WorktreeReader<'_>, rela: &str| {
-            reader
-                .read(rela.as_bytes().as_bstr(), u64::MAX)
-                .expect("readable")
+            let rela = rela.as_bytes().as_bstr();
+            let index_kind = index_entry(reader.index(), rela, Stage::Unconflicted)
+                .expect("valid mode")
+                .map(|entry| entry.kind);
+            reader.read(rela, u64::MAX, index_kind).expect("readable")
         };
         assert_eq!(
             read(&mut reader, "run.sh").expect("present").side.kind,
@@ -528,23 +793,75 @@ mod tests {
         );
     }
 
+    /// A directory link at `link` to `target`: a symlink on Unix, a junction on Windows (`mklink /J` needs no
+    /// privilege and leads anywhere, just like a symlink).
+    fn dir_link(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlinks work");
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("cmd runs");
+            assert!(status.success(), "mklink /J creates a junction");
+        }
+    }
+
+    #[test]
+    fn path_behind_linked_directory_is_missing_and_not_writable() {
+        let repo = fixture::repo();
+        repo.write("real/f.txt", b"x\n");
+        dir_link(&repo.path.join("real"), &repo.path.join("link"));
+        let local = repo.open();
+        let mut reader = WorktreeReader::new(&local).expect("worktree");
+        assert!(
+            reader
+                .read(b"link/f.txt".as_bstr(), u64::MAX, None)
+                .expect("not an error")
+                .is_none(),
+            "Git does not look through a linked directory: the path is missing"
+        );
+        assert_eq!(
+            resolve_worktree_path(&repo.path, b"link/f.txt".as_bstr()).expect("inspectable"),
+            WorktreePath::BehindLink,
+            "the junction or symlink is detected on every platform"
+        );
+        let err = writable_worktree_path(&repo.path, b"link/f.txt".as_bstr())
+            .expect_err("never written through a link");
+        assert_eq!(
+            err.kind(),
+            crate::GitErrorKind::InvalidName,
+            "a classified refusal: {err:?}"
+        );
+        assert_eq!(
+            writable_worktree_path(&repo.path, b"link".as_bstr()).expect("the link itself"),
+            repo.path.join("link"),
+            "the last component may be a link (deleting it removes the link)"
+        );
+        assert_eq!(
+            writable_worktree_path(&repo.path, b"real/new/deeper.txt".as_bstr())
+                .expect("missing components are fine"),
+            repo.path.join("real").join("new").join("deeper.txt"),
+            "nothing below a missing directory can be a link"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn path_behind_symlinked_directory_is_missing() {
+    fn symlink_side_is_its_target() {
         let repo = fixture::repo();
         repo.write("real/f.txt", b"x\n");
         std::os::unix::fs::symlink("real", repo.path.join("link")).expect("symlinks work");
         let local = repo.open();
         let mut reader = WorktreeReader::new(&local).expect("worktree");
-        assert!(
-            reader
-                .read(b"link/f.txt".as_bstr(), u64::MAX)
-                .expect("not an error")
-                .is_none(),
-            "Git does not look through a symlinked directory: the path is missing"
-        );
         let link = reader
-            .read(b"link".as_bstr(), u64::MAX)
+            .read(b"link".as_bstr(), u64::MAX, None)
             .expect("readable")
             .expect("present");
         assert_eq!(link.side.kind, EntryKind::Link, "the link itself");
@@ -553,6 +870,73 @@ mod tests {
             Some(b"real".as_slice()),
             "a link's git form is its target"
         );
+    }
+
+    #[test]
+    fn read_with_raw_returns_both_forms_of_one_read() {
+        let repo = fixture::repo();
+        repo.git(&["config", "core.autocrlf", "true"]);
+        repo.write("crlf.txt", b"one\r\ntwo\n");
+        repo.write("lf.txt", b"one\n");
+        let local = repo.open();
+        let mut reader = WorktreeReader::new(&local).expect("worktree");
+        let side = reader
+            .read_with_raw(b"crlf.txt".as_bstr(), u64::MAX, None)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(
+            side.raw.as_deref(),
+            Some(b"one\r\ntwo\n".as_slice()),
+            "the bytes on disk"
+        );
+        assert_eq!(
+            side.content.data.as_deref(),
+            Some(b"one\ntwo\n".as_slice()),
+            "the clean conversion"
+        );
+        let unchanged = reader
+            .read_with_raw(b"lf.txt".as_bstr(), u64::MAX, None)
+            .expect("readable")
+            .expect("present");
+        assert_eq!(
+            unchanged.raw, unchanged.content.data,
+            "a file no filter changes has equal forms"
+        );
+    }
+
+    #[test]
+    fn prepare_text_decides_binary_and_algorithm() {
+        let repo = fixture::repo();
+        repo.write("text.txt", b"a\n");
+        repo.write("bin.dat", b"a\0b\n");
+        repo.git(&["add", "."]);
+        repo.git(&["config", "diff.algorithm", "histogram"]);
+        let local = repo.open();
+        let index = local.index().expect("index exists");
+        let side = |path: &'static str| {
+            let entry = index_entry(&index, path.as_bytes().as_bstr(), Stage::Unconflicted)
+                .expect("valid")
+                .expect("staged");
+            Resource {
+                id: entry.id,
+                kind: entry.kind,
+                path: path.as_bytes().as_bstr(),
+                worktree: false,
+            }
+        };
+        let text = prepare_text(&local, None, Some(side("text.txt"))).expect("prepared");
+        assert!(!text.binary, "plain text");
+        assert_eq!(
+            text.algorithm,
+            gix::diff::blob::Algorithm::Histogram,
+            "diff.algorithm is honoured"
+        );
+        assert!(
+            text.old_textconv.is_none() && text.new_textconv.is_none(),
+            "no driver"
+        );
+        let binary = prepare_text(&local, Some(side("bin.dat")), None).expect("prepared");
+        assert!(binary.binary, "a NUL byte makes it binary");
     }
 
     #[test]

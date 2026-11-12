@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use bstr::ByteSlice as _;
 use gitcthulhu_git::{
-    CancelToken, DiscardMode, GitError, GitErrorKind, HunkHeader, LineRef, NoPrompter, OpContext,
-    OpOutcome, PartialBlock, RefreshSet, RelaPath, Repo, Resolution, Selection, SelectionRequest,
-    stage,
+    CancelToken, ChangeKind, DiffContent, DiffOptions, DiffTarget, DiscardMode, GitError,
+    GitErrorKind, HunkHeader, LineRef, NoPrompter, OpContext, OpOutcome, PartialAvailability,
+    PartialBlock, RefreshSet, RelaPath, Repo, Resolution, Selection, SelectionRequest, diff, stage,
 };
 use support::{TestEnv, TestRepo};
 
@@ -99,6 +99,7 @@ fn unstaged_req(t: &TestRepo, path: &str, selection: Selection) -> SelectionRequ
         previous_path: None,
         base_old: index_id(t, path),
         base_new: worktree_id(t, path),
+        algorithm: None,
         selection,
     }
 }
@@ -115,6 +116,7 @@ fn staged_req(
         previous_path: previous_path.map(Into::into),
         base_old: head_id(t, previous_path.unwrap_or(path)),
         base_new: index_id(t, path),
+        algorithm: None,
         selection,
     }
 }
@@ -482,25 +484,391 @@ fn crlf_committed_no_autocrlf() {
 }
 
 #[test]
-fn mixed_eol_discard_refused_with_autocrlf() {
+fn mixed_eol_discard_keeps_each_line_ending_with_autocrlf() {
     let env = TestEnv::new();
     let (t, repo) = autocrlf_repo(&env);
     t.write("f", b"a\nb\nc\n");
     t.commit_all("base");
     t.write("f", b"a\r\nb\nX\r\nc\n");
-    expect_partial_block(
-        discard_sel(&t, &repo, &unstaged_req(&t, "f", lines(&[add(3)]))),
-        PartialBlock::UnsafeRoundTrip,
-    );
-    assert_eq!(
-        t.read("f").as_bstr(),
-        b"a\r\nb\nX\r\nc\n".as_bstr(),
-        "the refused discard left the file alone"
-    );
     assert_eq!(
         stage_lines(&t, &repo, "f", lines(&[add(3)])).as_bstr(),
         b"a\nb\nX\nc\n".as_bstr(),
         "staging works on the git form regardless of the worktree mix"
+    );
+    t.git(&["reset", "-q"]);
+    assert_eq!(
+        discard_lines(&t, &repo, "f", lines(&[add(3)])).as_bstr(),
+        b"a\r\nb\nc\n".as_bstr(),
+        "the worktree bytes are edited directly: every kept line keeps its own ending"
+    );
+    assert_eq!(
+        t.index_blob("f").as_bstr(),
+        b"a\nb\nc\n".as_bstr(),
+        "discarding never touches the index"
+    );
+}
+
+#[test]
+fn lf_file_discard_with_autocrlf_true_stays_lf() {
+    let env = TestEnv::new();
+    let (t, repo) = autocrlf_repo(&env);
+    t.write("f", b"a\nb\nc\nd\n");
+    t.commit_all("base");
+    t.write("f", b"a\nB\nc\nd\nnew\n");
+    assert_eq!(
+        discard_lines(&t, &repo, "f", lines(&[rem(2), add(2)])).as_bstr(),
+        b"a\nb\nc\nd\nnew\n".as_bstr(),
+        "the restored line ends like the rest of the LF file, not with the CRLF a checkout would write"
+    );
+    assert_eq!(
+        t.index_blob("f").as_bstr(),
+        b"a\nb\nc\nd\n".as_bstr(),
+        "discarding never touches the index"
+    );
+}
+
+/// A repository with `core.autocrlf=<autocrlf>` for git and gix and a committed `.gitattributes`.
+fn eol_repo(
+    env: &TestEnv,
+    rt: &std::sync::Arc<gitcthulhu_git::GitRuntime>,
+    name: &str,
+    autocrlf: &str,
+    attributes: Option<&str>,
+) -> (TestRepo, Repo) {
+    let t = env.repo(name);
+    t.git(&["config", "core.autocrlf", autocrlf]);
+    if let Some(attributes) = attributes {
+        t.write(".gitattributes", format!("{attributes}\n"));
+    }
+    let repo = Repo::open(rt, &t.path).expect("repository opens");
+    (t, repo)
+}
+
+/// The lines of `bytes`, each with its terminator.
+fn raw_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes.split_inclusive(|b| *b == b'\n').collect()
+}
+
+/// Spec §4.6 redesign: partial discard edits the worktree bytes directly, for every combination of `core.autocrlf`,
+/// worktree line endings and `.gitattributes` `text`/`eol` settings. Each case changes line 2 and appends a line, then
+/// discards only the line-2 change and checks that (1) it is not refused, (2) every other line keeps its exact bytes,
+/// (3) the file now cleans to exactly the expected git form, and (4) the index is untouched.
+#[test]
+fn discard_line_endings_matrix() {
+    let env = TestEnv::new();
+    let names = ["one", "two", "three", "four", "five"];
+    let styles: [(&str, [&[u8]; 5]); 3] = [
+        ("lf", [b"\n"; 5]),
+        ("crlf", [b"\r\n"; 5]),
+        ("mixed", [b"\r\n", b"\n", b"\r\n", b"\n", b"\r\n"]),
+    ];
+    let attribute_sets = [
+        None,
+        Some("* text=auto"),
+        Some("* text eol=crlf"),
+        Some("* text eol=lf"),
+        Some("* -text"),
+    ];
+    let runtimes: Vec<_> = ["true", "input", "false"]
+        .into_iter()
+        .map(|autocrlf| {
+            let rt = env
+                .runtime_with(|config| {
+                    if let Some(isolation) = &mut config.test_isolation {
+                        isolation
+                            .overrides
+                            .retain(|(key, _)| key != "core.autocrlf");
+                        isolation
+                            .overrides
+                            .push(("core.autocrlf".into(), autocrlf.into()));
+                    }
+                })
+                .expect("runtime with autocrlf");
+            (autocrlf, rt)
+        })
+        .collect();
+    let cases = std::sync::atomic::AtomicUsize::new(0);
+    // The 45 cases are independent repositories; nine threads keep the test at a few seconds.
+    std::thread::scope(|scope| {
+        for (autocrlf, rt) in &runtimes {
+            for (style, eols) in &styles {
+                let (env, names, attribute_sets, cases) = (&env, &names, &attribute_sets, &cases);
+                let autocrlf: &str = autocrlf;
+                scope.spawn(move || {
+                    for (a, attributes) in attribute_sets.iter().enumerate() {
+                        let case = format!("autocrlf={autocrlf} {style} attributes={attributes:?}");
+                        let (t, repo) = eol_repo(
+                            env,
+                            rt,
+                            &format!("{autocrlf}-{style}-{a}"),
+                            autocrlf,
+                            *attributes,
+                        );
+                        let base: Vec<u8> = names
+                            .iter()
+                            .zip(eols)
+                            .flat_map(|(name, eol)| [name.as_bytes(), eol].concat())
+                            .collect();
+                        t.write("f", &base);
+                        t.commit_all("base");
+                        let index_before = t.git(&["ls-files", "-s", "--", "f"]);
+                        let index_blob = t.index_blob("f");
+
+                        // Line 2 changed (same ending), a line appended with the first line's ending.
+                        let mut worktree: Vec<Vec<u8>> =
+                            raw_lines(&base).into_iter().map(<[u8]>::to_vec).collect();
+                        worktree[1] = [b"TWO".as_slice(), eols[1]].concat();
+                        worktree.push([b"new".as_slice(), eols[0]].concat());
+                        let modified = worktree.concat();
+                        t.write("f", &modified);
+
+                        let target = DiffTarget::Unstaged {
+                            path: "f".into(),
+                            previous_path: None,
+                        };
+                        let shown = diff::file_diff(
+                            &repo,
+                            &target,
+                            &DiffOptions::default(),
+                            &CancelToken::new(),
+                        )
+                        .unwrap_or_else(|err| panic!("{case}: the diff works: {err:?}"));
+                        assert_eq!(shown.kind, ChangeKind::Modified, "{case}: a modification");
+                        let git_form_before = t.git_bytes(&[
+                            "cat-file",
+                            "blob",
+                            &t.git(&["hash-object", "-w", "--", "f"]),
+                        ]);
+                        let req = SelectionRequest {
+                            path: "f".into(),
+                            previous_path: None,
+                            base_old: shown.old.map(|side| side.id),
+                            base_new: shown.new.map(|side| side.id),
+                            algorithm: None,
+                            selection: lines(&[rem(2), add(2)]),
+                        };
+                        discard_sel(&t, &repo, &req).unwrap_or_else(|err| {
+                            panic!("{case}: the discard is not refused: {err:?}")
+                        });
+
+                        let after = t.read("f");
+                        let after_lines = raw_lines(&after);
+                        let before_lines = raw_lines(&modified);
+                        assert_eq!(
+                            after_lines.len(),
+                            before_lines.len(),
+                            "{case}: one line replaced by one"
+                        );
+                        for (n, (now, was)) in after_lines.iter().zip(&before_lines).enumerate() {
+                            if n != 1 {
+                                assert_eq!(
+                                    now.as_bstr(),
+                                    was.as_bstr(),
+                                    "{case}: line {} keeps its exact bytes",
+                                    n + 1
+                                );
+                            }
+                        }
+                        let restored = after_lines[1];
+                        assert!(
+                            restored == b"two\n" || restored == b"two\r\n",
+                            "{case}: the restored line is the index line: {:?}",
+                            restored.as_bstr()
+                        );
+
+                        // The file now cleans to the git form before the discard with line 2 taken from the index.
+                        let mut expected: Vec<&[u8]> = raw_lines(&git_form_before);
+                        expected[1] = raw_lines(&index_blob)[1];
+                        let expected = expected.concat();
+                        let expected_file = env.path(&format!("expected-{autocrlf}-{style}-{a}"));
+                        std::fs::write(&expected_file, &expected).expect("temp dir is writable");
+                        assert_eq!(
+                            t.git(&["hash-object", "--", "f"]),
+                            t.git(&[
+                                "hash-object",
+                                "--no-filters",
+                                expected_file.to_str().expect("UTF-8 temp path")
+                            ]),
+                            "{case}: git add of the result equals the expected git form {:?}",
+                            expected.as_bstr()
+                        );
+                        assert_eq!(
+                            t.git(&["ls-files", "-s", "--", "f"]),
+                            index_before,
+                            "{case}: the index is untouched"
+                        );
+                        if *style == "lf" && autocrlf == "true" && attributes.is_none() {
+                            assert_eq!(
+                                restored, b"two\n",
+                                "{case}: an LF file stays LF under autocrlf=true"
+                            );
+                        }
+                        if autocrlf == "false" && attributes.is_none() {
+                            assert_eq!(
+                                restored,
+                                raw_lines(&base)[1],
+                                "{case}: without conversion the index bytes come back exactly"
+                            );
+                        }
+                        cases.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+        }
+    });
+    assert_eq!(
+        cases.into_inner(),
+        45,
+        "3 autocrlf values x 3 line-ending styles x 5 attribute sets"
+    );
+}
+
+/// A clean filter that changes the line structure (`git stripspace` squeezes blank lines) and has no smudge: the
+/// worktree lines cannot be mapped to the git form and the file does not survive clean + smudge, so a partial
+/// discard is refused instead of guessing.
+#[test]
+fn discard_refused_when_a_filter_changes_the_line_structure() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.git(&["config", "filter.squeeze.clean", "git stripspace"]);
+    t.write(".gitattributes", b"f filter=squeeze\n");
+    t.write("f", b"a\nb\n");
+    t.commit_all("base");
+    t.write("f", b"a\n\n\nb\nc\n");
+    let repo = t.open();
+    let req = unstaged_req(&t, "f", lines(&[add(4)]));
+    expect_partial_block(discard_sel(&t, &repo, &req), PartialBlock::UnsafeRoundTrip);
+    assert_eq!(
+        t.read("f").as_bstr(),
+        b"a\n\n\nb\nc\n".as_bstr(),
+        "the refused discard left the file alone"
+    );
+}
+
+/// `text` as UTF-16LE (no byte order mark).
+fn utf16le(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// A UTF-16 `working-tree-encoding` file: its raw lines do not line up with the git form (a newline is two bytes),
+/// so the direct edit cannot be used, and gix's checkout conversion cannot encode UTF-16 (it writes UTF-8), so the
+/// whole-file path fails its round-trip check. The discard is refused and the file left alone; with the worktree file
+/// deleted (nothing on disk to compare with) the written file would not clean back to the expected content, so that
+/// is refused as well instead of writing UTF-8 where Git writes UTF-16.
+#[test]
+fn discard_refused_for_utf16_working_tree_encoding() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write(".gitattributes", b"f working-tree-encoding=UTF-16LE\n");
+    t.write("f", utf16le("a\nb\nc\n"));
+    t.commit_all("base");
+    assert_eq!(
+        t.index_blob("f").as_bstr(),
+        b"a\nb\nc\n".as_bstr(),
+        "the index holds UTF-8"
+    );
+    let modified = utf16le("a\nB\nc\nd\n");
+    t.write("f", &modified);
+    let repo = t.open();
+    expect_partial_block(
+        discard_sel(&t, &repo, &unstaged_req(&t, "f", lines(&[rem(2), add(2)]))),
+        PartialBlock::UnsafeRoundTrip,
+    );
+    assert_eq!(
+        t.read("f").as_bstr(),
+        modified.as_bstr(),
+        "the refused discard left the file alone"
+    );
+
+    std::fs::remove_file(t.path.join("f")).expect("the file can be deleted");
+    expect_partial_block(
+        discard_sel(&t, &repo, &unstaged_req(&t, "f", lines(&[rem(1)]))),
+        PartialBlock::UnsafeRoundTrip,
+    );
+    assert!(
+        !t.path.join("f").exists(),
+        "no wrongly encoded file was written"
+    );
+    assert_eq!(
+        t.index_blob("f").as_bstr(),
+        b"a\nb\nc\n".as_bstr(),
+        "discarding never touches the index"
+    );
+}
+
+/// A lossless clean/smudge pair that changes the number of lines (clean prepends a header line, smudge drops it):
+/// the worktree lines cannot be mapped one to one, but the filters reproduce the file, so the discard rewrites the
+/// whole file through them and the unselected change survives.
+#[test]
+fn discard_through_a_lossless_filter_that_changes_the_line_count() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.git(&["config", "filter.hdr.clean", "{ echo HEADER; cat; }"]);
+    t.git(&["config", "filter.hdr.smudge", "sed 1d"]);
+    t.write(".gitattributes", b"f filter=hdr\n");
+    t.write("f", b"a\nb\nc\n");
+    t.commit_all("base");
+    assert_eq!(
+        t.index_blob("f").as_bstr(),
+        b"HEADER\na\nb\nc\n".as_bstr(),
+        "the clean filter adds the header"
+    );
+    t.write("f", b"a\nB\nc\nd\n");
+    let repo = t.open();
+    discard_sel(&t, &repo, &unstaged_req(&t, "f", lines(&[rem(3), add(3)])))
+        .expect("a lossless filter is not refused");
+    assert_eq!(
+        t.read("f").as_bstr(),
+        b"a\nb\nc\nd\n".as_bstr(),
+        "line b restored, the added line kept"
+    );
+    assert_eq!(
+        t.index_blob("f").as_bstr(),
+        b"HEADER\na\nb\nc\n".as_bstr(),
+        "discarding never touches the index"
+    );
+}
+
+/// HEAD has a directory where the index now has a file: the staged diff shows an added file (HEAD's tree is no old
+/// side), and partial unstaging must agree with that instead of trying to read the tree as a blob.
+#[test]
+fn unstage_selection_when_head_has_a_directory_at_the_path() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("a/x", b"x\n");
+    t.commit_all("base");
+    t.git(&["rm", "-r", "-q", "a"]);
+    t.write("a", b"one\ntwo\n");
+    t.git(&["add", "a"]);
+    let repo = t.open();
+    let target = DiffTarget::Staged {
+        path: "a".into(),
+        previous_path: None,
+    };
+    let shown = diff::file_diff(&repo, &target, &DiffOptions::default(), &CancelToken::new())
+        .expect("the diff works");
+    assert_eq!(shown.kind, ChangeKind::Added, "an added file");
+    let DiffContent::Text(text) = &shown.content else {
+        panic!("text expected, got {:?}", shown.content);
+    };
+    assert_eq!(
+        text.partial,
+        PartialAvailability::Allowed,
+        "the diff offers partial unstaging"
+    );
+    let req = SelectionRequest {
+        path: "a".into(),
+        previous_path: None,
+        base_old: shown.old.map(|side| side.id),
+        base_new: shown.new.map(|side| side.id),
+        algorithm: None,
+        selection: lines(&[add(2)]),
+    };
+    unstage_sel(&t, &repo, &req).expect("what the diff offers works");
+    assert_eq!(
+        t.index_blob("a").as_bstr(),
+        b"one\n".as_bstr(),
+        "the selected line left the index"
     );
 }
 
@@ -747,6 +1115,7 @@ fn unstaged_rename_whole_file_only() {
         previous_path: Some("old.txt".into()),
         base_old: head_id(&t, "old.txt"),
         base_new: worktree_id(&t, "new.txt"),
+        algorithm: None,
         selection: lines(&[add(3)]),
     };
     expect_partial_block(stage_sel(&t, &repo, &req), PartialBlock::Rename);
@@ -823,6 +1192,7 @@ fn symlink_whole_only() {
         previous_path: None,
         base_old: None,
         base_new: None,
+        algorithm: None,
         selection: lines(&[add(1)]),
     };
     expect_partial_block(stage_sel(&t, &repo, &req), PartialBlock::Symlink);
@@ -1433,6 +1803,7 @@ fn conflicted_path_refuses_partial_operations() {
         previous_path: None,
         base_old: None,
         base_new: worktree_id(&t, "f"),
+        algorithm: None,
         selection: lines(&[add(1)]),
     };
     expect_partial_block(stage_sel(&t, &repo, &req), PartialBlock::Conflict);
@@ -1584,6 +1955,82 @@ fn delete_untracked_never_follows_a_symlinked_directory() {
     assert!(
         outside.join("victim").exists(),
         "deleting the link leaves its target alone"
+    );
+}
+
+/// A directory junction on Windows (`mklink /J` needs no privilege), a symlink on Unix.
+fn junction(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("symlink");
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cmd runs");
+        assert!(status.success(), "mklink /J creates a junction");
+    }
+}
+
+#[test]
+fn discard_selection_never_writes_through_a_junction() {
+    let env = TestEnv::new();
+    let outside = env.path("outside");
+    std::fs::create_dir_all(&outside).expect("outside directory");
+    std::fs::write(outside.join("f"), b"precious\n").expect("outside file");
+    let t = env.repo("r");
+    t.write("dir/f", b"a\nb\n");
+    t.commit_all("base");
+    std::fs::remove_dir_all(t.path.join("dir")).expect("tracked directory can be removed");
+    junction(&outside, &t.path.join("dir"));
+    let repo = t.open();
+
+    let target = DiffTarget::Unstaged {
+        path: "dir/f".into(),
+        previous_path: None,
+    };
+    let shown = diff::file_diff(&repo, &target, &DiffOptions::default(), &CancelToken::new())
+        .expect("the diff works");
+    assert_eq!(
+        (shown.kind, shown.new),
+        (ChangeKind::Deleted, None),
+        "like Git, the file behind the junction counts as deleted"
+    );
+    let req = SelectionRequest {
+        path: "dir/f".into(),
+        previous_path: None,
+        base_old: shown.old.map(|side| side.id),
+        base_new: None,
+        algorithm: None,
+        selection: lines(&[rem(1)]),
+    };
+    expect_kind(discard_sel(&t, &repo, &req), GitErrorKind::InvalidName);
+    assert_eq!(
+        std::fs::read(outside.join("f"))
+            .expect("outside file")
+            .as_bstr(),
+        b"precious\n".as_bstr(),
+        "nothing outside the worktree is written through the junction"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&outside)
+        .expect("outside can be listed")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "no temporary file appears outside: {leftovers:?}"
+    );
+    assert_eq!(
+        t.index_blob("dir/f").as_bstr(),
+        b"a\nb\n".as_bstr(),
+        "the index is untouched"
     );
 }
 

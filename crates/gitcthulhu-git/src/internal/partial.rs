@@ -88,7 +88,8 @@ fn block_reason(sides: Sides, kinds: &Kinds, textconv: bool) -> Option<PartialBl
         PartialBlock::Conflict
     } else if is_kind(EntryKind::Submodule) {
         PartialBlock::Submodule
-    } else if type_changed {
+    } else if type_changed || is_kind(EntryKind::Tree) {
+        // A directory entry (sparse index) on either side has no lines to select.
         PartialBlock::TypeChange
     } else if is_kind(EntryKind::Link) {
         PartialBlock::Symlink

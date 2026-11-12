@@ -141,6 +141,7 @@ fn status_stage_hunk_commit_log_graph() {
                 previous_path: None,
                 base_old: fd.old.map(|s| s.id),
                 base_new: fd.new.map(|s| s.id),
+                algorithm: None,
                 selection: Selection::Hunks(vec![second]),
             },
         )
@@ -401,6 +402,16 @@ fn fetch_pull_push_against_bare_remote_with_hooks() {
         "#!/bin/sh\necho declined >&2\nexit 1\n",
     )
     .expect("write pre-receive");
+    // Git ignores a hook without the executable bit (Unix).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            bare.join("hooks").join("pre-receive"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("pre-receive can be made executable");
+    }
     let err = network::push(&repo, &ctx(&work), &opts).expect_err("the remote declines");
     assert_eq!(
         err.kind(),

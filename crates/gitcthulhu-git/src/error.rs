@@ -58,6 +58,19 @@ pub enum GitError {
     /// The operation was cancelled through its `CancelToken`.
     #[error("the operation was cancelled")]
     Cancelled,
+    /// Content is larger than the limit the caller allowed (for example `diff::read_blob`'s `max_bytes`). The size is
+    /// known without reading the content (object header, file metadata).
+    ///
+    /// Display limits do not use this error: `DiffOptions::max_file_bytes` (default 50 MiB) and
+    /// `DiffOptions::max_lines` (default 1 000 000 lines per side) yield `DiffContent::TooLarge`, and partial
+    /// operations refuse sides above those defaults with `PartialNotPossible { reason: PartialBlock::TooLarge }`.
+    #[error("the content is too large: {size} bytes, the limit is {limit} bytes")]
+    TooLarge {
+        /// The size in bytes.
+        size: u64,
+        /// The limit in bytes.
+        limit: u64,
+    },
     // ── auth / network ──
     /// The remote rejected the credentials.
     #[error("authentication failed for {url}", url = url.as_deref().unwrap_or("the remote"))]
@@ -435,6 +448,7 @@ pub enum GitErrorKind {
     UnbornHead,
     Unsupported,
     Cancelled,
+    TooLarge,
     AuthFailed,
     AuthCancelled,
     HostKeyVerificationFailed,
@@ -489,6 +503,7 @@ impl GitError {
             GitError::UnbornHead => K::UnbornHead,
             GitError::Unsupported { .. } => K::Unsupported,
             GitError::Cancelled => K::Cancelled,
+            GitError::TooLarge { .. } => K::TooLarge,
             GitError::AuthFailed { .. } => K::AuthFailed,
             GitError::AuthCancelled { .. } => K::AuthCancelled,
             GitError::HostKeyVerificationFailed { .. } => K::HostKeyVerificationFailed,

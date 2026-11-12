@@ -995,13 +995,16 @@ pub struct DiffOptions {
     pub whitespace: WhitespaceMode,
     /// Default true (§2.4 diff.rs).
     pub inline_highlights: bool,
-    /// Default 50 MiB (Gitnuro); either side above => TooLarge.
+    /// Default 50 MiB (Gitnuro); either side above => `DiffContent::TooLarge { unit: SizeUnit::Bytes, .. }`. Partial
+    /// operations use the default and refuse larger sides with `PartialBlock::TooLarge`.
     pub max_file_bytes: u64,
-    /// Default 1_000_000 lines per side => TooLarge.
+    /// Default 1_000_000 lines per side => `DiffContent::TooLarge { unit: SizeUnit::Lines, .. }`. Partial operations
+    /// use the default and refuse longer sides with `PartialBlock::TooLarge`.
     pub max_lines: u32,
     /// Default 20 MiB per side for Image previews.
     pub max_image_bytes: u64,
-    /// `None` = `diff.algorithm` config (gix default Myers).
+    /// `None` = what Git uses for the path: the diff driver's `algorithm`, else `diff.algorithm` (default Myers).
+    /// Pass the same value as [`SelectionRequest::algorithm`] when staging from this diff.
     pub algorithm: Option<DiffAlgorithm>,
 }
 
@@ -1016,6 +1019,15 @@ pub enum WhitespaceMode {
     IgnoreChange,
     /// Ignore all whitespace.
     IgnoreAll,
+}
+
+/// What a size threshold counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeUnit {
+    /// Bytes (on-disk size for worktree files, object size for blobs).
+    Bytes,
+    /// Lines per side.
+    Lines,
 }
 
 /// The diff algorithm.
@@ -1071,8 +1083,10 @@ pub enum DiffContent {
     Binary,
     /// A side exceeds the configured threshold.
     TooLarge {
-        /// The threshold in bytes.
+        /// The threshold that was exceeded: `DiffOptions::max_file_bytes` or `DiffOptions::max_lines`.
         threshold: u64,
+        /// What `threshold` counts.
+        unit: SizeUnit,
     },
     /// Image previews.
     Image {
@@ -1372,6 +1386,9 @@ pub struct SelectionRequest {
     pub base_old: Option<ObjectId>,
     /// `new.id` of the FileDiff the selection was made on (stale check, §4.4).
     pub base_new: Option<ObjectId>,
+    /// `DiffOptions::algorithm` of the FileDiff the selection was made on, so the operation replays the same edit
+    /// script (line numbers of another algorithm would select other lines). `None` = what Git uses for the path.
+    pub algorithm: Option<DiffAlgorithm>,
     /// What was selected.
     pub selection: Selection,
 }

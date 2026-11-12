@@ -6,11 +6,12 @@
 //!
 //! Hunk and line operations are an in-process index edit (§4): the new index blob is the old image plus the selected
 //! line edits, written under `index.lock` after a stale check against the ids the displayed diff was computed from.
-//! Discarding selected lines writes the worktree file back through the filter pipeline, refusing when the worktree
-//! conversion is not lossless.
+//! Both sides are read, checked and diffed with the same shared code as `diff::file_diff` (`internal::content`,
+//! `internal::partial`, `internal::linediff`), so a selection replays exactly the displayed edit script. Discarding
+//! selected lines edits the worktree file's own bytes (§4.6).
 
 use std::{
-    io::{Read as _, Write as _},
+    io::Write as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -23,16 +24,16 @@ use gix::{
 };
 
 use crate::{
-    CommandLog, DiscardMode, EntryKind, GitError, OpClass, OpContext, OpOutcome, OpWarning,
-    PartialBlock, RefreshSet, RelaPath, Repo, RepoExclusive, Resolution, Result, Selection,
-    SelectionRequest,
+    CommandLog, DiffOptions, DiscardMode, EntryKind, GitError, OpClass, OpContext, OpOutcome,
+    OpWarning, PartialAvailability, PartialBlock, RefreshSet, RelaPath, Repo, RepoExclusive,
+    Resolution, Result, Selection, SelectionRequest, Side, WhitespaceMode,
     cli::{self, CommandKind, GitCommand},
+    internal::{
+        content::{self, SideContent, WorktreeReader},
+        linediff::{self, LineImage, Op, dominant_eol, edit_script, split_lines},
+        partial,
+    },
 };
-
-/// Either side above this size (git form) blocks partial operations (`DiffOptions::max_file_bytes` default).
-const MAX_PARTIAL_BYTES: u64 = 50 * 1024 * 1024;
-/// More lines than this on either side blocks partial operations (`DiffOptions::max_lines` default).
-const MAX_PARTIAL_LINES: usize = 1_000_000;
 
 // ───────────────────────────── whole-file operations (git CLI) ─────────────────────────────
 
@@ -91,7 +92,10 @@ pub fn unstage_paths(
     }
     let gix = repo.local();
     let index = read_index(&gix)?;
-    if let Some(path) = paths.iter().find(|p| is_conflicted(&index, p.as_ref())) {
+    if let Some(path) = paths
+        .iter()
+        .find(|p| content::is_conflicted(&index, p.as_ref()))
+    {
         return Err(GitError::PartialNotPossible {
             path: path.clone(),
             reason: PartialBlock::Conflict,
@@ -188,7 +192,7 @@ pub fn discard_paths(
     let mut untracked = Vec::new();
     for path in paths {
         let path_ref: &BStr = path.as_ref();
-        if is_conflicted(&index, path_ref) {
+        if content::is_conflicted(&index, path_ref) {
             conflicted.push(path.clone());
         } else if tracked_lookup.is_tracked(path_ref) {
             // A path that is tracked only under another letter case (`core.ignoreCase`) lands here too: Git then
@@ -201,7 +205,7 @@ pub fn discard_paths(
     // Verify every untracked path before anything is changed.
     let untracked_targets = untracked
         .iter()
-        .map(|path| verified_worktree_path(&workdir, path.as_ref()))
+        .map(|path| content::writable_worktree_path(&workdir, path.as_ref()))
         .collect::<Result<Vec<_>>>()?;
 
     let mut run = Run::default();
@@ -222,7 +226,7 @@ pub fn discard_paths(
                     let files = index_files_below(&index, &tracked);
                     let targets = files
                         .iter()
-                        .map(|path| verified_worktree_path(&workdir, path.as_ref()))
+                        .map(|path| content::writable_worktree_path(&workdir, path.as_ref()))
                         .collect::<Result<Vec<_>>>()?;
                     let cmd = GitCommand::new(repo, CommandKind::Mutation)
                         .args(["rm", "--cached", "-r", "-q"])
@@ -266,13 +270,14 @@ pub fn delete_untracked(
     let tracked_lookup = TrackedLookup::new(&gix, &index)?;
     let mut targets = Vec::with_capacity(paths.len());
     for path in paths {
-        if tracked_lookup.is_tracked(path.as_ref()) || is_conflicted(&index, path.as_ref()) {
+        if tracked_lookup.is_tracked(path.as_ref()) || content::is_conflicted(&index, path.as_ref())
+        {
             return Err(GitError::InvalidName {
                 what: "untracked path",
                 name: path.to_str_lossy().into_owned(),
             });
         }
-        targets.push(verified_worktree_path(&workdir, path.as_ref())?);
+        targets.push(content::writable_worktree_path(&workdir, path.as_ref())?);
     }
     for target in &targets {
         remove_worktree_item(target)?;
@@ -318,7 +323,7 @@ pub fn resolve_conflict(
             let mut add_only = Vec::new();
             for path in paths {
                 let path_ref: &BStr = path.as_ref();
-                if !is_conflicted(&index, path_ref) {
+                if !content::is_conflicted(&index, path_ref) {
                     // Already resolved (or never conflicted): `git checkout --ours` would check such a path out
                     // from the index and silently drop its worktree changes, so it is only staged.
                     add_only.push(path.clone());
@@ -364,24 +369,16 @@ pub fn stage_selection(
     req: &SelectionRequest,
 ) -> Result<OpOutcome<()>> {
     ctx.cancel.check()?;
-    let workdir = require_workdir(repo)?.to_owned();
-    validate_paths(std::slice::from_ref(&req.path))?;
+    require_workdir(repo)?;
+    validate_request(req)?;
     let path: &BStr = req.path.as_ref();
-    if req.previous_path.is_some() {
-        return partial_not_possible(req, PartialBlock::Rename);
-    }
     let gix = repo.local();
     let index = read_index(&gix)?;
-    if is_conflicted(&index, path) {
-        return partial_not_possible(req, PartialBlock::Conflict);
-    }
-    let sides = unstaged_sides(&gix, &index, &workdir, path, false)?;
-    check_sides(&gix, req, &sides, true)?;
+    let mut reader = WorktreeReader::new(&gix)?;
+    let sides = recompute(&gix, &index, Some(&mut reader), req, false)?;
 
-    let old_img = split_lines(&sides.old_data);
-    let new_img = split_lines(&sides.new_data);
-    check_line_counts(req, &old_img, &new_img)?;
-    let ops = edit_script(&old_img, &new_img, gix.diff_algorithm()?);
+    let (old_img, new_img) = (split_lines(sides.old_data()), split_lines(sides.new_data()));
+    let ops = edit_script(&old_img, &new_img, sides.algorithm, WhitespaceMode::None);
     let selected = LineSelection::new(&req.selection, old_img.len(), new_img.len());
     let applied = apply(Action::Stage, &old_img, &new_img, &ops, &selected);
     if applied.nothing_selected() {
@@ -389,19 +386,23 @@ pub fn stage_selection(
     }
 
     let entry = index.entry_by_path_and_stage(path, Stage::Unconflicted);
-    let edit = match (&sides.new, entry) {
+    let entry_kind = entry
+        .map(|entry| content::entry_kind_from_mode(entry.mode))
+        .transpose()?;
+    let new_kind = sides.new.as_ref().map(|new| new.side.kind);
+    let edit = match (new_kind, entry) {
         // A deleted file with every line selected: stage the deletion.
         (None, _) if applied.all_deletes_selected() => IndexChange::Remove,
-        (Some(new), Some(entry))
-            if applied.bytes == sides.new_data && kind_of_mode(entry.mode) != new.kind =>
+        (Some(new_kind), Some(_))
+            if applied.bytes == sides.new_data() && entry_kind != Some(new_kind) =>
         {
             // The whole content plus an executable-bit change: that is a whole-file stage.
             return stage_paths(repo, perm, ctx, std::slice::from_ref(&req.path));
         }
-        (new, entry) => {
-            let mode = match (entry, new) {
+        (new_kind, entry) => {
+            let mode = match (entry, new_kind) {
                 (Some(entry), _) => entry.mode,
-                (None, Some(new)) => mode_of_kind(new.kind),
+                (None, Some(kind)) => mode_of_kind(kind),
                 (None, None) => Mode::FILE,
             };
             IndexChange::Upsert {
@@ -413,7 +414,7 @@ pub fn stage_selection(
 
     let base_old = req.base_old;
     write_index_change(&gix, path, edit, |index| {
-        if is_conflicted(index, path) || unstaged_old_id(index, path) != base_old {
+        if content::is_conflicted(index, path) || unstaged_old_id(index, path) != base_old {
             return Err(GitError::StaleDiff {
                 path: req.path.clone(),
             });
@@ -436,49 +437,37 @@ pub fn unstage_selection(
 ) -> Result<OpOutcome<()>> {
     ctx.cancel.check()?;
     require_workdir(repo)?;
-    validate_paths(std::slice::from_ref(&req.path))?;
-    if let Some(previous) = &req.previous_path {
-        validate_paths(std::slice::from_ref(previous))?;
-    }
+    validate_request(req)?;
     let path: &BStr = req.path.as_ref();
     let gix = repo.local();
     let index = read_index(&gix)?;
-    if is_conflicted(&index, path) {
-        return partial_not_possible(req, PartialBlock::Conflict);
-    }
-    let old_path: &BStr = req.previous_path.as_ref().map_or(path, |p| p.as_ref());
-    let sides = staged_sides(&gix, &index, old_path, path)?;
-    check_sides(&gix, req, &sides, false)?;
+    let sides = recompute(&gix, &index, None, req, false)?;
 
-    let old_img = split_lines(&sides.old_data);
-    let new_img = split_lines(&sides.new_data);
-    check_line_counts(req, &old_img, &new_img)?;
-    let ops = edit_script(&old_img, &new_img, gix.diff_algorithm()?);
+    let (old_img, new_img) = (split_lines(sides.old_data()), split_lines(sides.new_data()));
+    let ops = edit_script(&old_img, &new_img, sides.algorithm, WhitespaceMode::None);
     let selected = LineSelection::new(&req.selection, old_img.len(), new_img.len());
     let applied = apply(Action::Unstage, &old_img, &new_img, &ops, &selected);
     if applied.nothing_selected() {
         return Ok(Run::default().outcome(RefreshSet::STATUS));
     }
 
-    let edit = if sides.old.is_none() && applied.bytes.is_empty() && applied.all_inserts_selected()
-    {
+    let (old_kind, new_kind) = (
+        sides.old.as_ref().map(|old| old.side.kind),
+        sides.new.as_ref().map(|new| new.side.kind),
+    );
+    let edit = if old_kind.is_none() && applied.bytes.is_empty() && applied.all_inserts_selected() {
         // A file that HEAD does not have, with every line unstaged: it leaves the index.
         IndexChange::Remove
     } else {
-        let mode = match (&sides.new, &sides.old) {
-            (Some(new), _) => mode_of_kind(new.kind),
-            (None, Some(old)) => mode_of_kind(old.kind),
-            (None, None) => Mode::FILE,
-        };
         IndexChange::Upsert {
             data: applied.bytes,
-            mode,
+            mode: new_kind.or(old_kind).map_or(Mode::FILE, mode_of_kind),
         }
     };
 
     let base_new = req.base_new;
     write_index_change(&gix, path, edit, |index| {
-        if is_conflicted(index, path) || staged_new_id(index, path) != base_new {
+        if content::is_conflicted(index, path) || staged_new_id(index, path) != base_new {
             return Err(GitError::StaleDiff {
                 path: req.path.clone(),
             });
@@ -488,13 +477,21 @@ pub fn unstage_selection(
     Ok(Run::default().outcome(RefreshSet::STATUS))
 }
 
-/// Throw away selected hunks or lines of the unstaged diff (index → worktree) by rewriting the worktree file (§4.6).
+/// Throw away selected hunks or lines of the unstaged diff (index → worktree) by editing the worktree file (§4.6).
 ///
-/// The new content is converted with the worktree filters and written atomically (temporary file + rename, the
-/// permissions of the existing file are kept). Refused with `PartialNotPossible { reason: UnsafeRoundTrip }` when the
-/// file does not survive a clean/smudge round trip unchanged (mixed line endings with `core.autocrlf`, irreversible
-/// filters); a file held open by another program yields [`GitError::Io`]. The index is not changed.
-/// Refresh: `STATUS`.
+/// The file's own bytes are edited: every line that is not discarded keeps its exact bytes (its own line ending and
+/// encoding), and each restored line is what a fresh checkout of the index content writes for it, ending like the
+/// rest of the file where the filters make both endings equivalent (an LF file under `core.autocrlf=true` stays LF;
+/// without any conversion the index bytes are restored exactly). The result is verified to clean (`git add`) to
+/// exactly the expected content before it is written atomically (temporary file + rename, the permissions of the
+/// existing file are kept). The index is never changed.
+///
+/// Refused with `PartialNotPossible { reason: UnsafeRoundTrip }` only when neither works: the worktree file's lines
+/// do not correspond one to one to its git form, or the edited file would not clean to the expected content, *and*
+/// the filters do not reproduce the file unchanged (`smudge(clean(file)) != file`). In practice that is a clean /
+/// smudge filter driver or a `working-tree-encoding` that is not lossless for this file. Binary, LFS, textconv and
+/// the other §4.2 cases are refused with their own reasons. A path that leads through a symbolic link or junction is
+/// refused with `InvalidName`; a file held open by another program yields [`GitError::Io`]. Refresh: `STATUS`.
 pub fn discard_selection(
     repo: &Repo,
     _perm: &mut RepoExclusive,
@@ -503,42 +500,36 @@ pub fn discard_selection(
 ) -> Result<OpOutcome<()>> {
     ctx.cancel.check()?;
     let workdir = require_workdir(repo)?.to_owned();
-    validate_paths(std::slice::from_ref(&req.path))?;
+    validate_request(req)?;
     let path: &BStr = req.path.as_ref();
-    if req.previous_path.is_some() {
-        return partial_not_possible(req, PartialBlock::Rename);
-    }
     let gix = repo.local();
     let index = read_index(&gix)?;
-    if is_conflicted(&index, path) {
-        return partial_not_possible(req, PartialBlock::Conflict);
-    }
-    let sides = unstaged_sides(&gix, &index, &workdir, path, true)?;
-    check_sides(&gix, req, &sides, true)?;
+    let mut reader = WorktreeReader::new(&gix)?;
+    let sides = recompute(&gix, &index, Some(&mut reader), req, true)?;
 
-    let (mut pipeline, _) = gix.filter_pipeline(None)?;
-    // §4.6 step 1: the worktree file must survive clean + smudge unchanged, or the rewrite would alter lines the
-    // user did not select.
-    if let Some(raw) = &sides.worktree_raw
-        && to_worktree(&mut pipeline, &sides.new_data, path)? != *raw
-    {
-        return partial_not_possible(req, PartialBlock::UnsafeRoundTrip);
-    }
-
-    let old_img = split_lines(&sides.old_data);
-    let new_img = split_lines(&sides.new_data);
-    check_line_counts(req, &old_img, &new_img)?;
-    let ops = edit_script(&old_img, &new_img, gix.diff_algorithm()?);
+    let (old_img, new_img) = (split_lines(sides.old_data()), split_lines(sides.new_data()));
+    let ops = edit_script(&old_img, &new_img, sides.algorithm, WhitespaceMode::None);
     let selected = LineSelection::new(&req.selection, old_img.len(), new_img.len());
     let applied = apply(Action::Discard, &old_img, &new_img, &ops, &selected);
     if applied.nothing_selected() {
         return Ok(Run::default().outcome(RefreshSet::STATUS));
     }
-    let content = to_worktree(&mut pipeline, &applied.bytes, path)?;
-    if sides.worktree_raw.as_deref() == Some(&content[..]) {
+    let edit = DiscardEdit {
+        path,
+        old: &old_img,
+        new: &new_img,
+        ops: &ops,
+        selected: &selected,
+        result: &applied.bytes,
+    };
+    let Some(content) = edit.worktree_bytes(&mut reader, sides.raw.as_deref())? else {
+        return partial_not_possible(req, PartialBlock::UnsafeRoundTrip);
+    };
+    if sides.raw.as_deref() == Some(&content[..]) {
         return Ok(Run::default().outcome(RefreshSet::STATUS));
     }
-    let target = verified_worktree_path(&workdir, path)?;
+    // Checked right before the write: never write through a symbolic link or junction.
+    let target = content::writable_worktree_path(&workdir, path)?;
     let index_mode = index
         .entry_by_path_and_stage(path, Stage::Unconflicted)
         .map(|entry| entry.mode);
@@ -548,347 +539,173 @@ pub fn discard_selection(
 
 // ───────────────────────────── sides of the diff ─────────────────────────────
 
-/// One side of the diff a selection was made on, resolved again now.
-#[derive(Debug, Clone, Copy)]
-struct SideInfo {
-    /// The blob id (for worktree files: the hash of the git form). Null for symlinks and submodules in the
-    /// worktree, which are never hashed (they block partial operations before the stale check).
-    id: ObjectId,
-    kind: EntryKind,
+/// Both sides of the diff a selection was made on, recomputed now (§4.5 step 1) and checked (steps 1-2).
+struct Recomputed {
+    /// The old side: index entry (unstaged diff) or HEAD's blob (staged diff), with its git-form bytes.
+    old: Option<SideContent>,
+    /// The new side: worktree file in git form (unstaged diff) or index entry (staged diff).
+    new: Option<SideContent>,
+    /// The bytes of the worktree file on disk (discard only).
+    raw: Option<Vec<u8>>,
+    /// The line algorithm of the diff the selection was made on.
+    algorithm: gix::diff::blob::Algorithm,
 }
 
-/// Both sides of a diff plus their git-form contents.
-struct Sides {
-    old: Option<SideInfo>,
-    new: Option<SideInfo>,
-    old_data: Vec<u8>,
-    new_data: Vec<u8>,
-    /// The new side is the worktree file.
-    new_from_worktree: bool,
-    /// The raw worktree bytes (discard only, when the file exists).
-    worktree_raw: Option<Vec<u8>>,
+impl Recomputed {
+    fn old_data(&self) -> &[u8] {
+        self.old
+            .as_ref()
+            .and_then(|side| side.data.as_deref())
+            .unwrap_or_default()
+    }
+
+    fn new_data(&self) -> &[u8] {
+        self.new
+            .as_ref()
+            .and_then(|side| side.data.as_deref())
+            .unwrap_or_default()
+    }
 }
 
-/// Unstaged diff sides: index entry (stage 0; nothing for untracked and intent-to-add) → worktree file in git form.
-fn unstaged_sides(
+/// Resolve and read both sides exactly as `diff::file_diff` does, then apply the shared §4.2 rules
+/// (`internal::partial`) and the stale check against `req.base_old` / `req.base_new`.
+///
+/// `worktree` selects the unstaged diff (index stage 0, nothing for untracked and intent-to-add → worktree file in
+/// git form); `None` selects the staged diff (HEAD's entry at the previous path of a rename → index stage 0).
+/// `keep_raw` also returns the worktree bytes on disk, from the same read as the git form.
+fn recompute(
     gix: &gix::Repository,
-    index: &gix::index::File,
-    workdir: &Path,
-    path: &BStr,
-    keep_raw: bool,
-) -> Result<Sides> {
-    let entry = index.entry_by_path_and_stage(path, Stage::Unconflicted);
-    let old = entry
-        .filter(|entry| !is_intent_to_add(entry))
-        .map(|entry| SideInfo {
-            id: entry.id,
-            kind: kind_of_mode(entry.mode),
-        });
-    let file = verified_worktree_path(workdir, path)?;
-    let null = gix.object_hash().null();
-    let md = match std::fs::symlink_metadata(&file) {
-        Ok(md) => Some(md),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        // A file where a directory is expected (`a` is a file, the path is `a/b`): nothing there.
-        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => None,
-        Err(err) => return Err(GitError::io(&file, err)),
-    };
-    let new = match &md {
-        None => None,
-        Some(md) if md.is_symlink() => Some(SideInfo {
-            id: null,
-            kind: EntryKind::Link,
-        }),
-        Some(md) if md.is_dir() => {
-            entry
-                .filter(|entry| entry.mode == Mode::COMMIT)
-                .map(|_| SideInfo {
-                    id: null,
-                    kind: EntryKind::Submodule,
-                })
-        }
-        Some(md) if md.is_file() => {
-            let executable_bit = gix.filesystem_options()?.executable_bit;
-            let kind = if !executable_bit {
-                // Without core.fileMode the index decides, like Git.
-                match entry.map(|entry| kind_of_mode(entry.mode)) {
-                    Some(EntryKind::BlobExecutable) => EntryKind::BlobExecutable,
-                    _ => EntryKind::Blob,
-                }
-            } else if is_executable(md) {
-                EntryKind::BlobExecutable
-            } else {
-                EntryKind::Blob
-            };
-            Some(SideInfo { id: null, kind })
-        }
-        // FIFOs, sockets: untrackable.
-        Some(_) => None,
-    };
-
-    let mut sides = Sides {
-        old,
-        new,
-        old_data: Vec::new(),
-        new_data: Vec::new(),
-        new_from_worktree: true,
-        worktree_raw: None,
-    };
-    if kind_block(sides.old.as_ref(), sides.new.as_ref()).is_some() {
-        // Reported by `check_sides`; reading would be pointless.
-        return Ok(sides);
-    }
-    if let Some(md) = md.as_ref().filter(|_| sides.new.is_some()) {
-        if md.len() > MAX_PARTIAL_BYTES {
-            sides.new = sides.new.map(|side| SideInfo { id: null, ..side });
-            return Ok(sides);
-        }
-        let raw = std::fs::read(&file).map_err(|err| GitError::io(&file, err))?;
-        let (mut pipeline, _) = gix.filter_pipeline(None)?;
-        let rela = gix::path::from_bstr(path)?;
-        let mut data = Vec::with_capacity(raw.len());
-        pipeline
-            .convert_to_git(&raw[..], &rela, index)?
-            .read_to_end(&mut data)
-            .map_err(|err| GitError::io(&file, err))?;
-        let id = gix::objs::compute_hash(gix.object_hash(), gix::objs::Kind::Blob, &data)
-            .map_err(|err| GitError::Other(err.into()))?;
-        if let Some(new) = &mut sides.new {
-            new.id = id;
-        }
-        sides.new_data = data;
-        if keep_raw {
-            sides.worktree_raw = Some(raw);
-        }
-    }
-    if let Some(old) = &sides.old {
-        sides.old_data = read_blob_limited(gix, old.id)?.unwrap_or_default();
-    }
-    Ok(sides)
-}
-
-/// Staged diff sides: HEAD's tree entry at `old_path` (nothing if unborn or absent) → index entry at `path`
-/// (stage 0; nothing for intent-to-add).
-fn staged_sides(
-    gix: &gix::Repository,
-    index: &gix::index::File,
-    old_path: &BStr,
-    path: &BStr,
-) -> Result<Sides> {
-    let old = head_entry(gix, old_path)?;
-    let new = index
-        .entry_by_path_and_stage(path, Stage::Unconflicted)
-        .filter(|entry| !is_intent_to_add(entry))
-        .map(|entry| SideInfo {
-            id: entry.id,
-            kind: kind_of_mode(entry.mode),
-        });
-    let mut sides = Sides {
-        old,
-        new,
-        old_data: Vec::new(),
-        new_data: Vec::new(),
-        new_from_worktree: false,
-        worktree_raw: None,
-    };
-    if kind_block(sides.old.as_ref(), sides.new.as_ref()).is_some() {
-        return Ok(sides);
-    }
-    if let Some(old) = &sides.old {
-        sides.old_data = read_blob_limited(gix, old.id)?.unwrap_or_default();
-    }
-    if let Some(new) = &sides.new {
-        sides.new_data = read_blob_limited(gix, new.id)?.unwrap_or_default();
-    }
-    Ok(sides)
-}
-
-/// The blob `id`, or `None` if it is larger than [`MAX_PARTIAL_BYTES`] (checked from the object header first).
-fn read_blob_limited(gix: &gix::Repository, id: ObjectId) -> Result<Option<Vec<u8>>> {
-    if gix.find_header(id)?.size() > MAX_PARTIAL_BYTES {
-        return Ok(None);
-    }
-    Ok(Some(gix.find_blob(id)?.take_data()))
-}
-
-/// HEAD's tree entry at `path`, `None` if HEAD is unborn or has no such entry.
-fn head_entry(gix: &gix::Repository, path: &BStr) -> Result<Option<SideInfo>> {
-    let Some(head_id) = gix.head()?.id() else {
-        return Ok(None);
-    };
-    let tree = head_id.object()?.peel_to_tree()?;
-    let entry = tree.lookup_entry(path.split(|b| *b == b'/'))?;
-    Ok(entry.map(|entry| SideInfo {
-        id: entry.object_id(),
-        kind: entry.mode().kind().into(),
-    }))
-}
-
-/// The partial-availability rules of §4.2 that need only the entry kinds.
-fn kind_block(old: Option<&SideInfo>, new: Option<&SideInfo>) -> Option<PartialBlock> {
-    fn category(kind: EntryKind) -> u8 {
-        match kind {
-            EntryKind::Blob | EntryKind::BlobExecutable => 0,
-            EntryKind::Link => 1,
-            EntryKind::Submodule => 2,
-            EntryKind::Tree => 3,
-        }
-    }
-    let kinds = || old.into_iter().chain(new).map(|side| side.kind);
-    if kinds().any(|kind| kind == EntryKind::Submodule) {
-        return Some(PartialBlock::Submodule);
-    }
-    if let (Some(old), Some(new)) = (old, new)
-        && category(old.kind) != category(new.kind)
-    {
-        return Some(PartialBlock::TypeChange);
-    }
-    if kinds().any(|kind| kind == EntryKind::Link) {
-        return Some(PartialBlock::Symlink);
-    }
-    if kinds().any(|kind| kind == EntryKind::Tree) {
-        return Some(PartialBlock::TypeChange);
-    }
-    None
-}
-
-/// §4.5 steps 1-2: kinds, stale check, then the content rules (size, LFS, binary, textconv).
-fn check_sides(
-    gix: &gix::Repository,
+    index: &gix::index::State,
+    worktree: Option<&mut WorktreeReader<'_>>,
     req: &SelectionRequest,
-    sides: &Sides,
-    unstaged: bool,
-) -> Result<()> {
-    if let Some(reason) = kind_block(sides.old.as_ref(), sides.new.as_ref()) {
+    keep_raw: bool,
+) -> Result<Recomputed> {
+    let limits = DiffOptions::default();
+    let path: &BStr = req.path.as_ref();
+    let old_path: &BStr = req.previous_path.as_ref().map_or(path, |p| p.as_ref());
+    let conflicted = content::is_conflicted(index, path);
+    let read_object = |side: Side| content::read_blob(gix, side, limits.max_file_bytes);
+    let entry_side = |entry: content::IndexEntry| Side {
+        id: entry.id,
+        kind: entry.kind,
+    };
+    let unstaged = worktree.is_some();
+    let (old, new, raw) = match worktree {
+        Some(reader) => {
+            let entry = content::index_entry(index, old_path, Stage::Unconflicted)?;
+            let old = entry
+                .filter(|entry| !entry.intent_to_add)
+                .map(|entry| read_object(entry_side(entry)))
+                .transpose()?;
+            let index_kind = entry.map(|entry| entry.kind);
+            let (new, raw) = if keep_raw {
+                match reader.read_with_raw(path, limits.max_file_bytes, index_kind)? {
+                    Some(side) => (Some(side.content), side.raw),
+                    None => (None, None),
+                }
+            } else {
+                (reader.read(path, limits.max_file_bytes, index_kind)?, None)
+            };
+            (old, new, raw)
+        }
+        None => {
+            // A directory in HEAD where the index now has a file is no old side, as in `diff::file_diff`.
+            let old = content::head_entry(gix, old_path)?
+                .filter(|side| side.kind != EntryKind::Tree)
+                .map(read_object)
+                .transpose()?;
+            let new = content::index_entry(index, path, Stage::Unconflicted)?
+                .filter(|entry| !entry.intent_to_add)
+                .map(|entry| read_object(entry_side(entry)))
+                .transpose()?;
+            (old, new, None)
+        }
+    };
+
+    let kind = |side: &Option<SideContent>| side.as_ref().map(|side| side.side.kind);
+    let id = |side: &Option<SideContent>| side.as_ref().map(|side| side.side.id);
+    let too_large = [&old, &new].into_iter().flatten().any(|side| {
+        side.is_too_large()
+            || side
+                .data
+                .as_deref()
+                .is_some_and(|data| linediff::count_lines(data) > limits.max_lines as usize)
+    });
+    let has_submodule = [kind(&old), kind(&new)].contains(&Some(EntryKind::Submodule));
+    // The diff platform decides binary and textconv; it is not asked about sides an earlier rule blocks anyway
+    // (it would read a submodule directory or a file above the size limit).
+    let prepared = if has_submodule || too_large {
+        None
+    } else {
+        let resource = |side: &Option<SideContent>, path| {
+            side.as_ref().map(|side| content::Resource {
+                id: side.side.id,
+                kind: side.side.kind,
+                path,
+                worktree: side.side.from_worktree,
+            })
+        };
+        Some(content::prepare_text(
+            gix,
+            resource(&old, old_path),
+            resource(&new, path),
+        )?)
+    };
+    let content_class = if too_large {
+        partial::ContentClass::TooLarge
+    } else if prepared.as_ref().is_some_and(|p| p.binary) {
+        partial::ContentClass::Binary
+    } else if id(&old).is_some() && id(&old) == id(&new) {
+        partial::ContentClass::Identical
+    } else {
+        partial::ContentClass::Text
+    };
+    let textconv = prepared
+        .as_ref()
+        .is_some_and(|p| p.old_textconv.is_some() || p.new_textconv.is_some());
+    let availability = partial::partial_availability(
+        gix,
+        index,
+        path,
+        if unstaged {
+            partial::Sides::IndexToWorktree
+        } else {
+            partial::Sides::HeadToIndex
+        },
+        &partial::Kinds {
+            old: kind(&old),
+            new: kind(&new),
+            content: content_class,
+            renamed: req.previous_path.is_some(),
+            conflicted,
+            whitespace: WhitespaceMode::None,
+        },
+        textconv,
+    )?;
+    if let PartialAvailability::WholeFileOnly(reason) = availability {
         return partial_not_possible(req, reason);
     }
-    let too_large = |side: &Option<SideInfo>| side.is_some_and(|side| side.id.is_null());
-    if too_large(&sides.new) && sides.new_from_worktree {
-        // Not hashed because of its size.
-        return partial_not_possible(req, PartialBlock::TooLarge);
-    }
-    if req.base_old != sides.old.map(|side| side.id) || req.base_new != sides.new.map(|s| s.id) {
+    if req.base_old != id(&old) || req.base_new != id(&new) {
         return Err(GitError::StaleDiff {
             path: req.path.clone(),
         });
     }
-    if let (Some(old), Some(new)) = (&sides.old, &sides.new)
-        && old.id == new.id
-        && old.kind != new.kind
-    {
-        return partial_not_possible(req, PartialBlock::ModeOnly);
-    }
-    let blob_too_large = |side: &Option<SideInfo>, data: &[u8]| -> Result<bool> {
-        Ok(match side {
-            Some(side) if data.is_empty() => gix.find_header(side.id)?.size() > MAX_PARTIAL_BYTES,
-            _ => false,
-        })
+    let configured = match &prepared {
+        Some(prepared) => prepared.algorithm,
+        None => gix.diff_algorithm()?,
     };
-    if blob_too_large(&sides.old, &sides.old_data)?
-        || (!sides.new_from_worktree && blob_too_large(&sides.new, &sides.new_data)?)
-    {
-        return partial_not_possible(req, PartialBlock::TooLarge);
-    }
-    if let Some(reason) = content_block(gix, req, sides, unstaged)? {
-        return partial_not_possible(req, reason);
-    }
-    Ok(())
-}
-
-/// LFS (`filter=lfs`), binary content and textconv drivers, decided like the diff does (gix diff resource cache in
-/// `ToGitUnlessBinaryToTextIsPresent` mode).
-fn content_block(
-    gix: &gix::Repository,
-    req: &SelectionRequest,
-    sides: &Sides,
-    unstaged: bool,
-) -> Result<Option<PartialBlock>> {
-    use gix::diff::blob::{
-        ResourceKind,
-        pipeline::{Mode as ConversionMode, WorktreeRoots},
-        platform::prepare_diff::Operation,
-    };
-    let path: &BStr = req.path.as_ref();
-    let old_path: &BStr = req.previous_path.as_ref().map_or(path, |p| p.as_ref());
-
-    {
-        let index = gix.index_or_empty()?;
-        let mut attributes = gix.attributes_only(
-            &index,
-            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-        )?;
-        let candidates = if old_path == path {
-            &[path][..]
-        } else {
-            &[path, old_path][..]
-        };
-        for &candidate in candidates {
-            let mut outcome = attributes.selected_attribute_matches(["filter"]);
-            attributes
-                .at_entry(candidate, None)?
-                .matching_attributes(&mut outcome);
-            let lfs = outcome.iter_selected().any(|m| {
-                matches!(m.assignment.state, gix::attrs::StateRef::Value(value) if value.as_bstr() == "lfs")
-            });
-            if lfs {
-                return Ok(Some(PartialBlock::Lfs));
-            }
-        }
-    }
-
-    let null = gix.object_hash().null();
-    let Some(any_kind) = sides.new.or(sides.old).map(|side| side.kind) else {
-        return Ok(None);
-    };
-    let new_root = (unstaged && sides.new.is_some())
-        .then(|| gix.workdir().map(ToOwned::to_owned))
-        .flatten();
-    let mut cache = gix.diff_resource_cache(
-        ConversionMode::ToGitUnlessBinaryToTextIsPresent,
-        WorktreeRoots {
-            old_root: None,
-            new_root,
-        },
-    )?;
-    let (new_id, new_kind) = match &sides.new {
-        Some(side) if sides.new_from_worktree => (null, side.kind),
-        Some(side) => (side.id, side.kind),
-        None => (null, any_kind),
-    };
-    let (old_id, old_kind) = sides
-        .old
-        .map_or((null, any_kind), |side| (side.id, side.kind));
-    cache
-        .set_resource(
-            new_id,
-            tree_kind(new_kind),
-            path,
-            ResourceKind::NewOrDestination,
-            gix,
-        )
-        .map_err(|err| GitError::Other(err.into()))?;
-    cache
-        .set_resource(
-            old_id,
-            tree_kind(old_kind),
-            old_path,
-            ResourceKind::OldOrSource,
-            gix,
-        )
-        .map_err(|err| GitError::Other(err.into()))?;
-    let prep = cache
-        .prepare_diff()
-        .map_err(|err| GitError::Other(err.into()))?;
-    Ok(match prep.operation {
-        Operation::SourceOrDestinationIsBinary => Some(PartialBlock::Binary),
-        _ if prep.old_or_new_is_derived => Some(PartialBlock::TextConv),
-        _ => None,
+    Ok(Recomputed {
+        old,
+        new,
+        raw,
+        algorithm: linediff::resolve_algorithm(req.algorithm, configured),
     })
 }
 
-fn check_line_counts(req: &SelectionRequest, old: &LineImage, new: &LineImage) -> Result<()> {
-    if old.len() > MAX_PARTIAL_LINES || new.len() > MAX_PARTIAL_LINES {
-        return partial_not_possible(req, PartialBlock::TooLarge);
+fn validate_request(req: &SelectionRequest) -> Result<()> {
+    validate_paths(std::slice::from_ref(&req.path))?;
+    if let Some(previous) = &req.previous_path {
+        validate_paths(std::slice::from_ref(previous))?;
     }
     Ok(())
 }
@@ -898,6 +715,96 @@ fn partial_not_possible<T>(req: &SelectionRequest, reason: PartialBlock) -> Resu
         path: req.path.clone(),
         reason,
     })
+}
+
+// ───────────────────────────── discard: editing the worktree bytes (§4.6) ─────────────────────────────
+
+/// A partial discard computed in git form, to be carried over to the worktree file's own bytes.
+struct DiscardEdit<'a> {
+    path: &'a BStr,
+    /// The index image (git form).
+    old: &'a LineImage<'a>,
+    /// The worktree image in git form.
+    new: &'a LineImage<'a>,
+    ops: &'a [Op],
+    selected: &'a LineSelection,
+    /// The discard result in git form (§4.4): what the worktree file must clean to afterwards.
+    result: &'a [u8],
+}
+
+impl DiscardEdit<'_> {
+    /// The new worktree bytes, or `None` if they cannot be produced without risking lines the user did not select.
+    ///
+    /// 1. Direct edit. Clean conversions (`core.autocrlf`, `eol`, `text`, `ident`) keep the number of lines, so the
+    ///    git-form line *j* is worktree line *j*. The same §4.4 discard runs over the raw worktree lines (kept
+    ///    byte-for-byte) and the checked-out index lines (restored lines). Restored lines first get the file's
+    ///    dominant line ending, then, if that does not clean to [`Self::result`], exactly the checkout's bytes.
+    /// 2. Whole file. If the filters reproduce the file unchanged (`smudge(clean(raw)) == raw`, e.g. a lossless
+    ///    `working-tree-encoding`), the result is smudged as a whole, and accepted only if that cleans back to exactly
+    ///    [`Self::result`].
+    fn worktree_bytes(
+        &self,
+        reader: &mut WorktreeReader<'_>,
+        raw: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
+        let raw_img = split_lines(raw.unwrap_or_default());
+        if raw_img.len() == self.new.len() {
+            let checkout = reader.convert_to_worktree(self.old.bytes, self.path)?;
+            let checkout_img = split_lines(&checkout);
+            if checkout_img.len() == self.old.len() {
+                let file_eol = raw_img
+                    .lines
+                    .iter()
+                    .any(|line| raw_img.bytes[line.clone()].ends_with(b"\n"))
+                    .then(|| dominant_eol(&raw_img));
+                let reterminated = file_eol
+                    .map(|eol| reterminate(&checkout_img, eol))
+                    .filter(|bytes| *bytes != checkout);
+                for restored in reterminated.iter().chain([&checkout]) {
+                    let restored_img = split_lines(restored);
+                    let bytes = apply(
+                        Action::Discard,
+                        &restored_img,
+                        &raw_img,
+                        self.ops,
+                        self.selected,
+                    )
+                    .bytes;
+                    // Spliced lines of an encoding that is not line-aligned may not even convert; that is a
+                    // mismatch like any other, and the whole-file path below decides.
+                    if reader
+                        .convert_to_git(&bytes, self.path)
+                        .is_ok_and(|git| git == self.result)
+                    {
+                        return Ok(Some(bytes));
+                    }
+                }
+            }
+        }
+        let round_trips = match raw {
+            Some(raw) => reader.convert_to_worktree(self.new.bytes, self.path)? == raw,
+            // Nothing on disk to preserve: write what a checkout of the result writes.
+            None => true,
+        };
+        if !round_trips {
+            return Ok(None);
+        }
+        let smudged = reader.convert_to_worktree(self.result, self.path)?;
+        // The same guarantee as the direct edit: the written file cleans to exactly the expected content.
+        Ok((reader.convert_to_git(&smudged, self.path)? == self.result).then_some(smudged))
+    }
+}
+
+/// The lines of `img` with every terminator (`\n` or `\r\n`) replaced by `eol`; a last line without one stays so.
+fn reterminate(img: &LineImage<'_>, eol: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(img.bytes.len() + img.len());
+    for idx in 0..img.len() as u32 {
+        out.extend_from_slice(img.content(idx));
+        if img.eol(idx) != crate::Eol::None {
+            out.extend_from_slice(eol);
+        }
+    }
+    out
 }
 
 // ───────────────────────────── index write (§4.5 steps 3-7) ─────────────────────────────
@@ -1029,15 +936,6 @@ fn is_intent_to_add(entry: &gix::index::Entry) -> bool {
         .contains(gix::index::entry::Flags::INTENT_TO_ADD)
 }
 
-/// Whether `path` has conflict stages in the index.
-fn is_conflicted(index: &gix::index::State, path: &BStr) -> bool {
-    index.entry_range(path).is_some_and(|range| {
-        index.entries()[range]
-            .iter()
-            .any(|entry| entry.flags.stage() != Stage::Unconflicted)
-    })
-}
-
 /// Whether the index has an entry at `path` or below it (a tracked file or a directory with tracked files).
 fn is_tracked(index: &gix::index::State, path: &BStr) -> bool {
     let path = path.trim_end_with(|c| c == '/').as_bstr();
@@ -1123,20 +1021,6 @@ fn head_is_unborn(gix: &gix::Repository) -> Result<bool> {
     Ok(gix.head()?.is_unborn())
 }
 
-fn kind_of_mode(mode: Mode) -> EntryKind {
-    if mode == Mode::FILE_EXECUTABLE {
-        EntryKind::BlobExecutable
-    } else if mode == Mode::SYMLINK {
-        EntryKind::Link
-    } else if mode == Mode::COMMIT {
-        EntryKind::Submodule
-    } else if mode == Mode::DIR {
-        EntryKind::Tree
-    } else {
-        EntryKind::Blob
-    }
-}
-
 fn mode_of_kind(kind: EntryKind) -> Mode {
     match kind {
         EntryKind::Blob => Mode::FILE,
@@ -1147,52 +1031,7 @@ fn mode_of_kind(kind: EntryKind) -> Mode {
     }
 }
 
-fn tree_kind(kind: EntryKind) -> gix::object::tree::EntryKind {
-    use gix::object::tree::EntryKind as K;
-    match kind {
-        EntryKind::Blob => K::Blob,
-        EntryKind::BlobExecutable => K::BlobExecutable,
-        EntryKind::Link => K::Link,
-        EntryKind::Submodule => K::Commit,
-        EntryKind::Tree => K::Tree,
-    }
-}
-
-#[cfg(unix)]
-fn is_executable(md: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    md.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_md: &std::fs::Metadata) -> bool {
-    false
-}
-
 // ───────────────────────────── worktree writes ─────────────────────────────
-
-/// `data` (git form) converted for the worktree at `path` (filters, `eol`, `core.autocrlf`), never delayed.
-fn to_worktree(
-    pipeline: &mut gix::filter::Pipeline<'_>,
-    data: &[u8],
-    path: &BStr,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(data.len() + data.len() / 16);
-    pipeline
-        .convert_to_worktree(
-            data,
-            path,
-            gix::filter::plumbing::pipeline::convert::to_worktree::Options {
-                can_delay: gix::filter::plumbing::driver::apply::Delay::Forbid,
-                ..Default::default()
-            },
-        )?
-        .read_to_end(&mut out)
-        .map_err(|err| {
-            GitError::Other(anyhow::Error::from(err).context("worktree filter failed"))
-        })?;
-    Ok(out)
-}
 
 /// Write `content` to `target` atomically: a temporary file next to it, the permissions of the existing file (or the
 /// executable bit of `index_mode` for a file that is gone), then a rename over the target. On failure the temporary
@@ -1276,42 +1115,6 @@ fn remove_worktree_item(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(GitError::io(path, err)),
     }
-}
-
-/// `workdir/path`, verified not to pass through a symbolic link (or, on Windows, a junction) on the way, so nothing
-/// outside the worktree can be written or deleted through it. The last component itself may be a link: deleting it
-/// removes the link, not its target. Missing components are fine (the rest of the path does not exist).
-///
-/// This is done here rather than with gix's `SymlinkCheck`, which performs no verification on Windows.
-fn verified_worktree_path(workdir: &Path, path: &BStr) -> Result<PathBuf> {
-    let trimmed = path.trim_end_with(|c| c == '/').as_bstr();
-    let invalid = || GitError::InvalidName {
-        what: "path inside the worktree",
-        name: path.to_str_lossy().into_owned(),
-    };
-    let mut current = workdir.to_owned();
-    let mut components = trimmed.split_str("/").peekable();
-    let mut checking = true;
-    while let Some(component) = components.next() {
-        current.push(gix::path::from_byte_slice(component).map_err(|_| invalid())?);
-        if !checking || components.peek().is_none() {
-            continue;
-        }
-        match std::fs::symlink_metadata(&current) {
-            Ok(md) if md.file_type().is_symlink() => return Err(invalid()),
-            Ok(_) => {}
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                checking = false;
-            }
-            Err(err) => return Err(GitError::io(&current, err)),
-        }
-    }
-    Ok(current)
 }
 
 // ───────────────────────────── validation and plumbing ─────────────────────────────
@@ -1423,101 +1226,10 @@ impl Run {
     }
 }
 
-// ───────────────────────────── line engine ─────────────────────────────
+// ───────────────────────────── selection replay (§4.4) ─────────────────────────────
 //
-// Private copy of the shared line engine of §4.3 (`internal::linediff`, WP-B0d), restricted to what staging needs
-// (`WhitespaceMode::None`). It uses the same tokens (lines including their terminator), the same gix diff with
-// slider heuristics and the same op order, so the line numbers of the displayed diff replay exactly. Once
-// `internal::linediff` lands, these functions are replaced by calls into it.
-
-/// A byte image split into lines; each range includes its terminator (`\n`, a preceding `\r` stays in the line).
-struct LineImage<'a> {
-    bytes: &'a [u8],
-    lines: Vec<std::ops::Range<usize>>,
-}
-
-impl LineImage<'_> {
-    fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    fn line(&self, idx: u32) -> &[u8] {
-        &self.bytes[self.lines[idx as usize].clone()]
-    }
-}
-
-fn split_lines(bytes: &[u8]) -> LineImage<'_> {
-    let mut lines = Vec::with_capacity(bytes.len() / 32 + 1);
-    let mut start = 0;
-    for end in memchr_newlines(bytes) {
-        lines.push(start..end + 1);
-        start = end + 1;
-    }
-    if start < bytes.len() {
-        lines.push(start..bytes.len());
-    }
-    LineImage { bytes, lines }
-}
-
-fn memchr_newlines(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    bytes.find_iter(b"\n")
-}
-
-/// `\r\n` if more lines end in CRLF than in a lone LF, else `\n`.
-fn dominant_eol(img: &LineImage<'_>) -> &'static [u8] {
-    let (mut crlf, mut lf) = (0usize, 0usize);
-    for range in &img.lines {
-        let line = &img.bytes[range.clone()];
-        if line.ends_with(b"\r\n") {
-            crlf += 1;
-        } else if line.ends_with(b"\n") {
-            lf += 1;
-        }
-    }
-    if crlf > lf { b"\r\n" } else { b"\n" }
-}
-
-/// One step of the edit script; indexes are 0-based line numbers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Op {
-    Equal { old: u32, new: u32 },
-    Delete { old: u32 },
-    Insert { new: u32 },
-}
-
-/// The line edit script from `old` to `new`, in order; within a change block all deletes precede all inserts.
-fn edit_script(
-    old: &LineImage<'_>,
-    new: &LineImage<'_>,
-    algorithm: gix::diff::blob::Algorithm,
-) -> Vec<Op> {
-    use gix::diff::blob::{InternedInput, diff_with_slider_heuristics};
-    let mut input: InternedInput<&[u8]> = InternedInput::default();
-    input.reserve(old.len() as u32, new.len() as u32);
-    input.update_before(old.lines.iter().map(|r| &old.bytes[r.clone()]));
-    input.update_after(new.lines.iter().map(|r| &new.bytes[r.clone()]));
-    let diff = diff_with_slider_heuristics(algorithm, &input);
-
-    let mut ops = Vec::with_capacity(old.len().max(new.len()) + 16);
-    let (mut i, mut j) = (0u32, 0u32);
-    for hunk in diff.hunks() {
-        while i < hunk.before.start {
-            ops.push(Op::Equal { old: i, new: j });
-            i += 1;
-            j += 1;
-        }
-        ops.extend(hunk.before.clone().map(|old| Op::Delete { old }));
-        ops.extend(hunk.after.clone().map(|new| Op::Insert { new }));
-        i = hunk.before.end;
-        j = hunk.after.end;
-    }
-    while (i as usize) < old.len() {
-        ops.push(Op::Equal { old: i, new: j });
-        i += 1;
-        j += 1;
-    }
-    ops
-}
+// The edit script comes from the shared line engine (`internal::linediff`, the one `diff::file_diff` displays), so
+// the line numbers of a `LineRef` select exactly the displayed lines.
 
 /// The selected removed (old) and added (new) lines, as bitmaps over the two images.
 struct LineSelection {
@@ -1672,47 +1384,28 @@ mod tests {
 
     fn run(action: Action, old: &[u8], new: &[u8], selection: Selection) -> Vec<u8> {
         let (old, new) = (split_lines(old), split_lines(new));
-        let ops = edit_script(&old, &new, gix::diff::blob::Algorithm::Myers);
+        let ops = edit_script(
+            &old,
+            &new,
+            gix::diff::blob::Algorithm::Myers,
+            WhitespaceMode::None,
+        );
         let sel = LineSelection::new(&selection, old.len(), new.len());
         apply(action, &old, &new, &ops, &sel).bytes
     }
 
     #[test]
-    fn split_lines_keeps_terminators_and_last_partial_line() {
+    fn reterminate_replaces_every_line_ending() {
         let img = split_lines(b"a\r\nb\nc");
-        let lines: Vec<&[u8]> = (0..img.len() as u32).map(|i| img.line(i)).collect();
-        assert_eq!(lines, [&b"a\r\n"[..], b"b\n", b"c"], "CR stays in the line");
-        assert_eq!(split_lines(b"").len(), 0, "empty input has no lines");
-        assert_eq!(split_lines(b"\n").len(), 1, "a lone newline is one line");
-    }
-
-    #[test]
-    fn dominant_eol_prefers_crlf_only_when_it_is_the_majority() {
-        assert_eq!(dominant_eol(&split_lines(b"a\r\nb\r\nc\n")), b"\r\n");
         assert_eq!(
-            dominant_eol(&split_lines(b"a\r\nb\n")),
-            b"\n",
-            "a tie is LF"
+            reterminate(&img, b"\n").as_bstr(),
+            b"a\nb\nc".as_bstr(),
+            "CRLF and LF both become the given ending, the unterminated last line stays"
         );
         assert_eq!(
-            dominant_eol(&split_lines(b"a")),
-            b"\n",
-            "no terminator at all"
-        );
-    }
-
-    #[test]
-    fn edit_script_orders_deletes_before_inserts() {
-        let (old, new) = (split_lines(b"a\nb\nc\n"), split_lines(b"a\nB\nc\n"));
-        let ops = edit_script(&old, &new, gix::diff::blob::Algorithm::Myers);
-        assert_eq!(
-            ops,
-            [
-                Op::Equal { old: 0, new: 0 },
-                Op::Delete { old: 1 },
-                Op::Insert { new: 1 },
-                Op::Equal { old: 2, new: 2 },
-            ]
+            reterminate(&split_lines(b"x\n"), b"\r\n").as_bstr(),
+            b"x\r\n".as_bstr(),
+            "LF becomes CRLF"
         );
     }
 

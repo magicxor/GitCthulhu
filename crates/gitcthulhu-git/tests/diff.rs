@@ -4,8 +4,8 @@ mod support;
 
 use gitcthulhu_git::{
     Against, CancelToken, ChangeKind, CommitFilesOptions, DiffContent, DiffOptions, DiffTarget,
-    EntryKind, Eol, EolStyle, ExportPatch, FileDiff, GitErrorKind, LineKind, PartialAvailability,
-    PartialBlock, PatchTextOptions, TextDiff, WhitespaceMode, diff,
+    EntryKind, Eol, EolStyle, ExportPatch, FileDiff, GitError, GitErrorKind, LineKind,
+    PartialAvailability, PartialBlock, PatchTextOptions, SizeUnit, TextDiff, WhitespaceMode, diff,
 };
 use support::{TestEnv, TestRepo};
 
@@ -473,7 +473,13 @@ fn too_large_detected() {
     };
     let d = file_diff(&fixture, &unstaged("f.txt"), &opts);
     assert!(
-        matches!(d.content, DiffContent::TooLarge { threshold: 10 }),
+        matches!(
+            d.content,
+            DiffContent::TooLarge {
+                threshold: 10,
+                unit: SizeUnit::Bytes
+            }
+        ),
         "{:?}",
         d.content
     );
@@ -1155,7 +1161,11 @@ fn read_blob_respects_limit() {
     let bytes = diff::read_blob(&repo, id, 1024).expect("blob");
     assert_eq!(&*bytes, b"hello world\n", "content");
     let err = diff::read_blob(&repo, id, 4).expect_err("too large");
-    assert_eq!(err.kind(), GitErrorKind::Unsupported, "{err:?}");
+    assert!(
+        matches!(err, GitError::TooLarge { size: 12, limit: 4 }),
+        "the dedicated error names size and limit: {err:?}"
+    );
+    assert_eq!(err.kind(), GitErrorKind::TooLarge, "{err:?}");
     let missing = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111").expect("id");
     let err = diff::read_blob(&repo, missing, 1024).expect_err("missing");
     assert_eq!(err.kind(), GitErrorKind::NotFound, "{err:?}");

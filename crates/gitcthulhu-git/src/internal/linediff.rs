@@ -15,7 +15,23 @@ use gix::diff::blob::{
     diff_with_slider_heuristics,
 };
 
-use crate::{Eol, EolStyle, HunkHeader, WhitespaceMode};
+use crate::{DiffAlgorithm, Eol, EolStyle, HunkHeader, WhitespaceMode};
+
+/// The line algorithm of a diff or of a partial operation: the explicitly requested one (`DiffOptions::algorithm`,
+/// `SelectionRequest::algorithm`), else `configured`, what Git uses for the path (the diff driver's `algorithm`, else
+/// `diff.algorithm`, default Myers; see `content::prepare_text`). The display and the staging path both resolve it
+/// here, so a selection replays the edit script it was made on.
+pub(crate) fn resolve_algorithm(
+    requested: Option<DiffAlgorithm>,
+    configured: Algorithm,
+) -> Algorithm {
+    match requested {
+        Some(DiffAlgorithm::Myers) => Algorithm::Myers,
+        Some(DiffAlgorithm::MyersMinimal) => Algorithm::MyersMinimal,
+        Some(DiffAlgorithm::Histogram) => Algorithm::Histogram,
+        None => configured,
+    }
+}
 
 /// The lines of one side of a diff. Every range indexes into `bytes` and includes its terminator.
 #[derive(Debug, Clone)]
@@ -43,23 +59,16 @@ pub(crate) fn split_lines(bytes: &[u8]) -> LineImage<'_> {
     LineImage { bytes, lines }
 }
 
-impl<'a> LineImage<'a> {
-    /// An image without any lines.
-    pub fn empty() -> LineImage<'static> {
-        LineImage {
-            bytes: &[],
-            lines: Vec::new(),
-        }
-    }
+/// The number of lines [`split_lines`] finds in `bytes`, without building the ranges (limit checks before a split).
+pub(crate) fn count_lines(bytes: &[u8]) -> usize {
+    let terminated = bytes.iter().filter(|b| **b == b'\n').count();
+    terminated + usize::from(bytes.last().is_some_and(|b| *b != b'\n'))
+}
 
+impl<'a> LineImage<'a> {
     /// The number of lines.
     pub fn len(&self) -> usize {
         self.lines.len()
-    }
-
-    /// `true` if there are no lines (the content is empty).
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
     }
 
     /// Line `idx` (0-based) including its terminator.
@@ -170,8 +179,14 @@ pub(crate) enum Op {
 ///
 /// The images keep their bytes; only the comparison changes. As in Git, the indent heuristic still measures the
 /// original lines in these modes (so the same `diff_with_slider_heuristics` steps run, with a position-based
-/// heuristic). With `Histogram` and a whitespace mode, Git's own histogram can pick different (sometimes
-/// non-minimal) blocks; this is display-only, as partial operations are blocked then (§4.2).
+/// heuristic).
+///
+/// Known difference (spec §13): with `Histogram` *and* a whitespace mode, Git's xhistogram sometimes picks different,
+/// even non-minimal, blocks (about 3 % of generated cases); this engine stays minimal. It cannot be removed by sharing
+/// the engine (both the display and the staging path run this function), and it is harmless: it only affects what is
+/// displayed, because partial operations are refused in whitespace modes (`PartialBlock::WhitespaceIgnored`, §4.2) and
+/// staging always uses `WhitespaceMode::None`, where Myers and Histogram both match Git exactly. Porting xhistogram's
+/// quirks is not worth it.
 ///
 /// The ops cover both images completely and in order;
 /// within a change block all `Delete`s precede all `Insert`s.
@@ -489,7 +504,7 @@ mod tests {
     #[test]
     fn split_lines_empty_input_has_no_lines() {
         let img = split_lines(b"");
-        assert!(img.is_empty(), "nothing to split");
+        assert_eq!(img.len(), 0, "nothing to split");
         assert!(!img.missing_final_newline(), "an empty file lacks nothing");
         assert_eq!(img.eol_style(), EolStyle::None, "no terminators at all");
     }
@@ -530,6 +545,27 @@ mod tests {
             "a trailing lone \\r stays in the line"
         );
         assert_eq!(img.eol(0), Eol::None, "\\r alone terminates nothing");
+    }
+
+    #[test]
+    fn count_lines_agrees_with_split_lines() {
+        for input in [
+            &b""[..],
+            b"\n",
+            b"a",
+            b"a\n",
+            b"a\r\nb",
+            b"a\nb\n\n",
+            b"x\r",
+            b"\n\nlast",
+        ] {
+            assert_eq!(
+                count_lines(input),
+                split_lines(input).len(),
+                "{:?}: one definition of a line",
+                input.as_bstr()
+            );
+        }
     }
 
     #[test]

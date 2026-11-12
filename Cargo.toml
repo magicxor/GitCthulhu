@@ -11,6 +11,11 @@ members = [
     "crates/but-testsupport",    # The foundation for all tests: fixtures, isolated environments, assertions.
     "crates/but-debugging",      # Debugging utilities that must not be relied upon by production code.
 
+    # The plain Git backend, snapshot undo and the application services of the GUI.
+    "crates/gitcthulhu-git",      # UI-agnostic plain Git backend: gix reads, `git` mutations, executor, graph layout.
+    "crates/gitcthulhu-oplog",    # Snapshot-based undo/redo (operation log) on top of `but_core::snapshot`.
+    "crates/gitcthulhu-services", # Forge, AI and update services shared by the GUI.
+
     # Git CLI executor, credential prompts and file watching.
     "crates/gitbutler-git",         # Run fetch/push/clone through the Git CLI, with askpass support (+ askpass binary).
     "crates/but-askpass",           # Broker prompts from Git back to the application.
@@ -61,6 +66,9 @@ but-utils = { path = "crates/but-utils" }
 but-forge = { path = "crates/but-forge" }
 but-llm = { path = "crates/but-llm" }
 but-tty = { path = "crates/but-tty" }
+gitcthulhu-git = { path = "crates/gitcthulhu-git" }
+gitcthulhu-oplog = { path = "crates/gitcthulhu-oplog" }
+gitcthulhu-services = { path = "crates/gitcthulhu-services" }
 gitbutler-git = { path = "crates/gitbutler-git" }
 gitbutler-filemonitor = { path = "crates/gitbutler-filemonitor" }
 
@@ -143,6 +151,12 @@ unicode-segmentation = "1.13.2"
 urlencoding = "2.1"
 inventory = "0.3"
 smallvec = "1.15.1"
+bitflags = "2.13"
+similar = "2.7"
+infer = "0.19"
+lru = "0.18"
+encoding_rs = "0.8"
+proptest = "1.7"
 
 [patch.crates-io]
 # Keep dependencies that use the crates.io `gix` on the same git revision as the workspace.

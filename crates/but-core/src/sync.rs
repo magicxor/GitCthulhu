@@ -111,6 +111,65 @@ pub fn exclusive_repo_access(
     }
 }
 
+/// Like [`exclusive_repo_access()`], but waits at most `timeout` in total.
+///
+/// The in-process lock is awaited with `try_write_arc_for(timeout)`; if `project_data_dir` is `Some`, the
+/// inter-process lock file is then polled with `try_lock` every 50 ms for the remaining time.
+/// Returns `None` on timeout, in which case the in-process guard is released again.
+///
+/// Unlike the blocking variant (where the file lock is best-effort and may be waived), this returns `None` when
+/// another process holds the inter-process lock for the whole `timeout`, so callers can tell the user that
+/// another window is busy. Failing to create or open the lock file is still logged and ignored.
+/// Like the blocking variant, a process that inherits Git's commit-hook environment only tries the file lock once
+/// and continues without it, to avoid deadlocking hook re-entry.
+pub fn try_exclusive_repo_access(
+    git_dir: impl Into<PathBuf>,
+    project_data_dir: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Option<RepoExclusiveGuard> {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    let git_dir = git_dir.into();
+    let lock = {
+        let mut map = WORKTREE_LOCKS.lock();
+        Arc::clone(map.entry(git_dir.clone()).or_default())
+    };
+    panic_if_locked_in_debug(&lock, &git_dir, "exclusive");
+    let in_process_lock = lock.try_write_arc_for(timeout)?;
+    let inter_process_lock = match project_data_dir.and_then(open_inter_process_lock_file) {
+        None => None,
+        // Like the blocking variant: a hook re-entering the application must not wait for its own parent.
+        Some(mut file) if current_process_looks_like_git_commit_hook() => {
+            matches!(file.try_lock(), Ok(true)).then_some(file)
+        }
+        Some(mut file) => loop {
+            match file.try_lock() {
+                Ok(true) => break Some(file),
+                Ok(false) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= timeout {
+                        // `in_process_lock` is released by dropping it.
+                        return None;
+                    }
+                    std::thread::sleep(POLL_INTERVAL.min(timeout - elapsed));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "Failed to try acquiring inter-process lock; continuing with in-process lock only"
+                    );
+                    break None;
+                }
+            }
+        },
+    };
+    Some(RepoExclusiveGuard {
+        in_process_fair_lock: Some(in_process_lock),
+        inter_process_unfair_lock: inter_process_lock,
+        perm: RepoExclusive(()),
+    })
+}
+
 /// Return a guard for shared (read) repository access for the project at `git_dir`,
 /// and block while waiting for writers to disappear.
 /// There can be multiple readers, but only a single writer. Waiting writers will be handled with priority,
@@ -320,9 +379,33 @@ impl LockFile {
     }
 }
 
+/// Create `project_data_dir` if needed and open its inter-process lock file, logging and ignoring failures.
+fn open_inter_process_lock_file(project_data_dir: &Path) -> Option<LockFile> {
+    if let Err(err) = std::fs::create_dir_all(project_data_dir) {
+        tracing::warn!(
+            ?err,
+            path = %project_data_dir.display(),
+            "Failed to create project data directory for inter-process lock; continuing with in-process lock only"
+        );
+        return None;
+    }
+    let path = project_data_dir.join("write.lock");
+    match LockFile::open(&path) {
+        Ok(lock) => Some(lock),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                path = %path.display(),
+                "Failed to open inter-process lock file; continuing with in-process lock only"
+            );
+            None
+        }
+    }
+}
+
 /// Try to take the best-effort inter-process write lock used by [`exclusive_repo_access()`].
 ///
-/// The lock file is created at `project_data_dir/gitbutler.write-lock`.
+/// The lock file is created at `project_data_dir/write.lock`.
 /// Failures to create the directory, open the file, or acquire the lock are logged and ignored so
 /// callers still keep their in-process lock.
 ///
@@ -332,27 +415,8 @@ impl LockFile {
 /// a hook that re-enters GitButler from hanging forever behind the parent process that launched the
 /// hook and is itself waiting for the hook to exit.
 fn best_effort_inter_process_lock(project_data_dir: &Path) -> Option<LockFile> {
-    if let Err(err) = std::fs::create_dir_all(project_data_dir) {
-        tracing::warn!(
-            ?err,
-            path = %project_data_dir.display(),
-            "Failed to create project data directory for inter-process lock; continuing with in-process lock only"
-        );
-        return None;
-    }
-
-    let inter_process_lock_path = project_data_dir.join("gitbutler.write-lock");
-    let mut lock = match LockFile::open(&inter_process_lock_path) {
-        Ok(lock) => lock,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                path = %inter_process_lock_path.display(),
-                "Failed to open inter-process lock file; continuing with in-process lock only"
-            );
-            return None;
-        }
-    };
+    let mut lock = open_inter_process_lock_file(project_data_dir)?;
+    let inter_process_lock_path = lock.path.clone();
 
     if current_process_looks_like_git_commit_hook() {
         match lock.try_lock() {

@@ -1,0 +1,13 @@
+[package]
+name = "gitcthulhu-oplog"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Snapshot-based undo/redo for GitCthulhu (placeholder, filled by oplog WP2)"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

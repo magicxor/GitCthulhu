@@ -1,0 +1,13 @@
+[package]
+name = "gitcthulhu-services"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Forge, AI and update services for the GitCthulhu GUI (placeholder, filled by WP-S0)"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

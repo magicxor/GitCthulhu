@@ -999,6 +999,14 @@ fn authentication_and_terminal_pages_are_gitnuros_with_the_m1_changes(cx: &mut T
     })
     .expect("window");
     select_page(cx, handle, SettingsPage::Terminal);
+    // With the embedded terminal (X1) its own rows replace Gitnuro's row (21 §5.4; tested in `terminal::tests`).
+    #[cfg(feature = "terminal")]
+    cx.update_window(handle, |_, window, _| {
+        window.find(ids::row("terminal-shell"));
+        assert!(window.try_find(ids::row("terminal-path")).is_none());
+    })
+    .expect("window");
+    #[cfg(not(feature = "terminal"))]
     cx.update_window(handle, |_, window, cx| {
         window.find(ids::row("terminal-path"));
         let v = view_sync(cx);
@@ -1017,6 +1025,7 @@ fn authentication_and_terminal_pages_are_gitnuros_with_the_m1_changes(cx: &mut T
     .expect("window");
 }
 
+#[cfg(not(feature = "terminal"))]
 fn view_sync(cx: &mut App) -> Entity<SettingsView> {
     cx.global::<OpenSettingsView>()
         .0

@@ -1,0 +1,34 @@
+# Milestone 2 (X1): the embedded terminal panel (21 §5.2) on the "rich" fixture, 1280x720, dark theme: the panel
+# below the split with one terminal running `git status`, a second terminal tab, a taller panel, the light theme,
+# the hidden panel and the Terminal settings page. `wait idle` after showing a terminal waits for the shell's
+# prompt; `wait terminal shows` waits for a command's output (the end of it: the 240 dp panel shows the last rows).
+resize 1280x720
+set theme dark
+open repository rich
+wait idle
+shot m2-terminal-01-hidden
+show terminal
+wait idle
+terminal input git status
+wait terminal shows Untracked files
+assert terminal shows Untracked files
+shot m2-terminal-02-panel
+new terminal cmd
+wait idle
+shot m2-terminal-03-second-tab
+select terminal 1
+resize terminal 360
+wait idle
+shot m2-terminal-04-taller
+set theme light
+wait idle
+shot m2-terminal-05-light
+set theme dark
+hide terminal
+wait idle
+shot m2-terminal-06-hidden-again
+open settings page terminal
+wait idle
+shot m2-terminal-07-settings
+close dialog
+assert no error

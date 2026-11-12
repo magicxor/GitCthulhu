@@ -606,10 +606,10 @@ impl SettingsView {
         if crate::terminal::settings_available(cx) {
             return vec![super::terminal::page(window, cx)];
         }
-        // Gitnuro's row, disabled until the embedded terminal exists (21 §5.4).
+        // Gitnuro's row, disabled in builds without the embedded terminal (21 §5.4).
         vec![
             SettingRow::new("terminal-path", "Custom terminal path")
-                .subtitle("The embedded terminal arrives in a later version")
+                .subtitle(crate::terminal::NOT_BUILT_TOOLTIP)
                 .disabled(true)
                 .control(
                     div()

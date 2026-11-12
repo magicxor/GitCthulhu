@@ -562,7 +562,13 @@ fn undo_slot_and_terminal_state_rendered(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let state = crate::terminal::toolbar_button_state(&ctx, cx);
         assert!(!state.enabled);
-        assert_eq!(state.tooltip, crate::terminal::M1_TOOLTIP);
+        // The inert test tab has no working tree, so it has no terminal panel (X1).
+        let expected = if cfg!(feature = "terminal") {
+            crate::terminal::NO_WORKTREE_TOOLTIP
+        } else {
+            crate::terminal::NOT_BUILT_TOOLTIP
+        };
+        assert_eq!(state.tooltip, expected);
         assert!(state.status_dot.is_none());
     });
 }

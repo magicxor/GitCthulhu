@@ -1,6 +1,5 @@
 //! The user's login shell on a pseudo-terminal, with what it writes read on its own thread.
 
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -13,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{ptr, sync, thread};
 
-use super::{Output, PAUSE_MS, Queue, Size, queue};
+use super::{Output, PAUSE_MS, Queue, ShellSpec, Size, queue};
 use anyhow::Context as _;
 
 /// How long the output stays open once the shell exits, for the reader to take what it wrote
@@ -99,11 +98,22 @@ impl Pty {
     /// interactive so it reads the same config as at a prompt. The receiver yields what the shell
     /// writes, in chunks, and ends once it exits, though jobs it left still hold the terminal.
     pub fn spawn(cwd: &Path, size: Size, command: Option<&str>) -> anyhow::Result<(Pty, Output)> {
+        Self::spawn_with(&ShellSpec::default_shell(), cwd, size, command)
+    }
+
+    /// Starts `spec`'s shell in `cwd`, sized `size`, running `command` as its kind takes one when
+    /// there is one. The receiver yields what the shell writes, in chunks, and ends once it
+    /// exits, though jobs it left still hold the terminal.
+    pub fn spawn_with(
+        spec: &ShellSpec,
+        cwd: &Path,
+        size: Size,
+        command: Option<&str>,
+    ) -> anyhow::Result<(Pty, Output)> {
         let (master, slave) = open(size).context("Couldn't open a pseudo-terminal")?;
-        let shell = shell();
-        let child = shell_command(&shell, command, cwd, &slave)?
+        let child = shell_command(spec, command, cwd, &slave)?
             .spawn()
-            .with_context(|| format!("Couldn't start {}", shell.display()))?;
+            .with_context(|| format!("Couldn't start {}", spec.program.display()))?;
         drop(slave);
 
         let shell = child.id() as libc::pid_t;
@@ -298,31 +308,18 @@ fn open(size: Size) -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((master, slave))
 }
 
-fn shell() -> OsString {
-    std::env::var_os("SHELL")
-        .filter(|shell| !shell.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "macos") {
-                "/bin/zsh"
-            } else {
-                "/bin/sh"
-            }
-            .into()
-        })
-}
-
 fn shell_command(
-    shell: &OsString,
+    spec: &ShellSpec,
     run: Option<&str>,
     cwd: &Path,
     slave: &OwnedFd,
 ) -> io::Result<Command> {
-    let mut command = Command::new(shell);
-    command.arg("-l");
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
     if let Some(run) = run {
-        // `-c` alone makes it non-interactive, and zsh skips `.zshrc`, where aliases and
-        // functions a command may use are set up.
-        command.arg("-i").arg("-c").arg(run);
+        // For a POSIX shell `-i -c`: `-c` alone makes it non-interactive, and zsh skips
+        // `.zshrc`, where aliases and functions a command may use are set up.
+        command.args(spec.command_args(run)?);
     }
     command
         .current_dir(cwd)
@@ -336,6 +333,7 @@ fn shell_command(
         // shell starts would look there for its libraries first, taking ~20ms longer to start.
         .env_remove("DYLD_LIBRARY_PATH")
         .env_remove(crate::handoff::HANDED)
+        .envs(spec.env.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave.try_clone()?));

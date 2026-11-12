@@ -33,7 +33,10 @@ Apply all relevant instruction files. If instructions conflict, resolve them in 
 
 - Rust as pinned in `rust-toolchain.toml`.
 - Windows: the Windows SDK (`fxc.exe`). Linux GUI builds: libxcb, xkbcommon-x11 and fontconfig dev packages.
-- `but-tty` builds libghostty-vt and needs Zig 0.17 on `PATH`.
+- `but-tty` builds libghostty-vt and needs Zig 0.17 on `PATH`. The `gitcthulhu` crate's default features include
+  `terminal` (which depends on `but-tty`), so building the GUI needs Zig too; on a machine without Zig use
+  `cargo check -p gitcthulhu --no-default-features --features services` (agents: a portable Zig is at
+  `C:\git\opensource\GitCthulhu.plan\tools\zig`, prepend it to `PATH` for the build command).
 
 ## Scoped Instructions
 

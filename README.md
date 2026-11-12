@@ -22,7 +22,9 @@ Requirements:
 
 - Rust, as pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
 - Windows: the Windows SDK (`fxc.exe`)
-- [Zig 0.17](https://ziglang.org/download/) on `PATH` (builds libghostty-vt for the embedded terminal, `but-tty`)
+- [Zig 0.17](https://ziglang.org/download/) on `PATH` (builds libghostty-vt for the embedded terminal, `but-tty`;
+  the GUI's default `terminal` feature needs it). Without Zig, build the GUI without the terminal:
+  `cargo build -p gitcthulhu --no-default-features --features services` (the Terminal button is then disabled).
 - Linux: libxcb, xkbcommon-x11, fontconfig and libdbus development packages
 
 ```sh

@@ -25,7 +25,7 @@ name = "gitcthulhu-editor"                            # RuntimeConfig::editor_ex
 path = "src/bin/gitcthulhu-editor.rs"
 
 [features]
-default = ["services"]                                # M1. X1 changes this to ["services", "terminal"] when it merges.
+default = ["services", "terminal"]                    # `terminal` needs Zig 0.17 on PATH; without it: --no-default-features --features services
 terminal = ["dep:but-tty", "dep:shell-words"]         # needs Zig 0.17 + network at build time; never in M1 acceptance
 services = ["dep:gitcthulhu-services", "dep:but-secret"]   # forge + AI + update
 gpui-fast = ["gpui-kit/gpui-fast"]                    # benchmark passthrough only

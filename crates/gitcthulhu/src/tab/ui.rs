@@ -8,7 +8,7 @@ use gpui_kit::{Context, EventEmitter, Modifiers, SharedString};
 use indexmap::IndexSet;
 
 use crate::backend::{
-    Against, BlameRev, DiffTarget, FullName, ObjectId, RebasePlan, RelaPath, Status,
+    Against, BlameRev, CommitFile, DiffTarget, FullName, ObjectId, RebasePlan, RelaPath, Status,
 };
 use crate::settings::Settings;
 use crate::tab::model::RepoModel;
@@ -191,6 +191,10 @@ pub struct RepoUi {
     pub staged_filter: Option<SharedString>,
     pub unstaged_filter: Option<SharedString>,
     pub commit_files_filter: Option<SharedString>,
+    /// The changed files of the commit the commit changes view shows, with that commit (08 §5.2). Written by the
+    /// commit changes view when its details load; [`Self::diff_target`] takes renames (and the untracked files of
+    /// a stash) from it.
+    pub commit_files: Option<(ObjectId, Arc<Vec<CommitFile>>)>,
     /// Extra graph column width in dp; per tab, not persisted (08 §2.2).
     pub graph_padding: f32,
     /// D0.4 slot (always false in milestone 1).
@@ -255,6 +259,7 @@ impl RepoUi {
             staged_filter: None,
             unstaged_filter: None,
             commit_files_filter: None,
+            commit_files: None,
             graph_padding: 0.,
             terminal_visible: false,
         }
@@ -321,6 +326,12 @@ impl RepoUi {
             }
             FileList::CommitFiles => {
                 let (commit, _) = self.selection.commit()?;
+                if let Some((owner, files)) = &self.commit_files
+                    && *owner == commit
+                    && let Some(file) = files.iter().find(|f| f.path == path)
+                {
+                    return Some(file.target.clone());
+                }
                 Some(DiffTarget::Commit {
                     commit,
                     against: Against::FirstParent,

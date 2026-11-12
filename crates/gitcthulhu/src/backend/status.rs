@@ -42,3 +42,20 @@ pub fn file_has_conflict_markers(repo: &Repo, path: &RelaPath) -> bool {
         }
     }
 }
+
+/// The paths of `paths` whose worktree file still contains a conflict marker (see
+/// [`file_has_conflict_markers`]); blocking, run it off the UI thread.
+pub fn files_with_conflict_markers(repo: &Repo, paths: &[RelaPath]) -> Vec<RelaPath> {
+    paths
+        .iter()
+        .filter(|path| file_has_conflict_markers(repo, path))
+        .cloned()
+        .collect()
+}
+
+/// The absolute path of the repository-relative `path` in the worktree, with the platform's separators. `None`
+/// for a bare repository or a path that is not valid on this platform. Pure path arithmetic, no I/O.
+pub fn absolute_path(repo: &Repo, path: &RelaPath) -> Option<std::path::PathBuf> {
+    let workdir = repo.workdir()?;
+    Some(workdir.join(path.to_path().ok()?))
+}

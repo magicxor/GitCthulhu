@@ -375,6 +375,9 @@ impl Render for SearchField {
         let this = cx.entity().downgrade();
         observed(self.id.clone())
             .w_full()
+            // 38 dp field + 4 dp padding on both sides (08 §4.3). A definite height lets the 48 dp close
+            // button clamp to the strip instead of making it 56 dp high.
+            .h(dp(metrics::FIELD_H + 8.))
             .p(dp(4.))
             .bg(tokens.background)
             .flex()

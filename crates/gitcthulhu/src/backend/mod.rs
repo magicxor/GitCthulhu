@@ -145,6 +145,7 @@ pub use gitcthulhu_git::{
     PushReport,
     PushedRefUpdate,
     RebaseAction,
+    RebaseBackend,
     RebaseOptions,
     RebaseOutcome,
     RebasePlan,

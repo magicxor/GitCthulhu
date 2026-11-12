@@ -1,14 +1,16 @@
-//! File operations of the catalogue (spec 21 §2.11; owned by G5 after G0b). G0b implements the reference methods
-//! `stage_paths`, `unstage_paths` and `discard_paths` (prepare + confirmation + snapshot with untracked paths); the
-//! other methods keep their final signatures and show "Not implemented yet" until G5 implements them.
+//! File operations of the catalogue (spec 21 §2.11; owned by G5): staging, unstaging, discarding, deleting
+//! untracked files and resolving conflicts. Operations that can lose untracked files record a snapshot that
+//! captures them and ask first when the snapshot cannot hold them.
 
 use gpui_kit::{Context, Window};
 
 use super::{OpKind, OpSpec, Prepared};
+use crate::backend::handle::RepoHandle;
 use crate::backend::present::{OpFailure, confirm_unrestorable};
+use crate::backend::prompt::Asker;
 use crate::backend::{
     ByteSlice as _, DiscardMode, OperationDescriptor, OperationKind, RefreshSet, RelaPath,
-    Resolution, Scope, SelectionRequest, UntrackedCapture, git,
+    Resolution, Scope, SelectionRequest, SkipReason, SkippedFile, UntrackedCapture, git,
 };
 use crate::tab::RepoTab;
 
@@ -91,110 +93,223 @@ impl RepoTab {
             let (repo, ctx) = (env.repo, env.ctx);
             git::stage::discard_paths(repo, env.perm(), ctx, &paths, mode)
         })
-        .prepare(move |handle, asker| {
-            let skipped = handle.preview_skipped(&untracked);
-            if skipped.is_empty() || asker.confirm(confirm_unrestorable(&title, &skipped)) {
-                Ok(Prepared::Continue { untracked: None })
-            } else {
-                Ok::<_, OpFailure>(Prepared::Cancelled)
-            }
-        })
+        .prepare(move |handle, asker| confirm_untracked_loss(handle, asker, &title, &untracked))
         .record(descriptor)
         .base_refresh(RefreshSet::STATUS | RefreshSet::REPO_STATE);
         self.run_op(spec, window, cx)
     }
 
-    /// Stages everything (`stage::stage_all`). Owner: G5.
-    pub fn stage_all(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.not_implemented("Stage all", cx);
-        false
+    /// Stages everything (`stage::stage_all`). Refresh: STATUS.
+    pub fn stage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let spec = OpSpec::new(OpKind::StageAll, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::stage_all(repo, env.perm(), ctx)
+        })
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Unstages everything (`stage::unstage_all`). Owner: G5.
-    pub fn unstage_all(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.not_implemented("Unstage all", cx);
-        false
+    /// Unstages everything (`stage::unstage_all`); the backend refuses it while paths are conflicted, so the
+    /// status pane disables the button then. Refresh: STATUS.
+    pub fn unstage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let spec = OpSpec::new(OpKind::UnstageAll, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::unstage_all(repo, env.perm(), ctx)
+        })
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Stages a directory (`stage::stage_paths([dir])`). Owner: G5.
+    /// Stages a directory (`stage::stage_paths([dir])`). Refresh: STATUS.
     pub fn stage_dir(
         &mut self,
-        _dir: RelaPath,
-        _window: &mut Window,
+        dir: RelaPath,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Stage directory", cx);
-        false
+        let spec = OpSpec::new(OpKind::StageDirectory, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::stage_paths(repo, env.perm(), ctx, std::slice::from_ref(&dir))
+        })
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Unstages a directory (`stage::unstage_paths([dir])`). Owner: G5.
+    /// Unstages a directory (`stage::unstage_paths([dir])`). Refresh: STATUS.
     pub fn unstage_dir(
         &mut self,
-        _dir: RelaPath,
-        _window: &mut Window,
+        dir: RelaPath,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Unstage directory", cx);
-        false
+        let spec = OpSpec::new(OpKind::UnstageDirectory, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::unstage_paths(repo, env.perm(), ctx, std::slice::from_ref(&dir))
+        })
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Stages hunks or lines (`stage::stage_selection`). Owner: G5.
+    /// Stages the selected hunks or lines of an unstaged diff (`stage::stage_selection`). Refresh: STATUS (also
+    /// after a stale diff, which the runner turns into a diff reload).
     pub fn stage_selection(
         &mut self,
-        _req: SelectionRequest,
-        _unit: SelectionUnit,
-        _window: &mut Window,
+        req: SelectionRequest,
+        unit: SelectionUnit,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Stage selection", cx);
-        false
+        let kind = match unit {
+            SelectionUnit::Hunk => OpKind::StageHunk,
+            SelectionUnit::Line => OpKind::StageLine,
+        };
+        let spec = OpSpec::new(kind, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::stage_selection(repo, env.perm(), ctx, &req)
+        })
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Unstages hunks or lines (`stage::unstage_selection`). Owner: G5.
+    /// Unstages the selected hunks or lines of a staged diff (`stage::unstage_selection`). Refresh: STATUS.
     pub fn unstage_selection(
         &mut self,
-        _req: SelectionRequest,
-        _unit: SelectionUnit,
-        _window: &mut Window,
+        req: SelectionRequest,
+        unit: SelectionUnit,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Unstage selection", cx);
-        false
+        let kind = match unit {
+            SelectionUnit::Hunk => OpKind::UnstageHunk,
+            SelectionUnit::Line => OpKind::UnstageLine,
+        };
+        let spec = OpSpec::new(kind, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::unstage_selection(repo, env.perm(), ctx, &req)
+        })
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Discards hunks or lines (`stage::discard_selection`); `untracked` = the file is untracked. Owner: G5.
+    /// Discards the selected hunks or lines of an unstaged diff (`stage::discard_selection`), recorded as a full
+    /// snapshot. `untracked` = the file is untracked: the user is asked first when the snapshot cannot hold it.
+    /// Refresh: STATUS.
     pub fn discard_selection(
         &mut self,
-        _req: SelectionRequest,
-        _unit: SelectionUnit,
-        _untracked: bool,
-        _window: &mut Window,
+        req: SelectionRequest,
+        unit: SelectionUnit,
+        untracked: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Discard selection", cx);
-        false
+        let kind = match unit {
+            SelectionUnit::Hunk => OpKind::DiscardHunk,
+            SelectionUnit::Line => OpKind::DiscardLine,
+        };
+        let path = req.path.clone();
+        let title = format!(
+            "Discard changes in {}",
+            paths_title(std::slice::from_ref(&path))
+        );
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::Discard,
+            title: title.clone(),
+            detail: None,
+            scope: Scope::Full,
+            untracked: UntrackedCapture::Paths(vec![path.clone()]),
+        };
+        let confirm_paths = if untracked { vec![path] } else { Vec::new() };
+        let spec = OpSpec::new(kind, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::discard_selection(repo, env.perm(), ctx, &req)
+        })
+        .prepare(move |handle, asker| confirm_untracked_loss(handle, asker, &title, &confirm_paths))
+        .record(descriptor)
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Deletes untracked files (`stage::delete_untracked`). Owner: G5.
+    /// Deletes untracked files and directories (`stage::delete_untracked`), recorded as a full snapshot that
+    /// captures them. The user is asked first when the snapshot cannot hold some of them. Refresh: STATUS.
     pub fn delete_untracked(
         &mut self,
-        _paths: Vec<RelaPath>,
-        _window: &mut Window,
+        paths: Vec<RelaPath>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Delete file", cx);
-        false
+        let title = format!("Delete {}", paths_title(&paths));
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::DeleteUntracked,
+            title: title.clone(),
+            detail: None,
+            scope: Scope::Full,
+            untracked: UntrackedCapture::Paths(paths.clone()),
+        };
+        let confirm_paths = paths.clone();
+        let spec = OpSpec::new(OpKind::DeleteFile, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::delete_untracked(repo, env.perm(), ctx, &paths)
+        })
+        .prepare(move |handle, asker| confirm_untracked_loss(handle, asker, &title, &confirm_paths))
+        .record(descriptor)
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
     }
 
-    /// Resolves conflicts (`stage::resolve_conflict`). Owner: G5.
+    /// Resolves conflicted paths (`stage::resolve_conflict`): take ours or theirs, mark resolved or delete. The
+    /// caller warns about remaining conflict markers before `MarkResolved`. Recorded as a full snapshot.
+    /// Refresh: STATUS | REPO_STATE.
     pub fn resolve_conflict(
         &mut self,
-        _paths: Vec<RelaPath>,
-        _how: Resolution,
-        _window: &mut Window,
+        paths: Vec<RelaPath>,
+        how: Resolution,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.not_implemented("Resolve conflict", cx);
-        false
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::ResolveConflicts,
+            title: format!("Resolve conflict in {}", paths_title(&paths)),
+            detail: None,
+            scope: Scope::Full,
+            untracked: UntrackedCapture::None,
+        };
+        let spec = OpSpec::new(OpKind::ResolveConflict, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::resolve_conflict(repo, env.perm(), ctx, &paths, how)
+        })
+        .record(descriptor)
+        .base_refresh(RefreshSet::STATUS | RefreshSet::REPO_STATE);
+        self.run_op(spec, window, cx)
+    }
+}
+
+/// The `prepare` step of every operation that deletes untracked files: asks first when the snapshot would not
+/// hold them. A repository without an oplog, or with undo history switched off, holds nothing: then every path is
+/// reported as unrestorable (32 review, T6).
+fn confirm_untracked_loss(
+    handle: &RepoHandle,
+    asker: &Asker,
+    title: &str,
+    untracked: &[RelaPath],
+) -> Result<Prepared, OpFailure> {
+    if untracked.is_empty() {
+        return Ok(Prepared::Continue { untracked: None });
+    }
+    let skipped = if handle.has_oplog() && handle.oplog_enabled() {
+        handle.preview_skipped(untracked)
+    } else {
+        untracked
+            .iter()
+            .map(|path| SkippedFile {
+                path: path.clone(),
+                size: 0,
+                reason: SkipReason::CaptureDisabled,
+            })
+            .collect()
+    };
+    if skipped.is_empty() || asker.confirm(confirm_unrestorable(title, &skipped)) {
+        Ok(Prepared::Continue { untracked: None })
+    } else {
+        Ok(Prepared::Cancelled)
     }
 }

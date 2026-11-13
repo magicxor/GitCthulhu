@@ -710,7 +710,7 @@ fn type_into(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str,
         window.render_frame(cx);
         window.click(id, cx);
         window.render_frame(cx);
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         window.input(text, cx);
     });
 }

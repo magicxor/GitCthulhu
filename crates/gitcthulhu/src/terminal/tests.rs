@@ -572,22 +572,28 @@ fn terminal_context_noaction_swallows_app_keys(cx: &mut TestAppContext) {
         window.render_frame(cx);
         window.focus(&focus, cx);
         window.render_frame(cx);
+        // Stash and Refresh are bound on the primary modifier: Ctrl, Cmd on macOS.
         for key in [
-            "ctrl-s",
+            "secondary-s",
             "escape",
             "f5",
             "tab",
             "shift-tab",
-            "ctrl-r",
+            "secondary-r",
             "ctrl-`",
         ] {
             window.press(key, cx);
         }
     })
     .expect("window");
+    let (stash_key, refresh_key) = if cfg!(target_os = "macos") {
+        ("cmd-s", "cmd-r")
+    } else {
+        ("ctrl-s", "ctrl-r")
+    };
     assert_eq!(
         keys_seen.borrow().as_slice(),
-        ["ctrl-s", "escape", "f5", "tab", "shift-tab", "ctrl-r"],
+        [stash_key, "escape", "f5", "tab", "shift-tab", refresh_key],
         "app shortcuts and Tab reach the terminal's key handler"
     );
     assert_eq!(
@@ -1318,7 +1324,7 @@ fn settings_page_shell_custom_and_font_size(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, cx| {
         window.click(sids::field(FONT_SIZE), cx);
         window.render_frame(cx);
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         window.input("16", cx);
         window.render_frame(cx);
     })
@@ -1330,7 +1336,7 @@ fn settings_page_shell_custom_and_font_size(cx: &mut TestAppContext) {
         "the font size is stored"
     );
     cx.update_window(handle, |_, window, cx| {
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         window.input("99", cx);
         window.render_frame(cx);
     })

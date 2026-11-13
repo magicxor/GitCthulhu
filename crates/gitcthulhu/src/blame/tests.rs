@@ -558,7 +558,7 @@ fn ctrl_c_copies_the_selection_with_indentation(cx: &mut TestAppContext) {
         let to = gpui_kit::point(line.right() - gpui_kit::px(4.), line.center().y);
         window.drag(from, to, cx);
         window.render_frame(cx);
-        window.press("ctrl-c", cx);
+        window.press("secondary-c", cx);
     })
     .expect("window");
     let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text()));

@@ -922,7 +922,7 @@ fn retype(
     cx.update_window(handle, |_, window: &mut Window, cx: &mut App| {
         field.update(cx, |f, cx| f.focus(window, cx));
         window.render_frame(cx);
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         if text.is_empty() {
             window.press("backspace", cx);
         } else {

@@ -1469,7 +1469,7 @@ fn ctrl_enter_commits(cx: &mut TestAppContext) {
         mount_seeded(cx, seed(&[("a.txt", ChangeKind::Added)], &[]), DEFAULT_SIZE);
     type_message(cx, handle, &tab, "msg");
     assert_eq!(message(cx, &tab), "msg", "typing reaches the field");
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-enter", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-enter", cx))
         .expect("window");
     cx.run_until_parked();
     assert!(
@@ -1495,7 +1495,7 @@ fn ctrl_enter_inserts_no_newline(cx: &mut TestAppContext) {
             Duration::ZERO,
         )
     });
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-enter", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-enter", cx))
         .expect("window");
     cx.run_until_parked();
     assert_eq!(
@@ -1512,7 +1512,7 @@ fn ctrl_enter_does_nothing_while_the_field_is_read_only(cx: &mut TestAppContext)
     type_message(cx, handle, &tab, "half a gener");
     // The AI controller streams into the field: a half-written message must not be committed by the chord.
     cx.update(|cx| box_of(&tab, cx).update(cx, |b, cx| b.set_read_only(true, cx)));
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-enter", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-enter", cx))
         .expect("window");
     cx.run_until_parked();
     assert!(recorded(cx, &tab).is_empty(), "{:?}", recorded(cx, &tab));
@@ -1526,7 +1526,7 @@ fn ctrl_enter_does_nothing_when_commit_is_disabled(cx: &mut TestAppContext) {
         DEFAULT_SIZE,
     );
     type_message(cx, handle, &tab, "msg");
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-enter", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-enter", cx))
         .expect("window");
     cx.run_until_parked();
     assert!(recorded(cx, &tab).is_empty(), "nothing is staged");
@@ -1561,7 +1561,7 @@ fn successful_commit_clears_the_box_and_amend(cx: &mut TestAppContext) {
         )
     });
     render(cx, handle);
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-enter", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-enter", cx))
         .expect("window");
     cx.run_until_parked();
     assert_eq!(message(cx, &tab), "", "the message is consumed");
@@ -1614,7 +1614,7 @@ fn unknown_identity_error_asks_for_the_identity(cx: &mut TestAppContext) {
             Duration::ZERO,
         )
     });
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-enter", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-enter", cx))
         .expect("window");
     cx.run_until_parked();
     let dialog = cx
@@ -1722,7 +1722,7 @@ fn real_commit_through_the_box(cx: &mut TestAppContext) {
     });
     render(cx, handle);
     type_message(cx, handle, &tab, "second commit");
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-enter", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-enter", cx))
         .expect("window");
     cx.run_until_parked();
     cx.run_until_parked();

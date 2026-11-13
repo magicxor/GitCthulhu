@@ -110,10 +110,16 @@ fn tooltips_texts() {
     let undo = texts::button_tip(Which::Undo, Some(&st), None, false);
     assert!(undo.enabled);
     assert_eq!(undo.text, "Undo Commit \"Fix login\"");
-    assert_eq!(undo.hint.as_deref(), Some("Ctrl+Z"));
+    // The hint names the platform's primary modifier: the command key on macOS (07 §5.1.4 tokens).
+    let (undo_hint, redo_hint) = if cfg!(target_os = "macos") {
+        ("⌘+Z", "⌘+Shift+Z")
+    } else {
+        ("Ctrl+Z", "Ctrl+Shift+Z")
+    };
+    assert_eq!(undo.hint.as_deref(), Some(undo_hint));
     let redo = texts::button_tip(Which::Redo, Some(&st), None, false);
     assert_eq!(redo.text, "Redo Merge 'feature' into main");
-    assert_eq!(redo.hint.as_deref(), Some("Ctrl+Shift+Z"));
+    assert_eq!(redo.hint.as_deref(), Some(redo_hint));
 
     // An undo that also ends an operation in progress says so (17 §4.5).
     let st = state(
@@ -406,8 +412,8 @@ fn shortcuts_outside_inputs_only(cx: &mut TestAppContext) {
     frame(cx, handle, |window, cx| {
         window.click(crate::ids::FRAME_DIVIDER, cx)
     });
-    // Focus in the frame: Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y act.
-    for key in ["ctrl-z", "ctrl-shift-z", "ctrl-y"] {
+    // Focus in the frame: Ctrl+Z, Ctrl+Shift+Z (Cmd on macOS) and Ctrl+Y act.
+    for key in ["secondary-z", "secondary-shift-z", "ctrl-y"] {
         cx.update_window(handle, |_, window, cx| window.press(key, cx))
             .expect("window");
         cx.run_until_parked();
@@ -425,7 +431,7 @@ fn shortcuts_outside_inputs_only(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     frame(cx, handle, |_, _| {});
-    for key in ["ctrl-z", "ctrl-shift-z", "ctrl-y"] {
+    for key in ["secondary-z", "secondary-shift-z", "ctrl-y"] {
         cx.update_window(handle, |_, window, cx| window.press(key, cx))
             .expect("window");
         cx.run_until_parked();

@@ -364,7 +364,7 @@ fn select_across_virtualised_rows_copies_full_lines(cx: &mut TestAppContext) {
     // Ctrl+C in the Diff context copies the same text.
     take_clipboard();
     cx.update_window(h.handle, |_, window, cx| {
-        window.press("ctrl-c", cx);
+        window.press("secondary-c", cx);
     })
     .expect("window");
     let copied = take_clipboard();
@@ -674,7 +674,7 @@ fn ctrl_a_selects_document(cx: &mut TestAppContext) {
     let lines = source_lines(&doc);
     cx.update_window(h.handle, |_, window, cx| {
         assert!(!h.selection.borrow().has_selection(cx));
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         let selection = h.selection.borrow();
         assert!(selection.has_selection(cx));
         assert_eq!(selection.selected_text(cx), Some(lines.join("\n")));
@@ -688,7 +688,7 @@ fn ctrl_a_selects_document(cx: &mut TestAppContext) {
     })
     .expect("window");
     take_clipboard();
-    cx.update_window(h.handle, |_, window, cx| window.press("ctrl-c", cx))
+    cx.update_window(h.handle, |_, window, cx| window.press("secondary-c", cx))
         .expect("window");
     assert_eq!(take_clipboard(), vec![lines.join("\n")]);
     // A click elsewhere clears select-all.
@@ -757,7 +757,7 @@ fn reset_clears_on_a_new_document_and_keeps_the_same_one(cx: &mut TestAppContext
     let doc = fixture_doc("r.txt", "a\n", "a\nb\nc\n", DiffMode::Unified);
     let h = mount(cx, doc.clone());
     cx.update_window(h.handle, |_, window, cx| {
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         assert!(h.selection.borrow().has_selection(cx));
         h.selection.borrow_mut().reset(&doc, cx);
         assert!(
@@ -900,7 +900,7 @@ c two
 
         // Another diff selection was painted last: the global fallback would act on it, the bound actions do not.
         set_active(&other.shared);
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         assert_eq!(
             h.selection.borrow().selected_text(cx),
             Some(lines.join(
@@ -912,7 +912,7 @@ c two
     })
     .expect("window");
     take_clipboard();
-    cx.update_window(h.handle, |_, window, cx| window.press("ctrl-c", cx))
+    cx.update_window(h.handle, |_, window, cx| window.press("secondary-c", cx))
         .expect("window");
     assert_eq!(
         take_clipboard(),
@@ -926,7 +926,7 @@ c two
     cx.update_window(h.handle, |_, window, cx| {
         h.selection.borrow_mut().clear(cx);
         window.render_frame(cx);
-        window.press("ctrl-c", cx);
+        window.press("secondary-c", cx);
     })
     .expect("window");
     assert!(take_clipboard().is_empty());

@@ -90,7 +90,7 @@ fn advance(cx: &mut TestAppContext, ms: u64) {
 /// Types `text` over the content of the focused input (the kit input does not announce programmatic changes).
 fn retype(window: &mut Window, cx: &mut App, text: &str) {
     window.render_frame(cx);
-    window.press("ctrl-a", cx);
+    window.press("secondary-a", cx);
     if text.is_empty() {
         window.press("backspace", cx);
     } else {
@@ -938,7 +938,7 @@ fn number_fields_take_digits_only_and_flash_on_invalid_input(cx: &mut TestAppCon
         days.update(cx, |f, cx| f.focus(window, cx));
         window.render_frame(cx);
         // Replace the default "30" by typing over it.
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         window.input("1a2b", cx);
     })
     .expect("window");
@@ -959,7 +959,7 @@ fn number_fields_take_digits_only_and_flash_on_invalid_input(cx: &mut TestAppCon
         "the flash ends after 500 ms"
     );
     cx.update_window(handle, |_, window, cx| {
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         window.input("0", cx);
     })
     .expect("window");
@@ -982,7 +982,7 @@ fn a_pasted_number_with_junk_is_cleaned_and_stored(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, cx| {
         port.update(cx, |f, cx| f.focus(window, cx));
         window.render_frame(cx);
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
     })
     .expect("window");
     cx.update(|cx| {
@@ -992,7 +992,7 @@ fn a_pasted_number_with_junk_is_cleaned_and_stored(cx: &mut TestAppContext) {
             .into(),
         ))
     });
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-v", cx))
+    cx.update_window(handle, |_, window, cx| window.press("secondary-v", cx))
         .expect("window");
     cx.run_until_parked();
     assert_eq!(cx.update(|cx| port.read(cx).text(cx).to_string()), "3128");

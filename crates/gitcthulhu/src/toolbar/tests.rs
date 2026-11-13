@@ -331,12 +331,12 @@ fn shortcuts_dispatch_actions(cx: &mut TestAppContext) {
     frame(cx, handle, |window, cx| {
         window.click(crate::side_panel::ids::SIDE_PANEL, cx)
     });
-    frame(cx, handle, |window, cx| window.press("ctrl-s", cx));
+    frame(cx, handle, |window, cx| window.press("secondary-s", cx));
     assert!(stash_requested(&tab, cx), "Ctrl+S stashes");
     for (key, kind) in [
-        ("ctrl-u", OpKind::Pull),
-        ("ctrl-p", OpKind::Push),
-        ("ctrl-shift-s", OpKind::PopStash),
+        ("secondary-u", OpKind::Pull),
+        ("secondary-p", OpKind::Push),
+        ("secondary-shift-s", OpKind::PopStash),
     ] {
         frame(cx, handle, |window, cx| window.press(key, cx));
         let ran = ops(&tab, cx);
@@ -416,7 +416,7 @@ fn open_action_in_a_repository_opens_the_popup(cx: &mut TestAppContext) {
     frame(cx, handle, |window, cx| {
         window.click(crate::side_panel::ids::SIDE_PANEL, cx)
     });
-    frame(cx, handle, |window, cx| window.press("ctrl-o", cx));
+    frame(cx, handle, |window, cx| window.press("secondary-o", cx));
     frame(cx, handle, |window, _| {
         assert!(
             window.try_find(ids::OPEN_POPUP).is_some(),
@@ -635,10 +635,18 @@ fn tooltips_follow_the_spec() {
 
 #[test]
 fn hints_use_gitnuros_order() {
-    if cfg!(target_os = "macos") {
-        return;
-    }
-    assert_eq!(state::primary_hint(false, false, "O"), "Ctrl+O");
-    assert_eq!(state::primary_hint(false, true, "S"), "Ctrl+Shift+S");
-    assert_eq!(state::primary_hint(true, false, "S"), "Ctrl+Alt+S");
+    // macOS shows the command key in place of Ctrl (07 §5.1.4, §11).
+    let expected = if cfg!(target_os = "macos") {
+        ["⌘+O", "⌘+Shift+S", "⌘+Alt+S"]
+    } else {
+        ["Ctrl+O", "Ctrl+Shift+S", "Ctrl+Alt+S"]
+    };
+    assert_eq!(
+        [
+            state::primary_hint(false, false, "O"),
+            state::primary_hint(false, true, "S"),
+            state::primary_hint(true, false, "S"),
+        ],
+        expected
+    );
 }

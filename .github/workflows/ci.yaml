@@ -46,6 +46,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Zig
         uses: $/.github/actions/setup-zig
+        # The download picks a community mirror at random; one that hangs must not eat the job's hour.
+        timeout-minutes: 10
       - name: Linux dependencies
         if: ${{ runner.os == 'Linux' }}
         run: |

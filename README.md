@@ -99,11 +99,12 @@ but-core`). Performance tests, the QA runner for real-window screenshots and the
 
 ## Known limitations
 
-- Developed and tested on Windows 11; the Linux test suite runs headless in Docker. macOS has never been built or
-  tested (CI defines a macOS job, but this branch has never been pushed, so CI has never run), and the real window
-  has never been opened on Linux or macOS.
-- There is no release pipeline, installer endpoint or signed release: `but-installer` and `but-update` refuse to run
-  until release URLs and a signing key are configured.
+- Developed and tested on Windows 11; the Linux test suite also runs headless in Docker. macOS is built and tested
+  only by CI, where a complete green run has not been observed yet, and the real window has never been opened on
+  Linux or macOS.
+- Releases are built by CI from a version tag ([DEVELOPMENT.md](DEVELOPMENT.md#releasing)) and are not code-signed:
+  Windows SmartScreen and macOS Gatekeeper warn about them. There is no installer endpoint or update manifest yet:
+  `but-installer` and `but-update` refuse to run until release URLs and a signing key are configured.
 - The GitHub, GitLab and Bitbucket integrations were only tested against fake local servers; real endpoints and the
   real GitHub device flow have not been exercised.
 - Manual checks are still open: interactive shells (PowerShell 7, Git Bash, vim) in the terminal panel, IME and

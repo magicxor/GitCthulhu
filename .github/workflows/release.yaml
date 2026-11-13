@@ -86,6 +86,8 @@ jobs:
     needs: check
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    # An optional platform does not hold the release back: `publish` goes on without its archive.
+    continue-on-error: ${{ matrix.optional == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -95,8 +97,10 @@ jobs:
           # The oldest Ubuntu runner: the binaries then need only its glibc (2.35) or newer.
           - os: ubuntu-22.04
             platform: linux-x86_64
+          # Optional: hosted macOS runners are at times not to be had, and the job is then cancelled.
           - os: macos-latest
             platform: macos-aarch64
+            optional: true
     defaults:
       run:
         shell: bash
@@ -198,7 +202,8 @@ jobs:
   publish:
     name: publish
     needs: [check, build]
-    if: ${{ needs.check.outputs.publish == 'true' }}
+    # Also after an optional build failed or was cancelled; the required archives are checked below.
+    if: ${{ !cancelled() && needs.check.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -211,6 +216,24 @@ jobs:
           path: dist
           pattern: gitcthulhu-*
           merge-multiple: true
+      - name: Required archives
+        id: archives
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          ls -l dist
+          for archive in "gitcthulhu-${VERSION}-windows-x86_64.zip" "gitcthulhu-${VERSION}-linux-x86_64.tar.gz"; do
+            if [ ! -s "dist/${archive}" ]; then
+              echo "::error::${archive} was not built; nothing is published."
+              exit 1
+            fi
+          done
+          if [ -s "dist/gitcthulhu-${VERSION}-macos-aarch64.tar.gz" ]; then
+            echo "macos=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::warning::The macOS archive was not built; the release is published without it."
+            echo "macos=false" >> "${GITHUB_OUTPUT}"
+          fi
       - name: Checksums
         working-directory: dist
         run: |
@@ -221,6 +244,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check.outputs.version }}
           PRERELEASE: ${{ needs.check.outputs.prerelease }}
+          MACOS: ${{ steps.archives.outputs.macos }}
         run: |
           # Re-running the job after a partial failure replaces the files of the release it made.
           if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
@@ -230,5 +254,9 @@ jobs:
           flags=(--verify-tag --title "GitCthulhu ${VERSION}" --generate-notes)
           if [ "${PRERELEASE}" = "true" ]; then
             flags+=(--prerelease)
+          fi
+          if [ "${MACOS}" != "true" ]; then
+            # Goes above the generated notes.
+            flags+=(--notes "This release has no macOS build: it could not be built when the release was made.")
           fi
           gh release create "${VERSION}" dist/* --repo "${GITHUB_REPOSITORY}" "${flags[@]}"

@@ -191,6 +191,11 @@ with generated notes, a `SHA256SUMS` file and one archive per platform:
 | `gitcthulhu-<version>-linux-x86_64.tar.gz` | the same three binaries |
 | `gitcthulhu-<version>-macos-aarch64.tar.gz` | `GitCthulhu.app`, ad-hoc signed |
 
+The macOS build is optional: when it fails or GitHub has no macOS runner to give, the release is published with
+the Windows and Linux archives only and says so in its notes. To add it later, re-run the macOS job from the
+run's page: `publish` then runs again and uploads the archive to the same release (the sentence in the release
+notes has to be removed by hand).
+
 Nothing is code-signed: Windows SmartScreen warns, and macOS Gatekeeper blocks a downloaded copy until the user
 allows it (System Settings > Privacy & Security, or `xattr -dr com.apple.quarantine GitCthulhu.app`).
 

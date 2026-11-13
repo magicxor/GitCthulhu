@@ -402,7 +402,7 @@ fn nested_repository_is_named_with_undo_history_off(cx: &mut TestAppContext) {
                 let paths = [RelaPath::from("junk/"), RelaPath::from("solo")];
                 let prepared =
                     confirm_untracked_loss(&handle, &asker, "Delete", &paths, Some(&agreed));
-                matches!(prepared, Ok(Prepared::Continue { .. }))
+                matches!(prepared, Ok(Prepared::DeletesUntracked { .. }))
             })
         };
         let request = loop {

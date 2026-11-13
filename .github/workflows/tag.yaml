@@ -1,0 +1,38 @@
+name: Tag
+
+# Pushing a version tag (1.2.3, 1.2.3-rc.1) runs CI and the release, both checked out at the tag. This
+# workflow builds nothing itself: it dispatches ci.yaml and release.yaml on master. A cache belongs to the
+# ref of the run that saved it, and only a run on the default branch saves caches that every pull request
+# and every later release can restore; a cache saved by a run on the tag would only ever serve that tag.
+# GITHUB_TOKEN may start workflow_dispatch runs (unlike the other events it raises). release.yaml's `check`
+# job validates the tag exactly. See DEVELOPMENT.md, section "Releasing".
+on:
+  push:
+    tags:
+      # A coarse filter (these are globs, not regular expressions).
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+      - '[0-9]+.[0-9]+.[0-9]+\+*'
+
+permissions: {}
+
+concurrency:
+  group: tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: dispatch CI and Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # to start the two workflows
+    steps:
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh workflow run ci.yaml --repo "${GITHUB_REPOSITORY}" --ref master -f ref="refs/tags/${TAG}"
+          gh workflow run release.yaml --repo "${GITHUB_REPOSITORY}" --ref master -f tag="${TAG}"
+          echo "Dispatched CI and Release for ${TAG} on master."

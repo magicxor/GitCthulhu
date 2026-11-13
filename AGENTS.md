@@ -16,7 +16,9 @@ Apply all relevant instruction files. If instructions conflict, resolve them in 
 - `scripts/` - helper scripts for the Rust workspace and the installer bootstrap.
 - `tools/dev/` - `seed-target.ps1` (worktree build seed) and `linux-test.ps1` (cargo in Docker).
 - `tools/qa/` - the QA runner scripts and scenarios (real-window screenshots, see below).
-- `.github/` - one Rust CI workflow (Windows, Linux, macOS, Git 2.34.1) plus security scans.
+- `.github/` - one Rust CI workflow (Windows, Linux, macOS, Git 2.34.1), the release workflow and security scans. CI
+  runs on pull requests and version tags, the release on version tags; `tag.yaml` dispatches both on `master`. Nothing
+  builds on pushes to `master`, and only the tag runs save the Rust caches.
 - `README.md` (users), `DEVELOPMENT.md` (build, data locations, build configuration, perf tests).
 
 ## Working Style

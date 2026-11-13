@@ -1,16 +1,25 @@
 name: CI
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI {0}', inputs.ref || github.ref_name) || github.event.pull_request.title }}
 
+# Not on pushes to master. Pull requests run it, and so does every version tag: tag.yaml dispatches this
+# workflow on master with `ref` set to the tag. Only those runs on master save the Rust caches (a cache
+# saved on master can be restored by every branch, pull request and tag); pull requests only restore them.
 on:
-  push:
-    branches: ["master"]
   pull_request:
     branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag, branch or commit to test (empty = the head of the branch the run is started on). Run on master, it also refreshes the Rust caches.
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Two tags dispatched on master one after the other must not cancel each other.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
   cancel-in-progress: true
 
 env:
@@ -23,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: cargo fmt --check
         run: cargo fmt --check --all
@@ -38,12 +48,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ci-${{ matrix.os }}
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          # Saved only by the runs dispatched on master (a version tag, or by hand). Those are rare, so a
+          # failing test does not skip the refresh: the compiled dependencies are good either way.
+          save-if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
       - name: Install Zig
         uses: $/.github/actions/setup-zig
         # The download picks a community mirror at random; one that hangs must not eat the job's hour.
@@ -96,6 +110,7 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Rust toolchain
         run: |
@@ -107,7 +122,8 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ci-git-min
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
+          cache-on-failure: true
       - name: cargo test
         env:
           LC_ALL: de_DE.UTF-8

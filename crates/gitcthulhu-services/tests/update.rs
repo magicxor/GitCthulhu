@@ -559,3 +559,110 @@ fn snooze_ends_when_a_newer_version_is_published() {
         "the snooze was for 0.2.0; 0.3.0 is announced"
     );
 }
+
+#[test]
+fn set_channel_switches_the_manifest_and_the_cache_scope_without_a_restart() {
+    let server = Server::start(vec![manifest("0.2.0"), manifest("0.3.0")]);
+    let cache = tempfile::tempdir().expect("temp dir");
+    let svc = service(&runtime(), &cache, Some(&server.url), "0.1.0");
+    svc.check_now(&CancelToken::new())
+        .expect("the release check works")
+        .expect("0.2.0 is announced");
+    assert!(
+        server.next_request().starts_with("GET /release.json "),
+        "the service starts on the channel it was configured with"
+    );
+    assert!(svc.cached().is_some() && svc.cached_at().is_some());
+
+    svc.set_channel(UpdateChannel::Nightly);
+    assert!(
+        svc.cached().is_none() && svc.cached_at().is_none(),
+        "the release result is not the nightly one"
+    );
+    let found = svc
+        .check_now(&CancelToken::new())
+        .expect("the nightly check works")
+        .expect("0.3.0 is announced");
+    assert_eq!(found.version, semver::Version::new(0, 3, 0));
+    assert!(
+        server.next_request().starts_with("GET /nightly.json "),
+        "the next check asks the nightly manifest"
+    );
+    assert!(svc.cached_at().is_some(), "the nightly check is remembered");
+
+    svc.set_channel(UpdateChannel::Release);
+    assert_eq!(
+        svc.cached().map(|update| update.version),
+        None,
+        "the cache holds the nightly outcome only (one record)"
+    );
+}
+
+#[test]
+fn cached_at_is_the_stored_check_time_and_survives_a_restart() {
+    let rt = runtime();
+    let server = Server::start(vec![manifest("0.1.0")]);
+    let cache = tempfile::tempdir().expect("temp dir");
+    let svc = service(&rt, &cache, Some(&server.url), "0.1.0");
+    assert_eq!(svc.cached_at(), None, "nothing was checked yet");
+
+    let before = std::time::SystemTime::now() - Duration::from_secs(2);
+    assert_eq!(
+        svc.check_now(&CancelToken::new()).expect("up to date"),
+        None
+    );
+    let at = svc.cached_at().expect("the check time is stored");
+    assert!(
+        at >= before && at <= std::time::SystemTime::now() + Duration::from_secs(2),
+        "it is the time of the check: {at:?}"
+    );
+
+    let restarted = service(&rt, &cache, Some(&server.url), "0.1.0");
+    assert_eq!(
+        restarted.cached_at(),
+        Some(at),
+        "a new service reads the time from the cache database"
+    );
+    let upgraded = service(&rt, &cache, Some(&server.url), "0.1.1");
+    assert_eq!(
+        upgraded.cached_at(),
+        None,
+        "another version's check does not count"
+    );
+    let disabled = service(&rt, &cache, None, "0.1.0");
+    assert_eq!(disabled.cached_at(), None, "disabled checks have no time");
+}
+
+#[test]
+fn a_check_waiting_for_one_of_the_old_channel_asks_the_new_channel_itself() {
+    let rt = runtime();
+    let cache = tempfile::tempdir().expect("temp dir");
+    let server = Server::start(vec![
+        Reply::After(Duration::from_millis(1500), manifest_json("0.2.0")),
+        manifest("0.3.0"),
+    ]);
+    let svc = std::sync::Arc::new(service(&rt, &cache, Some(&server.url), "0.1.0"));
+    let first = {
+        let svc = svc.clone();
+        std::thread::spawn(move || svc.check_now(&CancelToken::new()))
+    };
+    assert!(server.next_request().starts_with("GET /release.json "));
+
+    svc.set_channel(UpdateChannel::Nightly);
+    let second = svc
+        .check_now(&CancelToken::new())
+        .expect("the nightly check works");
+    assert_eq!(
+        second.map(|update| update.version),
+        Some(semver::Version::new(0, 3, 0)),
+        "the release answer of the running check is not the nightly one"
+    );
+    assert!(
+        server.next_request().starts_with("GET /nightly.json "),
+        "the waiting check asked the nightly manifest after the release check ended"
+    );
+    first
+        .join()
+        .expect("the checking thread finishes")
+        .expect("the release check works");
+}

@@ -70,6 +70,10 @@ impl OpenAIClientProvider for OllamaProvider {
             .with_api_key("ollama");
         Ok(async_openai::Client::with_config(open_ai_config))
     }
+
+    fn response_start_timeout(&self) -> std::time::Duration {
+        crate::http::LOCAL_RESPONSE_START_TIMEOUT
+    }
 }
 
 impl LLMClient for OllamaProvider {

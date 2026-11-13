@@ -63,6 +63,10 @@ impl OpenAIClientProvider for LMStudioProvider {
 
         Ok(Client::with_config(open_ai_config))
     }
+
+    fn response_start_timeout(&self) -> std::time::Duration {
+        crate::http::LOCAL_RESPONSE_START_TIMEOUT
+    }
 }
 
 impl LLMClient for LMStudioProvider {

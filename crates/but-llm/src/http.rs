@@ -4,8 +4,11 @@ use std::{sync::OnceLock, time::Duration};
 
 use crate::error::LlmError;
 
-/// How long connecting and waiting for the response head may take.
+/// How long connecting and waiting for the response head may take at a hosted provider.
 pub(crate) const RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(60);
+/// The same for a model running on the user's machine (Ollama, LM Studio): a large one is loaded into memory
+/// and evaluates the whole prompt before the first byte is sent.
+pub(crate) const LOCAL_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long a stream may stay silent between two chunks (a local model may load before its first token).
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a whole non-streaming request may take.

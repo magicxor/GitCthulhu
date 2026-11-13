@@ -30,6 +30,11 @@ pub trait OpenAIClientProvider: Sync {
     fn uses_max_completion_tokens(&self) -> bool {
         false
     }
+
+    /// How long connecting and waiting for the response head may take.
+    fn response_start_timeout(&self) -> std::time::Duration {
+        crate::http::RESPONSE_START_TIMEOUT
+    }
 }
 
 impl From<ChatMessage> for ChatCompletionRequestMessage {

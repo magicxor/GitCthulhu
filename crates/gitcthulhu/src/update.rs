@@ -78,8 +78,15 @@ pub struct UpdateState {
     /// Snoozes whose service call has not finished.
     pending_snoozes: u32,
     last_checked: Option<SystemTime>,
+    /// When the last check of an earlier session finished (read from the service's cache). Only shown as "Last
+    /// checked"; it does not postpone the check at startup, so [`check_due`] looks at `last_checked` alone.
+    stored_last_checked: Option<SystemTime>,
     last_error: Option<SharedString>,
     scheduler_started: bool,
+    /// Counts channel changes; a check that started before one of them answers for the old channel and is dropped.
+    channel_epoch: u64,
+    /// The channel was changed while a check was running: run another one when it ends.
+    rerun_pending: bool,
     /// The "Check for updates automatically" value the settings observer saw last (it checks only when the setting
     /// is switched on, not on every unrelated settings change).
     auto_check_seen: Option<bool>,
@@ -104,7 +111,7 @@ pub struct UpdateSnapshot {
     pub notice: Option<UpdateNotice>,
     /// A check is running.
     pub checking: bool,
-    /// When the last check finished successfully (this session).
+    /// When the last check finished successfully: this session's, else the one stored by an earlier session.
     pub last_checked: Option<SystemTime>,
     /// Why the last check failed, if it did.
     pub last_error: Option<SharedString>,
@@ -116,7 +123,7 @@ pub fn snapshot(cx: &App) -> UpdateSnapshot {
         .map(|s| UpdateSnapshot {
             notice: s.notice.clone(),
             checking: s.checking,
-            last_checked: s.last_checked,
+            last_checked: s.last_checked.or(s.stored_last_checked),
             last_error: s.last_error.clone(),
         })
         .unwrap_or_default()
@@ -180,7 +187,7 @@ pub fn check_now(cx: &mut App, kind: CheckKind) {
         }
         return;
     };
-    let snoozes_before = {
+    let (snoozes_before, epoch_before) = {
         let state = cx.default_global::<UpdateState>();
         if state.checking {
             // A check is already running: its outcome answers this request too (in a toast when asked for).
@@ -189,14 +196,14 @@ pub fn check_now(cx: &mut App, kind: CheckKind) {
         }
         state.checking = true;
         state.manual_waiting = false;
-        state.snoozes_done
+        (state.snoozes_done, state.channel_epoch)
     };
     cx.refresh_windows();
     let cancel = CancelToken::new();
     let task = backend::bg(cx, move || backend::update::check_now(&services, &cancel));
     cx.spawn(async move |cx: &mut AsyncApp| {
         let result = task.await;
-        cx.update(|cx| finish_check(cx, kind, snoozes_before, result));
+        cx.update(|cx| finish_check(cx, kind, snoozes_before, epoch_before, result));
     })
     .detach();
 }
@@ -205,10 +212,28 @@ fn finish_check(
     cx: &mut App,
     kind: CheckKind,
     snoozes_before: u64,
+    epoch_before: u64,
     result: Result<Option<UpdateNotice>, UpdateCheckError>,
 ) {
     let state = cx.default_global::<UpdateState>();
     state.checking = false;
+    if state.channel_epoch != epoch_before {
+        // The answer is for the channel the user has left. Drop it; the check of the new channel follows.
+        let rerun = std::mem::take(&mut state.rerun_pending);
+        let manual = std::mem::take(&mut state.manual_waiting) || kind == CheckKind::Manual;
+        cx.refresh_windows();
+        if rerun {
+            check_now(
+                cx,
+                if manual {
+                    CheckKind::Manual
+                } else {
+                    CheckKind::Automatic
+                },
+            );
+        }
+        return;
+    }
     let kind = if std::mem::take(&mut state.manual_waiting) {
         CheckKind::Manual
     } else {
@@ -263,6 +288,36 @@ fn finish_check(
             tracing::warn!("the update check failed: {reason}");
         }
         _ => {}
+    }
+}
+
+/// The user picked another update channel (the chips of the Updates page; the setting is already written): the
+/// services look at it from now on, without a restart. What the old channel found (notice, "Last checked") is
+/// dropped, and a check of the new channel runs at once while "Check for updates automatically" is on (when it is
+/// off, nothing is fetched until "Check now").
+pub fn channel_changed(cx: &mut App, channel: settings::UpdateChannel) {
+    let Some(services) = enabled_services(cx) else {
+        return;
+    };
+    // On the UI thread, not in `backend::bg`: it only swaps a value under a lock that is never held across I/O, and
+    // two background tasks of quick clicks could run in either order and leave the services on the wrong channel.
+    services.set_update_channel(channel);
+    let auto_check = settings::get_or_default(cx).update_check;
+    let state = cx.default_global::<UpdateState>();
+    state.channel_epoch += 1;
+    state.notice = None;
+    state.last_checked = None;
+    state.stored_last_checked = None;
+    state.last_error = None;
+    if state.checking {
+        // That check asks the old channel: `finish_check` drops its answer and starts the next check.
+        state.rerun_pending = true;
+        cx.refresh_windows();
+    } else {
+        cx.refresh_windows();
+        if auto_check {
+            check_now(cx, CheckKind::Automatic);
+        }
     }
 }
 
@@ -333,14 +388,20 @@ fn ensure_scheduler(cx: &mut App) {
         state.scheduler_started = true;
         state.auto_check_seen = Some(auto_check);
     }
-    let cached = backend::bg(cx, move || backend::update::cached(&services));
+    let cached = backend::bg(cx, move || {
+        (
+            backend::update::cached(&services),
+            backend::update::cached_at(&services),
+        )
+    });
     cx.spawn(async move |cx: &mut AsyncApp| {
-        let cached = cached.await;
+        let (cached, cached_at) = cached.await;
         cx.update(|cx| {
             let state = cx.default_global::<UpdateState>();
             // A check that already finished knows better than the cache.
             if state.last_checked.is_none() && state.notice.is_none() {
                 state.notice = cached;
+                state.stored_last_checked = cached_at;
                 cx.refresh_windows();
             }
         });

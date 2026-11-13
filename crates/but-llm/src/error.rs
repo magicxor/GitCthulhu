@@ -46,6 +46,11 @@ impl LlmError {
         }
     }
 
+    /// A stream that ended without the provider saying that the answer was complete (a dropped connection).
+    pub(crate) fn incomplete() -> Self {
+        LlmError::Network("the stream ended before the answer was complete".to_owned())
+    }
+
     pub(crate) fn timed_out(what: &str, after: Duration) -> Self {
         LlmError::Network(format!(
             "timed out after {} s waiting for {what}",

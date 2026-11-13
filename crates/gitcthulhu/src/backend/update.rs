@@ -59,7 +59,36 @@ pub fn manifest_url() -> Option<&'static str> {
 
 /// Whether this build can offer the Nightly channel: its manifest URL has a `{channel}` placeholder.
 pub fn nightly_channel_available() -> bool {
+    #[cfg(any(test, feature = "qa"))]
+    if let Some(forced) = nightly_override::get() {
+        return forced;
+    }
     manifest_url().is_some_and(|url| url.contains("{channel}"))
+}
+
+/// Forces [`nightly_channel_available`] (`None`: the build decides again). Tests and QA runs only, per thread: the build of a
+/// test has no manifest URL, so without this the Nightly chip could never be tested.
+#[cfg(any(test, feature = "qa"))]
+pub fn set_nightly_channel_available_override(forced: Option<bool>) {
+    nightly_override::set(forced);
+}
+
+#[cfg(any(test, feature = "qa"))]
+mod nightly_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Per thread, so that parallel tests do not see each other's override; the UI runs on one thread.
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<bool> {
+        FORCED.with(Cell::get)
+    }
+
+    pub(super) fn set(forced: Option<bool>) {
+        FORCED.with(|cell| cell.set(forced));
+    }
 }
 
 /// Fetches the manifest and returns the update to announce (`None` when the running version is current or the
@@ -103,6 +132,19 @@ pub fn cached(services: &ServicesHandle) -> Option<UpdateNotice> {
 /// Without the `services` feature there is no cache.
 #[cfg(not(feature = "services"))]
 pub fn cached(_services: &ServicesHandle) -> Option<UpdateNotice> {
+    None
+}
+
+/// When the last check finished, from the service's cache (no network); it survives restarts. `None` when there was
+/// none for the selected channel or checks are disabled.
+#[cfg(feature = "services")]
+pub fn cached_at(services: &ServicesHandle) -> Option<std::time::SystemTime> {
+    services.services().update.cached_at()
+}
+
+/// Without the `services` feature there is no cache.
+#[cfg(not(feature = "services"))]
+pub fn cached_at(_services: &ServicesHandle) -> Option<std::time::SystemTime> {
     None
 }
 

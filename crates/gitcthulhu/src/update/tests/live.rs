@@ -567,11 +567,11 @@ fn snooze_wins_over_a_check_that_was_running(cx: &mut TestAppContext) {
     cx.update(|cx| {
         // A check started (snoozes_done = 0), then a snooze finished before the check's answer arrived.
         cx.default_global::<UpdateState>().snoozes_done = 1;
-        finish_check(cx, CheckKind::Automatic, 0, Ok(Some(found.clone())));
+        finish_check(cx, CheckKind::Automatic, 0, 0, Ok(Some(found.clone())));
     });
     assert_eq!(snapshot_of(cx).notice, None, "the snooze stays in force");
     // A check that started after the snooze shows what it found.
-    cx.update(|cx| finish_check(cx, CheckKind::Automatic, 1, Ok(Some(found.clone()))));
+    cx.update(|cx| finish_check(cx, CheckKind::Automatic, 1, 0, Ok(Some(found.clone()))));
     assert_eq!(snapshot_of(cx).notice, Some(found));
 
     // "Check now" while an automatic check runs: the running check reports in a toast.
@@ -579,7 +579,7 @@ fn snooze_wins_over_a_check_that_was_running(cx: &mut TestAppContext) {
         let state = cx.default_global::<UpdateState>();
         state.checking = true;
         state.manual_waiting = true;
-        finish_check(cx, CheckKind::Automatic, 1, Ok(None));
+        finish_check(cx, CheckKind::Automatic, 1, 0, Ok(None));
     });
     assert!(has_toast(cx, &app, "GitCthulhu is up to date."));
     assert!(!cx.update(|cx| cx.default_global::<UpdateState>().manual_waiting));
@@ -758,4 +758,163 @@ fn unit_tests_never_download_real_avatars(cx: &mut TestAppContext) {
         "no stand-in server: no download at all"
     );
     assert_eq!(env.avatar_requests(), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// the channel and "Last checked"
+// ---------------------------------------------------------------------------------------------------------------
+
+impl Env {
+    /// Services whose manifest URL has the `{channel}` placeholder, like a build with a nightly manifest.
+    fn channel_services(&self, app_version: &str) -> ServicesHandle {
+        crate::backend::update::services_with_manifest(
+            self.dir.path().join("data"),
+            self.dir.path().join("cache"),
+            Some(&self.server.url("/manifest-{channel}.json")),
+            app_version,
+        )
+        .expect("services start")
+    }
+
+    fn manifest_paths(&self) -> Vec<String> {
+        self.server
+            .requests()
+            .into_iter()
+            .filter(|p| p.starts_with("/manifest"))
+            .collect()
+    }
+}
+
+#[gpui_kit::test]
+fn changing_the_channel_applies_at_once_and_checks_again(cx: &mut TestAppContext) {
+    use crate::backend::update::set_nightly_channel_available_override;
+    use crate::dialogs::settings::updates::{self, ids as pid};
+
+    init_app(cx);
+    let env = Env::new("9.9.9");
+    cx.update(|_| set_nightly_channel_available_override(Some(true)));
+    let (window, _probe) = open_probe(cx, 760., 400., |window, cx| updates::page(window, cx));
+    install_services(cx, env.channel_services("0.1.0"));
+    assert_eq!(
+        env.manifest_paths(),
+        ["/manifest-release.json"],
+        "the startup check asks the release manifest"
+    );
+    assert_eq!(
+        snapshot_of(cx).notice.map(|n| n.version),
+        Some("9.9.9".to_owned())
+    );
+
+    // The nightly manifest announces another version; the click must reach it without a restart.
+    env.serve_manifest("10.0.0");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(pid::CHANNEL_NIGHTLY, cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
+    assert_eq!(
+        env.manifest_paths(),
+        ["/manifest-release.json", "/manifest-nightly.json"],
+        "choosing Nightly checks the nightly manifest at once"
+    );
+    let state = snapshot_of(cx);
+    assert_eq!(
+        state.notice.map(|n| n.version),
+        Some("10.0.0".to_owned()),
+        "the notice is the nightly channel's"
+    );
+    assert!(state.last_checked.is_some() && !state.checking);
+
+    // Back to Release: asks the release manifest again (a repeated click on the chosen chip does nothing).
+    cx.update_window(window, |_, window, cx| {
+        window.click(pid::CHANNEL_NIGHTLY, cx);
+        window.click(pid::CHANNEL_RELEASE, cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
+    assert_eq!(
+        env.manifest_paths().last().map(String::as_str),
+        Some("/manifest-release.json")
+    );
+    assert_eq!(env.manifest_paths().len(), 3);
+    cx.update(|_| set_nightly_channel_available_override(None));
+}
+
+#[gpui_kit::test]
+fn the_last_check_time_comes_back_after_a_restart(cx: &mut TestAppContext) {
+    init_app(cx);
+    let env = Env::new("0.1.0");
+    set_update_check(cx, false);
+    install_services(cx, env.services("0.1.0"));
+    assert_eq!(
+        snapshot_of(cx).last_checked,
+        None,
+        "nothing was ever checked"
+    );
+    cx.update(|cx| check_now(cx, CheckKind::Manual));
+    cx.run_until_parked();
+    let checked = snapshot_of(cx).last_checked.expect("the check finished");
+
+    // A new session: no state, services over the same cache directory, no startup check.
+    cx.update(|cx| cx.set_global(UpdateState::default()));
+    install_services(cx, env.services("0.1.0"));
+    cx.run_until_parked();
+    let state = snapshot_of(cx);
+    let stored = state.last_checked.expect("read from the cache");
+    let drift = stored
+        .duration_since(checked)
+        .or_else(|err| Ok::<_, ()>(err.duration()))
+        .expect("a duration");
+    assert!(
+        drift < Duration::from_secs(5),
+        "the stored time is the check's: {stored:?} vs {checked:?}"
+    );
+    assert_eq!(
+        env.manifest_requests(),
+        1,
+        "no check was needed to show the time"
+    );
+    assert!(!state.checking && state.notice.is_none());
+}
+
+#[gpui_kit::test]
+fn a_check_running_during_a_channel_change_is_dropped_and_repeated(cx: &mut TestAppContext) {
+    init_app(cx);
+    let env = Env::new("9.9.9");
+    set_update_check(cx, false);
+    install_services(cx, env.channel_services("0.1.0"));
+    assert!(env.manifest_paths().is_empty(), "automatic checks are off");
+
+    // A check of the release channel is running (epoch 0) when the user picks Nightly.
+    cx.update(|cx| {
+        cx.default_global::<UpdateState>().checking = true;
+        channel_changed(cx, settings::UpdateChannel::Nightly);
+    });
+    cx.run_until_parked();
+    assert!(
+        env.manifest_paths().is_empty(),
+        "no second check while one is running"
+    );
+    let old = UpdateNotice {
+        version: "1.0.0".to_owned(),
+        url: "https://example.com/releases/old".to_owned(),
+    };
+    cx.update(|cx| finish_check(cx, CheckKind::Automatic, 0, 0, Ok(Some(old))));
+    cx.run_until_parked();
+    assert_eq!(
+        env.manifest_paths(),
+        ["/manifest-nightly.json"],
+        "the release answer was dropped and the nightly manifest asked"
+    );
+    let state = snapshot_of(cx);
+    assert_eq!(state.notice.map(|n| n.version), Some("9.9.9".to_owned()));
+    assert!(!state.checking);
+
+    // With automatic checks off and no check running, a change fetches nothing (until "Check now").
+    cx.update(|cx| channel_changed(cx, settings::UpdateChannel::Release));
+    cx.run_until_parked();
+    assert_eq!(env.manifest_paths().len(), 1, "nothing was fetched");
+    let state = snapshot_of(cx);
+    assert!(state.notice.is_none() && state.last_checked.is_none());
 }

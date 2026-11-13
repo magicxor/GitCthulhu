@@ -2,8 +2,8 @@
 //! has a manifest URL, `update::settings_available`).
 //!
 //! * "Check for updates automatically": the `update_check` setting (a check at startup and every 24 hours),
-//! * "Update channel" (Release / Nightly): only for builds whose manifest URL has a `{channel}` placeholder; the
-//!   services read the channel when they start, so a change applies after a restart,
+//! * "Update channel" (Release / Nightly): only for builds whose manifest URL has a `{channel}` placeholder; a change
+//!   applies at once (the services switch channel and, while automatic checks are on, check again),
 //! * "Check for updates" with the "Check now" button and the state of the last check.
 //!
 //! The page is a plain function (the dialog hosts it as a list of rows), so the channel picker is a pair of chips
@@ -69,7 +69,7 @@ pub(crate) fn content(cx: &mut App, with_channel: bool) -> AnyElement {
     if with_channel {
         rows.push(
             SettingRow::new(ids::CHANNEL, "Update channel")
-                .subtitle("Which releases to look for. Applies after GitCthulhu restarts")
+                .subtitle("Which releases to look for. Applies at once")
                 .control(channel_chips(*cx.tokens(), current.update_channel))
                 .into_any_element(),
         );
@@ -195,6 +195,12 @@ fn chip(
         .text_body1()
         .whitespace_nowrap()
         .child(label)
-        .on_click(move |_, _, cx| settings::update(cx, |s| s.update_channel = channel))
+        .on_click(move |_, _, cx| {
+            if settings::get_or_default(cx).update_channel == channel {
+                return;
+            }
+            settings::update(cx, |s| s.update_channel = channel);
+            update::channel_changed(cx, channel);
+        })
         .test_support()
 }

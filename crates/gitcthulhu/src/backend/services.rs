@@ -24,11 +24,27 @@ pub struct ServicesHandle {
     _private: (),
 }
 
+#[cfg(not(feature = "services"))]
+impl ServicesHandle {
+    /// Without the `services` feature there is nothing to switch.
+    pub fn set_update_channel(&self, _channel: crate::settings::UpdateChannel) {}
+}
+
 #[cfg(feature = "services")]
 impl ServicesHandle {
     /// The services (for the region backend files `backend/{ai,forge,update}.rs`).
     pub(crate) fn services(&self) -> &Arc<gitcthulhu_services::Services> {
         &self.services
+    }
+
+    /// Makes later update checks look at `channel` at once (no restart). Nothing is fetched: the caller runs a
+    /// check when it wants the channel's answer. It only swaps a value under a lock that is never held across I/O,
+    /// so it may run on the UI thread (which keeps quick successive changes in order).
+    pub fn set_update_channel(&self, channel: crate::settings::UpdateChannel) {
+        self.services.update.set_channel(match channel {
+            crate::settings::UpdateChannel::Release => gitcthulhu_services::UpdateChannel::Release,
+            crate::settings::UpdateChannel::Nightly => gitcthulhu_services::UpdateChannel::Nightly,
+        });
     }
 }
 

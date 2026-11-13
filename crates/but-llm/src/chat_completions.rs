@@ -38,7 +38,12 @@ pub(crate) async fn complete(
         options,
         false,
     )?;
-    let response = request.timeout(TOTAL_TIMEOUT).send().await?;
+    // A local model's longer start (loading, prompt evaluation) comes on top of the generation time.
+    let total = TOTAL_TIMEOUT
+        + provider
+            .response_start_timeout()
+            .saturating_sub(RESPONSE_START_TIMEOUT);
+    let response = request.timeout(total).send().await?;
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
@@ -63,6 +68,8 @@ pub(crate) async fn complete(
 
 /// Ask for the answer as a stream, calling `on_token` with each piece as it arrives. Returns the whole answer
 /// (`None` if the model said nothing). Dropping the returned future closes the connection.
+///
+/// A stream that ends without `[DONE]` and without a finish reason is an error, not a short answer.
 pub(crate) async fn stream(
     provider: &impl OpenAIClientProvider,
     system_message: &str,
@@ -79,20 +86,23 @@ pub(crate) async fn stream(
         options,
         true,
     )?;
-    let response = timeout(RESPONSE_START_TIMEOUT, request.send())
+    let start_timeout = provider.response_start_timeout();
+    let response = timeout(start_timeout, request.send())
         .await
-        .map_err(|_| LlmError::timed_out("the response", RESPONSE_START_TIMEOUT))??;
+        .map_err(|_| LlmError::timed_out("the response", start_timeout))??;
     let status = response.status();
     if !status.is_success() {
-        let body = timeout(RESPONSE_START_TIMEOUT, response.text())
+        let body = timeout(start_timeout, response.text())
             .await
-            .map_err(|_| LlmError::timed_out("the error description", RESPONSE_START_TIMEOUT))??;
+            .map_err(|_| LlmError::timed_out("the error description", start_timeout))??;
         return Err(LlmError::from_status(status, &body));
     }
 
     let mut chunks = response.bytes_stream();
     let mut parser = SseParser::default();
     let mut answer: Option<String> = None;
+    // Whether the server said the answer is complete by naming a finish reason (some omit the `[DONE]` line).
+    let mut finished = false;
     loop {
         let (events, last) = match timeout(STREAM_IDLE_TIMEOUT, chunks.next()).await {
             Err(_) => return Err(LlmError::timed_out("the next token", STREAM_IDLE_TIMEOUT)),
@@ -119,9 +129,20 @@ pub(crate) async fn stream(
                 answer.get_or_insert_with(String::new).push_str(token);
                 on_token(token);
             }
+            if value
+                .pointer("/choices/0/finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                finished = true;
+            }
         }
         if last {
-            return Ok(answer);
+            // A connection that dropped mid-answer must not look like a finished (truncated) message.
+            return if finished {
+                Ok(answer)
+            } else {
+                Err(LlmError::incomplete())
+            };
         }
     }
 }
@@ -360,6 +381,68 @@ mod tests {
             "the provider's reason is kept: {err}"
         );
         assert_eq!(seen, "par", "text before the error was delivered");
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_off_before_done_or_a_finish_reason_is_an_error() {
+        let (addr, _server) = serve_once(|_request, mut stream| async move {
+            start_event_stream(&mut stream).await;
+            send(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Fix the par\"}}]}\n\n",
+            )
+            .await;
+        })
+        .await;
+        let mut seen = String::new();
+        let err = stream(
+            &lmstudio(addr),
+            "s",
+            user("u"),
+            "m",
+            &GenerateOptions::default(),
+            &mut |t| seen.push_str(t),
+        )
+        .await
+        .expect_err("a dropped connection is not a finished message");
+        assert!(matches!(err, LlmError::Network(_)), "{err}");
+        assert_eq!(seen, "Fix the par", "the text that arrived was delivered");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_names_a_finish_reason_is_complete_without_done() {
+        let (addr, _server) = serve_once(|_request, mut stream| async move {
+            start_event_stream(&mut stream).await;
+            send(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .await;
+        })
+        .await;
+        let answer = stream(
+            &lmstudio(addr),
+            "s",
+            user("u"),
+            "m",
+            &GenerateOptions::default(),
+            &mut |_| {},
+        )
+        .await
+        .expect("a finish reason completes the answer");
+        assert_eq!(answer.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn local_models_get_a_longer_response_start_timeout_than_hosted_providers() {
+        use crate::ollama::{OllamaConfig, OllamaProvider};
+        let hosted = OpenAiProvider::with(Sensitive("k".into()), None, None);
+        assert_eq!(hosted.response_start_timeout().as_secs(), 60);
+        let lm = lmstudio("127.0.0.1:1".parse().expect("an address"));
+        assert_eq!(lm.response_start_timeout().as_secs(), 180);
+        let ollama = OllamaProvider::new(OllamaConfig::default(), None);
+        assert_eq!(ollama.response_start_timeout().as_secs(), 180);
     }
 
     #[tokio::test]

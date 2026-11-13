@@ -81,11 +81,33 @@ pub struct UpdateService {
     /// The number of checks whose outcome reached the cache; tells a caller that waited for another
     /// thread's check whether that check produced a fresh answer.
     completed_checks: AtomicU64,
-    manifest_url: Option<String>,
+    /// The manifest URL with `{channel}` still in it.
+    manifest_template: Option<String>,
     version: semver::Version,
+    /// The channel checks look at; changes with [`UpdateService::set_channel`].
+    target: Mutex<Target>,
+    user_agent: String,
+}
+
+/// What a check looks at: the manifest of the channel, and the scope its outcome is cached for.
+#[derive(Clone)]
+struct Target {
+    manifest_url: Option<String>,
     /// What a cached check is valid for: the running version and the channel.
     cache_scope: String,
-    user_agent: String,
+}
+
+impl Target {
+    fn new(template: Option<&str>, version: &semver::Version, channel: UpdateChannel) -> Self {
+        let channel = match channel {
+            UpdateChannel::Release => "release",
+            UpdateChannel::Nightly => "nightly",
+        };
+        Target {
+            manifest_url: template.map(|url| url.replace("{channel}", channel)),
+            cache_scope: format!("{version}/{channel}"),
+        }
+    }
 }
 
 impl UpdateService {
@@ -94,21 +116,18 @@ impl UpdateService {
     /// `update_manifest_url` may contain `{channel}`, which becomes `release` or `nightly` according to
     /// `update_channel`. Nothing is read or fetched here.
     pub fn new(rt: Runtime, cfg: &ServicesConfig) -> Self {
-        let channel = match cfg.update_channel {
-            UpdateChannel::Release => "release",
-            UpdateChannel::Nightly => "nightly",
-        };
         UpdateService {
             rt,
             cache_dir: cfg.cache_dir.clone(),
             cache: Mutex::new(None),
             check_in_flight: tokio::sync::Mutex::new(()),
             completed_checks: AtomicU64::new(0),
-            manifest_url: cfg
-                .update_manifest_url
-                .as_ref()
-                .map(|url| url.replace("{channel}", channel)),
-            cache_scope: format!("{}/{channel}", cfg.app_version),
+            manifest_template: cfg.update_manifest_url.clone(),
+            target: Mutex::new(Target::new(
+                cfg.update_manifest_url.as_deref(),
+                &cfg.app_version,
+                cfg.update_channel,
+            )),
             version: cfg.app_version.clone(),
             user_agent: cfg.user_agent.clone(),
         }
@@ -123,23 +142,47 @@ impl UpdateService {
         f(cache)
     }
 
-    fn require_manifest_url(&self) -> Result<&str, UpdateError> {
-        self.manifest_url.as_deref().ok_or(UpdateError::Disabled)
+    /// Switch the channel that later checks look at. Nothing is fetched: the caller runs a check when it
+    /// wants the new channel's answer. [`UpdateService::cached`] and [`UpdateService::cached_at`] only
+    /// report outcomes that were produced for the channel now selected, so until that check finishes they
+    /// answer `None`. A check that is running keeps asking the channel it started with.
+    pub fn set_channel(&self, channel: UpdateChannel) {
+        *self.target.lock().unwrap_or_else(PoisonError::into_inner) =
+            Target::new(self.manifest_template.as_deref(), &self.version, channel);
     }
 
-    fn params<'a>(&'a self, manifest_url: &'a str) -> but_update::CheckParams<'a> {
+    fn target(&self) -> Target {
+        self.target
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn require_manifest_url(&self) -> Result<Target, UpdateError> {
+        let target = self.target();
+        if target.manifest_url.is_some() {
+            Ok(target)
+        } else {
+            Err(UpdateError::Disabled)
+        }
+    }
+
+    fn params<'a>(
+        &'a self,
+        manifest_url: &'a str,
+        cache_scope: &'a str,
+    ) -> but_update::CheckParams<'a> {
         but_update::CheckParams {
             manifest_url,
             current_version: &self.version,
-            cache_scope: &self.cache_scope,
+            cache_scope,
             user_agent: &self.user_agent,
         }
     }
 
-    fn current_update(&self) -> Result<Option<AvailableUpdate>, UpdateError> {
-        let found = self.with_cache(|cache| {
-            but_update::available_update(cache, &self.version, &self.cache_scope)
-        })?;
+    fn current_update(&self, cache_scope: &str) -> Result<Option<AvailableUpdate>, UpdateError> {
+        let found = self
+            .with_cache(|cache| but_update::available_update(cache, &self.version, cache_scope))?;
         Ok(found.and_then(|update| {
             Some(AvailableUpdate {
                 version: update.available_version,
@@ -159,7 +202,7 @@ impl UpdateService {
     ///
     /// If another thread of this service is checking at this very moment, this call waits for that check
     /// (cancellable) and returns its outcome instead of requesting the manifest a second time. Only if that
-    /// check failed or was cancelled does this call request the manifest itself.
+    /// check failed, was cancelled or asked another channel does this call request the manifest itself.
     ///
     /// # Errors
     ///
@@ -167,7 +210,12 @@ impl UpdateService {
     /// be downloaded, [`UpdateError::Manifest`] when it is not a usable manifest, [`UpdateError::Cache`]
     /// when the outcome cannot be stored. After an error the previously cached outcome is unchanged.
     pub fn check_now(&self, cancel: &CancelToken) -> Result<Option<AvailableUpdate>, UpdateError> {
-        let manifest_url = self.require_manifest_url()?;
+        let target = self.require_manifest_url()?;
+        let manifest_url = target
+            .manifest_url
+            .as_deref()
+            .ok_or(UpdateError::Disabled)?;
+        let cache_scope = target.cache_scope.as_str();
         let completed_before = self.completed_checks.load(Ordering::SeqCst);
         let _in_flight = match self.check_in_flight.try_lock() {
             Ok(guard) => guard,
@@ -177,20 +225,24 @@ impl UpdateService {
                     .rt
                     .block_on_cancellable(cancel, self.check_in_flight.lock())
                     .map_err(|_| UpdateError::Cancelled)?;
-                if self.completed_checks.load(Ordering::SeqCst) != completed_before {
-                    return self.current_update();
+                // Its outcome answers this call only if it was for the same channel: after
+                // [`UpdateService::set_channel`] the waiting call asks the new channel itself.
+                if self.completed_checks.load(Ordering::SeqCst) != completed_before
+                    && self.stored_check(cache_scope).is_some()
+                {
+                    return self.current_update(cache_scope);
                 }
                 guard
             }
         };
-        let params = self.params(manifest_url);
+        let params = self.params(manifest_url, cache_scope);
         let status = self
             .rt
             .block_on_cancellable(cancel, but_update::fetch_status(&params))
             .map_err(|_| UpdateError::Cancelled)??;
         self.with_cache(|cache| but_update::record_status(cache, &params, &status))?;
         self.completed_checks.fetch_add(1, Ordering::SeqCst);
-        self.current_update()
+        self.current_update(cache_scope)
     }
 
     /// The update found by the last check, from the cache, without any network access.
@@ -198,8 +250,26 @@ impl UpdateService {
     /// `None` when nothing was found, the update is snoozed, the cached check belongs to another version or
     /// channel, the cache is unreadable, or update checks are disabled.
     pub fn cached(&self) -> Option<AvailableUpdate> {
-        self.require_manifest_url().ok()?;
-        self.current_update().ok().flatten()
+        let target = self.require_manifest_url().ok()?;
+        self.current_update(&target.cache_scope).ok().flatten()
+    }
+
+    /// When the last check finished, from the cache, without any network access. It survives restarts.
+    ///
+    /// `None` when no check was made yet, the stored check belongs to another version or channel (see
+    /// [`UpdateService::set_channel`]), the cache is unreadable, or update checks are disabled.
+    pub fn cached_at(&self) -> Option<std::time::SystemTime> {
+        let target = self.require_manifest_url().ok()?;
+        self.stored_check(&target.cache_scope)
+            .map(|stored| stored.checked_at.into())
+    }
+
+    /// The stored outcome of the last check, if it was made for `cache_scope` (version and channel).
+    fn stored_check(&self, cache_scope: &str) -> Option<but_db::cache::CachedCheckResult> {
+        self.with_cache(|cache| cache.update_check().try_get())
+            .ok()
+            .flatten()
+            .filter(|stored| stored.status.valid_for_version.as_deref() == Some(cache_scope))
     }
 
     /// Hide the update notice for `hours` (1..=720). A later check keeps a running snooze while it finds the

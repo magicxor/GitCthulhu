@@ -197,6 +197,17 @@ impl HistoryPopover {
                         }
                         this.load = Load::Ready;
                     }
+                    // A later page failed: keep the rows already shown, stop paging and say so.
+                    Err(text) if before.is_some() => {
+                        this.next = None;
+                        crate::app_view::show_toast(
+                            cx,
+                            Some(this.ctx.id),
+                            crate::notifications::ToastKind::Warning,
+                            format!("Older undo history could not be read: {text}"),
+                            None,
+                        );
+                    }
                     Err(text) => this.load = Load::Failed(text),
                 }
                 cx.notify();

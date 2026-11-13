@@ -369,53 +369,6 @@ pub fn https_credential(
     }
 }
 
-/// "provider model" when an AI provider is configured and ready (the PR dialog's "Generate" link needs it).
-pub fn ai_ready(services: &ServicesHandle) -> Option<String> {
-    #[cfg(feature = "services")]
-    {
-        match services.services().ai.status() {
-            gitcthulhu_services::ai::AiStatus::Ready { provider, model } => {
-                Some(format!("{provider} {model}"))
-            }
-            _ => None,
-        }
-    }
-    #[cfg(not(feature = "services"))]
-    {
-        let _ = services;
-        None
-    }
-}
-
-/// Asks the AI provider for a pull request title and description from the commits (blocking).
-pub fn generate_pr_text(
-    services: &ServicesHandle,
-    title: &str,
-    body: &str,
-    commit_messages: Vec<String>,
-    cancel: &super::CancelToken,
-) -> Result<(String, String), String> {
-    #[cfg(feature = "services")]
-    {
-        let request = gitcthulhu_services::ai::PrRequest {
-            title: title.to_owned(),
-            body: body.to_owned(),
-            commit_messages,
-        };
-        services
-            .services()
-            .ai
-            .generate_pr_text(&request, cancel, &mut |_| {})
-            .map(|text| (text.title, text.body))
-            .map_err(|e| e.to_string())
-    }
-    #[cfg(not(feature = "services"))]
-    {
-        let _ = (services, title, body, commit_messages, cancel);
-        Err("The AI integration is not available".to_owned())
-    }
-}
-
 /// Fetches an image through the forge HTTP stack (blocking).
 pub fn fetch_image(services: &ServicesHandle, url: &str) -> Result<Vec<u8>, String> {
     #[cfg(feature = "services")]

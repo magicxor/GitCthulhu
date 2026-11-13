@@ -1135,6 +1135,16 @@ fn settings_page_shell_custom_and_font_size(cx: &mut TestAppContext) {
             matches!(options.last(), Some(TerminalShell::Custom(_))),
             "Custom comes last"
         );
+        // The option right under the box lies over the Custom row: the press must reach the option.
+        window.click(sids::select_option(SHELL, 1), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            crate::settings::get(cx).terminal_shell,
+            options[1],
+            "the option over the next row takes the click"
+        );
+        window.click(sids::select(SHELL), cx);
+        window.render_frame(cx);
         window.click(sids::select_option(SHELL, options.len() - 1), cx);
         window.render_frame(cx);
     })

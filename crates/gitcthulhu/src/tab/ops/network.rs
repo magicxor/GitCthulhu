@@ -583,14 +583,29 @@ impl RepoTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.push_branch_to_with(local, remote_branch, force, false, window, cx)
+        self.push_branch_to_with(local, remote_branch, force, false, false, window, cx)
     }
 
+    /// [`RepoTab::push_branch_to`] for a branch without an upstream: the push also makes `remote_branch` its
+    /// upstream (`git push -u`), so the toolbar's Push works for it afterwards (Create pull request, "Push the branch
+    /// first").
+    pub fn publish_branch_to(
+        &mut self,
+        local: FullName,
+        remote_branch: FullName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.push_branch_to_with(local, remote_branch, false, true, false, window, cx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn push_branch_to_with(
         &mut self,
         local: FullName,
         remote_branch: FullName,
         force: bool,
+        set_upstream: bool,
         skip_hooks: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -628,7 +643,7 @@ impl RepoTab {
             }],
             force: force_mode,
             tags: TagPush::None,
-            set_upstream: false,
+            set_upstream,
             push_options: Vec::new(),
             skip_hooks,
         };
@@ -641,7 +656,7 @@ impl RepoTab {
         .label(format!("Push to {remote}"))
         .base_refresh(RefreshSet::REMOTES | RefreshSet::BRANCHES | RefreshSet::LOG)
         .retry_without_hooks(move |tab, window, cx| {
-            tab.push_branch_to_with(local, remote_branch, force, true, window, cx);
+            tab.push_branch_to_with(local, remote_branch, force, set_upstream, true, window, cx);
         });
         self.run_op(spec, window, cx)
     }

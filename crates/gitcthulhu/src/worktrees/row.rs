@@ -165,6 +165,8 @@ pub(super) fn render(ctx: &TabCtx, info: &WorktreeInfo, selected: bool, cx: &App
                         .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
+                        // Long directory names end in "…" before the branch label, as other rows do.
+                        .text_ellipsis()
                         .text_body2()
                         .text_color(tokens.on_background)
                         .when(info.is_current, |t| t.bold())

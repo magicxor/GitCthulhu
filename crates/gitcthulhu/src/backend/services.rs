@@ -70,20 +70,3 @@ pub fn start_services(settings: &Settings) -> anyhow::Result<ServicesHandle> {
 pub fn start_services(_settings: &Settings) -> anyhow::Result<ServicesHandle> {
     anyhow::bail!("built without integrations")
 }
-
-/// `ai::SecretSource` over the OS keychain (`but_secret`, namespace "gitcthulhu" set by `Services::new`).
-#[cfg(feature = "services")]
-pub struct GuiSecretSource;
-
-#[cfg(feature = "services")]
-impl gitcthulhu_services::ai::SecretSource for GuiSecretSource {
-    fn secret(&self, handle: &str) -> Option<String> {
-        match but_secret::secret::retrieve(handle, but_secret::secret::Namespace::BuildKind) {
-            Ok(secret) => secret.map(|s| s.0),
-            Err(err) => {
-                tracing::warn!("cannot read the secret {handle}: {err}");
-                None
-            }
-        }
-    }
-}

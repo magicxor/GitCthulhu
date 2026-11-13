@@ -467,7 +467,9 @@ fn refusal_now(r: &Rig, cx: &mut TestAppContext, redo: bool) -> String {
             .try_lock(Duration::from_secs(2))
             .expect("the guard is free");
         match handle.oplog_restore(&kind, options.clone(), guard.write_permission()) {
-            Ok(UndoOutcome::Refused(why)) => return crate::backend::present::refusal_text(&why),
+            Ok(UndoOutcome::Refused(why)) => {
+                return crate::backend::present::refusal_text(&why, "Undo");
+            }
             Ok(UndoOutcome::NeedsConfirmation(c)) => options.confirmation = Some(c.token),
             Ok(_) => panic!("not refused"),
             Err(_) => panic!("oplog error"),
@@ -550,7 +552,10 @@ fn undo_over_an_untracked_file_asks_first_and_declining_keeps_the_file(cx: &mut 
         ) {
             Ok(UndoOutcome::NeedsConfirmation(c)) => c.reasons,
             Ok(UndoOutcome::Refused(why)) => {
-                panic!("refused: {}", crate::backend::present::refusal_text(&why))
+                panic!(
+                    "refused: {}",
+                    crate::backend::present::refusal_text(&why, "Undo")
+                )
             }
             _ => panic!("a confirmation was expected"),
         }

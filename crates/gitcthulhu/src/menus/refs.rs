@@ -251,6 +251,11 @@ pub fn local_branch(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
         );
     }
     extend(cx, MenuSlot::AfterCheckout, target, &mut items);
+    if !target.is_current {
+        // The slot's items join Checkout's group: 08 §2.13 has no separator between Checkout and Merge/Rebase
+        // (nor between Checkout and Rename on a detached HEAD).
+        trim_separator(&mut items);
+    }
     if !target.is_current && head.is_some() {
         let r = rev.clone();
         items.push(on_tab(

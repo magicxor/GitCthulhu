@@ -543,7 +543,8 @@ pub fn in_progress_name(kind: OplogInProgress) -> &'static str {
 }
 
 /// Why an undo/redo/restore was refused (17 §4.5; cannot be overridden).
-pub fn refusal_text(r: &Refusal) -> String {
+/// `action` names the restore that was refused ("Undo", "Redo", "Restore").
+pub fn refusal_text(r: &Refusal, action: &str) -> String {
     match r {
         Refusal::OperationInProgress { kind } => format!(
             "A {} is in progress. Finish or abort it first.",
@@ -572,7 +573,7 @@ pub fn refusal_text(r: &Refusal) -> String {
             "The commits needed for this are no longer in the repository.".to_owned()
         }
         Refusal::UntrackedInTheWay(paths) => format!(
-            "Undo needs to write {}, but an untracked file is in the way. Move it away and try again.",
+            "{action} needs to write {}, but an untracked file is in the way. Move it away and try again.",
             paths_text(paths)
         ),
         Refusal::EntryNotFound(_) => "The operation is no longer in the undo history.".to_owned(),

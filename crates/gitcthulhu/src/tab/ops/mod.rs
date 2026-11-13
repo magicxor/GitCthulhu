@@ -461,7 +461,8 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
                     },
                 };
                 match h.oplog_finish(pending, outcome, guard.write_permission()) {
-                    Ok(()) => recorded = true,
+                    // A dropped no-op entry is not "recorded": no Undo action, no UNDO reload.
+                    Ok(written) => recorded = written,
                     Err(err) => warning = Some(format!("{title} can't be undone: {err}")),
                 }
             }
@@ -1158,14 +1159,14 @@ impl RepoTab {
                 crate::app_view::show_toast(cx, tab_id, ToastKind::Positive, text, None);
             }
             Ok(RestoreDone::Outcome(UndoOutcome::Refused(why))) => {
-                let title = match kind {
-                    RestoreKind::Undo => "Can't undo",
-                    RestoreKind::Redo => "Can't redo",
-                    RestoreKind::RestoreTo(_) => "Can't restore",
+                let (title, action) = match kind {
+                    RestoreKind::Undo => ("Can't undo", "Undo"),
+                    RestoreKind::Redo => ("Can't redo", "Redo"),
+                    RestoreKind::RestoreTo(_) => ("Can't restore", "Restore"),
                 };
                 crate::app_view::show_error(
                     cx,
-                    ErrorDialogData::new(title, present::refusal_text(&why)),
+                    ErrorDialogData::new(title, present::refusal_text(&why, action)),
                 );
             }
             Ok(RestoreDone::Outcome(UndoOutcome::NeedsConfirmation(_)))

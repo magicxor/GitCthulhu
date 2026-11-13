@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, Subscription, WeakEntity, Window};
 
 use super::button::AiButton;
@@ -254,7 +255,13 @@ impl AiController {
         let escape = cx.intercept_keystrokes({
             let this = this.clone();
             move |event, window, cx| {
-                if event.keystroke.key == "escape" && window.window_handle() == home {
+                // An open menu or dialog takes the Escape for itself (it closes); only a bare Escape stops the run.
+                let layer_open = window.has_active_dialog(cx)
+                    || cx
+                        .try_global::<crate::menus::MenuHostGlobal>()
+                        .is_some_and(|host| host.0.read(cx).is_open());
+                if event.keystroke.key == "escape" && window.window_handle() == home && !layer_open
+                {
                     let stopped = this
                         .update(cx, |controller, cx| controller.stop_run(id, cx))
                         .unwrap_or(false);

@@ -267,6 +267,9 @@ mod rows {
                             cx.notify();
                         })
                     })
+                    // The options lie over the rows below (the Custom field, Font size): they must take the
+                    // pointer, or a press on an option reaches the field under it instead.
+                    .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .children(rows)
                     .test_support(),

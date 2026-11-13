@@ -63,6 +63,8 @@ pub struct AiHub {
     /// Identity of the services instance the settings were given to.
     services_id: Option<usize>,
     generation: u64,
+    /// The generation whose result was applied last (equal to `generation` when nothing is on its way).
+    settled: u64,
     /// The newest generation, readable from the background threads: an older configuration that has not started
     /// yet is skipped, so the service always ends with the newest settings.
     latest: Arc<AtomicU64>,
@@ -95,6 +97,7 @@ impl AiHub {
             applied: AiSettings::default(),
             services_id: None,
             generation: 0,
+            settled: 0,
             latest: Arc::new(AtomicU64::new(0)),
             gate: Arc::new(Mutex::new(())),
             debounce: None,
@@ -107,11 +110,18 @@ impl AiHub {
         &self.readiness
     }
 
+    /// Whether settings are on their way to the service (a configuration runs or is queued). [`Readiness::Pending`]
+    /// alone does not say so: nothing asked for a configuration yet before the first [`ensure`].
+    pub fn applying(&self) -> bool {
+        self.settled != self.generation
+    }
+
     /// Applies the current settings and keys to the service in the background. Without running services the
     /// hub goes back to [`Readiness::Pending`].
     pub fn reconfigure(&mut self, cx: &mut Context<Self>) {
         let Some(services) = app::services(cx) else {
             self.services_id = None;
+            self.settled = self.generation;
             self.set_readiness(Readiness::Pending, cx);
             return;
         };
@@ -137,6 +147,7 @@ impl AiHub {
                 if hub.generation == generation
                     && let Some(status) = status
                 {
+                    hub.settled = generation;
                     hub.set_readiness(Readiness::of(status), cx);
                 }
             })

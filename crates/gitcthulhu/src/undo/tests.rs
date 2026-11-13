@@ -376,10 +376,19 @@ fn refused_shows_error(cx: &mut TestAppContext) {
         );
     }
     assert_eq!(
-        crate::backend::present::refusal_text(&Refusal::OperationInProgress {
-            kind: InProgress::Merge
-        }),
+        crate::backend::present::refusal_text(
+            &Refusal::OperationInProgress {
+                kind: InProgress::Merge
+            },
+            "Undo"
+        ),
         "A merge is in progress. Finish or abort it first."
+    );
+    let in_the_way = Refusal::UntrackedInTheWay(vec![bstr::BString::from("new.txt")]);
+    assert!(
+        crate::backend::present::refusal_text(&in_the_way, "Redo")
+            .starts_with("Redo needs to write"),
+        "the refusal names the restore that was refused"
     );
 }
 
@@ -645,14 +654,20 @@ fn toast_action_of_a_no_op_does_not_undo_an_older_operation(cx: &mut TestAppCont
         t.create_branch("topic".to_owned(), StartPoint::Head, false, w, cx);
     });
     let with_topic = branches(&fx);
-    // Checking out the current branch changes nothing, but its toast still offers "Undo".
+    // Checking out the current branch changes nothing: the oplog drops its entry, so its toast offers no "Undo".
     run(cx, handle, &tab, |t, w, cx| {
         t.checkout_branch(full("refs/heads/main"), w, cx);
     });
     assert_eq!(branches(&fx), with_topic);
+    assert_eq!(
+        undo_depth(&tab, cx),
+        1,
+        "only the branch creation is on the undo stack"
+    );
+    // The newest action left is the older toast's "Undo"; a newer operation ran since, so it does nothing.
     assert!(
         click_toast_action(cx, handle),
-        "the checkout toast has an action"
+        "the branch toast still shows its action"
     );
     assert_eq!(
         branches(&fx),
@@ -661,6 +676,21 @@ fn toast_action_of_a_no_op_does_not_undo_an_older_operation(cx: &mut TestAppCont
     );
     let texts = cx.update(|cx| toast_texts(&app, cx));
     assert!(texts.iter().any(|t| t == STALE_TOAST), "{texts:?}");
+}
+
+#[gpui_kit::test]
+fn a_no_op_toast_has_no_undo_action(cx: &mut TestAppContext) {
+    let (_fx, handle, app, tab) = real_tab(cx, true);
+    run(cx, handle, &tab, |t, w, cx| {
+        t.checkout_branch(full("refs/heads/main"), w, cx);
+    });
+    let texts = cx.update(|cx| toast_texts(&app, cx));
+    assert_eq!(texts.len(), 1, "the checkout's success toast: {texts:?}");
+    assert!(
+        !click_toast_action(cx, handle),
+        "an operation that changed nothing offers no Undo"
+    );
+    assert_eq!(undo_depth(&tab, cx), 0);
 }
 
 fn open_history(cx: &mut TestAppContext, handle: AnyWindowHandle, tab: &Entity<RepoTab>) {

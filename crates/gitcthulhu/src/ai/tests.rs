@@ -456,6 +456,38 @@ fn escape_tab_switch_and_commit_stop_the_run(cx: &mut TestAppContext) {
         .expect("window");
     assert!(!running(cx), "Escape stops it");
 
+    // With a context menu open, the first Escape closes the menu and the run goes on; the next one stops it.
+    start_run(cx, handle, &tab, "", |_, _| Err(AiFailure::Cancelled));
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        crate::menus::open_context_menu(
+            window,
+            cx,
+            gpui_kit::point(gpui_kit::px(200.), gpui_kit::px(200.)),
+            vec![crate::menus::MenuItem::action("x-item", "Item", |_, _| {})],
+        );
+        window.render_frame(cx);
+    })
+    .expect("window");
+    let menu_open = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            cx.global::<crate::menus::MenuHostGlobal>()
+                .0
+                .read(cx)
+                .is_open()
+        })
+    };
+    assert!(menu_open(cx));
+    assert!(running(cx), "opening a menu does not stop the generation");
+    // (No parking here: the scripted job would finish the run.)
+    cx.update_window(handle, |_, window, cx| window.press("escape", cx))
+        .expect("window");
+    assert!(!menu_open(cx), "Escape closed the menu");
+    assert!(running(cx), "and did not stop the generation");
+    cx.update_window(handle, |_, window, cx| window.press("escape", cx))
+        .expect("window");
+    assert!(!running(cx), "the next Escape stops it");
+
     start_run(cx, handle, &tab, "", |_, _| Err(AiFailure::Cancelled));
     assert!(running(cx));
     cx.update_window(handle, |_, window, cx| {

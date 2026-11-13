@@ -14,10 +14,8 @@ use gpui_kit::{
     Styled as _, Subscription, Task, Window, div,
 };
 
-use crate::backend::forge::{
-    self as backend_forge, CreatedReview, Failure, NewReview, PrDraft, RepoHandle,
-};
-use crate::backend::{ByteSlice as _, CancelToken, FullName};
+use crate::backend::forge::{CreatedReview, Failure, NewReview, PrDraft, RepoHandle};
+use crate::backend::{ByteSlice as _, FullName};
 use crate::dialogs::register::common::{self, FocusOnce};
 use crate::forge::flows::describe_failure;
 use crate::metrics::dialogs::CLONE_W;
@@ -160,8 +158,14 @@ pub fn open(window: &mut Window, cx: &mut App, tab: TabCtx, branch: FullName) {
         );
         return;
     };
-    let ai =
-        crate::app::services(cx).filter(|services| backend_forge::ai_ready(services).is_some());
+    // The Generate link shows when AI is ready (the hook it calls asks the same hub).
+    #[cfg(feature = "services")]
+    let ai = {
+        crate::ai::hub::ensure(cx);
+        crate::app::services(cx).filter(|_| crate::ai::is_ready(cx))
+    };
+    #[cfg(not(feature = "services"))]
+    let ai: Option<crate::backend::services::ServicesHandle> = None;
     let title = cx.new(|cx| OutlinedField::new(ids::TITLE, window, cx).hint("Title", window, cx));
     let description = cx.new(|cx| FilledTextArea::new(ids::DESCRIPTION, "Description", window, cx));
     let base_options: Vec<SharedString> =
@@ -265,6 +269,13 @@ pub(crate) struct Snapshot {
     pub error: Option<String>,
 }
 
+/// A running Generate request.
+#[cfg(feature = "services")]
+type Generating = crate::ai::AiHandle;
+/// Without the integrations there is no AI (the link is never shown).
+#[cfg(not(feature = "services"))]
+type Generating = crate::backend::CancelToken;
+
 /// What the dialog needs of the branch and the repository, read from the model on the UI thread.
 #[derive(Clone, Debug)]
 struct Plan {
@@ -280,6 +291,8 @@ struct Plan {
     tip: crate::backend::ObjectId,
     /// No upstream, or commits the upstream does not have.
     needs_push: bool,
+    /// The branch has an upstream (a push for it keeps it; without one the push sets it).
+    has_upstream: bool,
     /// The remote branches of the base remote.
     base_names: Vec<String>,
     /// The default base branch.
@@ -322,6 +335,7 @@ impl Plan {
                 remote_ref: Some(local.clone()),
                 tip: remote.target,
                 needs_push: false,
+                has_upstream: true,
                 base_names: base_names(),
                 default_base: String::new(),
                 head_label: head_label(&remote.name),
@@ -368,6 +382,7 @@ impl Plan {
             remote_ref,
             tip: branch.target,
             needs_push,
+            has_upstream: branch.upstream.is_some(),
             base_names: base_names(),
             default_base: String::new(),
         })
@@ -392,7 +407,8 @@ pub struct PullRequestDialog {
     description_edited: bool,
     commit_messages: Vec<String>,
     ai: Option<crate::backend::services::ServicesHandle>,
-    generating: Option<CancelToken>,
+    /// The running Generate request (through the AI hooks: privacy confirmation, QA refusal, cancellation).
+    generating: Option<Generating>,
     focus: FocusOnce,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -483,9 +499,15 @@ impl PullRequestDialog {
             };
             let started = std::rc::Rc::new(std::cell::Cell::new(false));
             let flag = started.clone();
+            let has_upstream = self.plan.has_upstream;
             self.phase = Phase::Pushing;
             self.tab.with_tab(window, cx, move |tab, window, cx| {
-                flag.set(tab.push_branch_to(local, remote_ref, false, window, cx));
+                flag.set(if has_upstream {
+                    tab.push_branch_to(local, remote_ref, false, window, cx)
+                } else {
+                    // A first push sets the upstream, so the toolbar's Push works for the branch afterwards.
+                    tab.publish_branch_to(local, remote_ref, window, cx)
+                });
             });
             if !started.get() {
                 // Another operation is running; it told the user.
@@ -561,42 +583,64 @@ impl PullRequestDialog {
         }
     }
 
-    /// Asks the AI provider for a title and a description (the link is shown only when one is ready).
+    /// Asks the AI provider for a title and a description (the link is shown only when one is ready), through the
+    /// AI hook (spec 21 §5.3): the one-time privacy confirmation for a provider off this machine comes first, and
+    /// the text streams into the fields.
+    #[cfg(feature = "services")]
     fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(services) = self.ai.clone() else {
-            return;
-        };
-        if self.generating.is_some() {
+        if self.ai.is_none() || self.generating.is_some() {
             return;
         }
-        let cancel = CancelToken::new();
-        self.generating = Some(cancel.clone());
-        let title = common::text_of(&self.title, cx);
-        let body = self.description.read(cx).text(cx).to_string();
-        let messages = self.commit_messages.clone();
-        let work = crate::backend::bg(cx, move || {
-            backend_forge::generate_pr_text(&services, &title, &body, messages, &cancel)
-        });
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let result = work.await;
-            this.update_in(cx, |dialog, window, cx| {
-                dialog.generating = None;
-                match result {
-                    Ok((title, body)) => {
-                        dialog
-                            .title
-                            .update(cx, |field, cx| field.set_text(&title, window, cx));
-                        dialog
-                            .description
-                            .update(cx, |area, cx| area.set_text(&body, window, cx));
-                    }
-                    Err(message) => dialog.error = Some(message.into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        });
-        self.tasks.push(task);
+        let request = crate::backend::ai::PrRequest {
+            title: common::text_of(&self.title, cx),
+            body: self.description.read(cx).text(cx).to_string(),
+            commit_messages: self.commit_messages.clone(),
+        };
+        let streamed = cx.weak_entity();
+        let finished = cx.weak_entity();
+        let handle = crate::ai::generate_pr_text(
+            window,
+            cx,
+            request,
+            move |text, window, cx| {
+                streamed
+                    .update(cx, |dialog, cx| {
+                        dialog.show_text(&text.title, &text.body, window, cx)
+                    })
+                    .ok();
+            },
+            move |result, window, cx| {
+                finished
+                    .update(cx, |dialog, cx| {
+                        dialog.generating = None;
+                        match result {
+                            Ok(text) => dialog.show_text(&text.title, &text.body, window, cx),
+                            Err(crate::backend::ai::AiFailure::Cancelled) => {}
+                            Err(failure) => dialog.error = Some(failure.message().into()),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            },
+        );
+        self.generating = Some(handle);
+        cx.notify();
+    }
+
+    #[cfg(not(feature = "services"))]
+    fn generate(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Puts generated text into the fields (an empty part leaves its field alone while the text streams).
+    #[cfg(feature = "services")]
+    fn show_text(&mut self, title: &str, body: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !title.is_empty() {
+            self.title
+                .update(cx, |field, cx| field.set_text(title, window, cx));
+        }
+        if !body.is_empty() {
+            self.description
+                .update(cx, |area, cx| area.set_text(body, window, cx));
+        }
         cx.notify();
     }
 }

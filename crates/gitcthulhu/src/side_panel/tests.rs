@@ -1061,7 +1061,6 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
         [
             "branch-checkout",
             "branch-create-worktree",
-            "---",
             "branch-merge",
             "branch-rebase",
             "---",
@@ -1143,7 +1142,6 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
         [
             "branch-checkout",
             "branch-create-worktree",
-            "---",
             "branch-rename",
             "branch-upstream",
             "---",
@@ -1151,7 +1149,7 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
             "---",
             "branch-copy-name"
         ],
-        "detached HEAD: merge and rebase are hidden, and so is their separator (08 §2.13); the separator after X6's Create worktree… is the one `menus::extend` adds after an extender's items"
+        "detached HEAD: merge and rebase are hidden, and so is their separator (08 §2.13: Checkout -> Rename); X6's Create worktree… joins Checkout's group"
     );
     let items = menu_of(
         &tab,
@@ -1335,7 +1333,6 @@ fn branch_menu_calls_extender_slots(cx: &mut TestAppContext) {
             "branch-checkout",
             "branch-create-worktree",
             "x-after-checkout",
-            "---",
             "branch-merge",
             "branch-rebase",
             "---",
@@ -1347,7 +1344,7 @@ fn branch_menu_calls_extender_slots(cx: &mut TestAppContext) {
             "---",
             "branch-copy-name"
         ],
-        "AfterCheckout follows Checkout; AfterRenameGroup follows Rename and Change upstream"
+        "AfterCheckout joins Checkout's group (no separator before Merge, 08 §2.13); AfterRenameGroup follows Rename and Change upstream"
     );
     let items = menu_of(
         &tab,

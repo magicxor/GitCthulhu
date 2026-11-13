@@ -94,6 +94,13 @@ impl Fixture {
             std::fs::create_dir_all(parent).expect("parent directories can be created");
         }
         std::fs::write(&full, text).expect("the file can be written");
+        // Git ignores a hook without the executable bit (Unix); Git for Windows runs it either way.
+        #[cfg(unix)]
+        if path.starts_with(".git/hooks/") {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755))
+                .expect("the hook can be made executable");
+        }
     }
 
     /// Runs `git <args>` in the worktree and returns its stdout. Panics with stderr when git fails.

@@ -50,14 +50,16 @@ function Get-QaEnvironment {
         GIT_TERMINAL_PROMPT   = '0'
     }
     if ($HttpPort -gt 0) {
-        # Only the gate's pairing passes (qa/gate.rs): http for the loopback test server, nothing else, and no
-        # proxy in between.
+        # Only the gate's pairing passes (qa/gate.rs): http for the loopback test server, nothing else. The
+        # loopback server is exempt from proxies; every other host goes to a proxy on the discard port of this
+        # machine, which nothing answers, so a fixture or scenario that names another http host cannot reach the
+        # network while http is allowed.
         $environment['GIT_ALLOW_PROTOCOL'] = 'file:http'
         $environment['GITCTHULHU_QA_LOOPBACK_HTTP'] = "127.0.0.1:$HttpPort"
-        $environment['NO_PROXY'] = '127.0.0.1,localhost'
-        $environment['no_proxy'] = '127.0.0.1,localhost'
+        $environment['NO_PROXY'] = '127.0.0.1'
+        $environment['no_proxy'] = '127.0.0.1'
         foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy') {
-            $environment[$name] = ''
+            $environment[$name] = 'http://127.0.0.1:9'
         }
     }
     $environment

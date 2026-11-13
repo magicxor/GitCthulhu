@@ -181,6 +181,8 @@ fn refresh(_window: &mut Window, cx: &mut App, _args: &Args) -> StepResult {
 
 fn open_forge_dialog(window: &mut Window, cx: &mut App, args: &Args) -> StepResult {
     let name = args.text(0, "dialog name")?;
+    // The scenario opens these dialogs itself: `assert no error` must not report them.
+    crate::qa::monitor::scenario_dialog(cx, true);
     match name.as_str() {
         "github-token" => open_token_dialog(window, cx, TokenFlow::GitHub),
         "enterprise" => open_token_dialog(window, cx, TokenFlow::GitHubEnterprise),

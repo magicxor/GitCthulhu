@@ -10,7 +10,7 @@ use gpui_kit::{App, Global, Window};
 
 use super::controller::{self, AiController};
 use super::fake::{Behavior, FakeProvider};
-use super::hub::{self, KeyStoreGlobal, Readiness};
+use super::hub::{self, KeyStoreGlobal};
 use crate::app;
 use crate::app_view::AppViewGlobal;
 use crate::backend::ai::{self as backend_ai, AiProvider, AiSettings, KeyStore};
@@ -342,7 +342,7 @@ fn probe(_: &mut Window, cx: &App) -> Option<String> {
     if cx.has_global::<ServicesStarting>() {
         return Some("the AI services are starting".into());
     }
-    if app::services(cx).is_some() && matches!(hub::readiness(cx), Readiness::Pending) {
+    if app::services(cx).is_some() && hub::hub(cx).is_some_and(|hub| hub.read(cx).applying()) {
         return Some("the AI settings are being applied".into());
     }
     let controller = active_controller(cx).ok()?;
@@ -400,7 +400,7 @@ mod tests {
     fn ready(cx: &mut TestAppContext) -> bool {
         matches!(
             cx.update(|cx| super::hub::readiness(cx)),
-            super::Readiness::Ready { .. }
+            crate::ai::Readiness::Ready { .. }
         )
     }
 

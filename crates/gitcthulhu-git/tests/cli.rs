@@ -667,10 +667,12 @@ fn wait_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool
 fn cancel_kills_process_tree() {
     let env = TestEnv::new();
     let repo = repo_with_commit(&env).open();
+    // A program no other test of this file starts: the tests run in parallel, and the processes are found by
+    // name among everything this test process started (the hooks of the lock tests below run `sleep`).
     let (alias, sleeper) = if cfg!(windows) {
         ("alias.slow=!ping -n 30 127.0.0.1 >/dev/null", "ping")
     } else {
-        ("alias.slow=!sleep 30", "sleep")
+        ("alias.slow=!tail -f /dev/null", "tail")
     };
     let cancel = CancelToken::new();
     let worker = {

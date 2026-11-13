@@ -289,6 +289,13 @@ struct OpenSettingsView(WeakEntity<SettingsView>);
 
 impl Global for OpenSettingsView {}
 
+/// The open Settings view, if any (cross-feature tests).
+#[cfg(all(test, feature = "services"))]
+pub(crate) fn open_view(cx: &App) -> Option<Entity<SettingsView>> {
+    cx.try_global::<OpenSettingsView>()
+        .and_then(|g| g.0.upgrade())
+}
+
 /// Opens the Settings dialog, optionally at `page` (ignored when that category is not available). While the
 /// dialog is open, a second call only switches the page.
 pub fn open(window: &mut Window, cx: &mut App, page: Option<SettingsPage>) {

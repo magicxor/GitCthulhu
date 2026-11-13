@@ -57,6 +57,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo check
         run: cargo check --workspace --all-targets
+      # The GUI's documented build without Zig (no embedded terminal); nothing else builds it.
+      - name: cargo check (gitcthulhu without the terminal)
+        run: cargo check -p gitcthulhu --all-targets --no-default-features --features services
       # but-core still carries GitButler-era tests that depend on its legacy fixtures and environment; they are
       # slated for the slimming stage (decision D2) and must not hide regressions of the crates that are maintained.
       - name: cargo test

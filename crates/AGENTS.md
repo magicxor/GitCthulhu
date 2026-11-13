@@ -7,15 +7,16 @@ them. Do not apply them to generated, vendored, or fixture data unless the task 
 
 Fixed decisions (owner-approved). The virtual-branch code is gone; the new crates are being built.
 
-- **Git core**: `but-core` (to be slimmed of GitButler-only concepts), `but-error`, `but-serde`, `but-schemars`,
+- **Git core**: `but-core` (to be slimmed of GitButler-only concepts), `but-error`, `but-serde`,
   `but-project-handle`, `but-path`, `but-utils`, `gitbutler-git` (askpass harness and transport defaults used by the `gitcthulhu-git` executor; the
   `gitcthulhu-askpass` and `gitcthulhu-editor` helper programs ship with the `gitcthulhu` package),
-  `but-askpass`, `gitbutler-filemonitor`, `but-testsupport`, `but-debugging`.
+  `but-askpass`, `gitbutler-filemonitor`, `but-testsupport`.
 - **Preserved capabilities**: forge integrations (`but-forge`, `but-forge-storage`, `but-github`, `but-gitlab`,
   `but-bitbucket`, `but-secret`), AI (`but-llm`), embedded terminal (`but-tty`), installer and updater
-  (`but-installer`, `but-update`), plus `but-settings` and `but-db`.
-- **Planned new crates**: `gitcthulhu-git` (UI-agnostic plain-Git backend, blocking API, no GPUI),
-  `gitcthulhu-oplog` (snapshot-based undo/redo on `but_core::snapshot`, no virtual-branch state), and
+  (`but-installer`, `but-update`), plus `but-db`.
+- **New crates**: `gitcthulhu-git` (UI-agnostic plain-Git backend, blocking API, no GPUI),
+  `gitcthulhu-oplog` (snapshot-based undo/redo on `but_core::snapshot`, no virtual-branch state),
+  `gitcthulhu-services` (the forge, AI and update services over the preserved crates, no GPUI), and
   `gitcthulhu` (the GUI binary on `gpui-kit` from crates.io; it embeds the fonts in `assets/fonts`
   and the app icons in `assets/app-icon`, still GitButler's artwork until GitCthulhu's own replaces it).
 - App data and config identity is `gitcthulhu`. GitButler on-disk state (`.git/gitbutler/*`, `refs/gitbutler/*`,

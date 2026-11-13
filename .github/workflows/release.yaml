@@ -1,16 +1,20 @@
 name: Release
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Release {0}', inputs.tag) || github.event.pull_request.title }}
 
-# Pushing a tag that is a Semantic Versioning 2.0.0 version without a leading "v" (1.2.3, 1.2.3-rc.1)
-# builds the application for Windows, Linux and macOS and publishes the archives as a GitHub release.
+# Builds the application at a tag that is a Semantic Versioning 2.0.0 version without a leading "v"
+# (1.2.3, 1.2.3-rc.1) for Windows, Linux and macOS and publishes the archives as a GitHub release.
 # The tag must equal the version in crates/gitcthulhu/Cargo.toml: the application shows that version.
 # The builds are not code-signed. See DEVELOPMENT.md, section "Releasing".
+# Pushing the tag starts it: tag.yaml dispatches this workflow on master with `tag` set, so the release
+# builds save their Rust caches where the next release (and the dry runs) can restore them. It can also
+# be started by hand for an existing tag (Actions > Release > Run workflow, on master).
 on:
-  push:
-    tags:
-      # A coarse filter (these are globs, not regular expressions); the `check` job validates exactly.
-      - "[0-9]+.[0-9]+.[0-9]+"
-      - "[0-9]+.[0-9]+.[0-9]+-*"
-      - '[0-9]+.[0-9]+.[0-9]+\+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The version tag to build and publish (it must exist), e.g. 1.2.3
+        required: true
+        type: string
   # A dry run for changes to this file: everything is built and packaged, nothing is published.
   pull_request:
     paths:
@@ -20,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref }}-${{ inputs.tag }}
   # A newer push replaces a dry run; a release that started is never cancelled halfway.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -39,21 +43,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The tag (a tag that does not exist fails here); a dry run checks out the pull request.
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
           persist-credentials: false
       - name: Version of the release
         id: version
         env:
           EVENT_NAME: ${{ github.event_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           cargo_version="$(sed -n '/^\[package\]/,/^\[/ s/^version *= *"\(.*\)"/\1/p' crates/gitcthulhu/Cargo.toml | head -n 1)"
           if [ -z "${cargo_version}" ]; then
             echo "::error::No version found in crates/gitcthulhu/Cargo.toml."
             exit 1
           fi
-          if [ "${EVENT_NAME}" = "push" ] && [ "${REF_TYPE}" = "tag" ]; then
-            version="${REF_NAME}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${INPUT_TAG}"
             publish=true
           else
             version="${cargo_version}"
@@ -107,7 +112,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
           persist-credentials: false
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-${{ matrix.platform }}
+          # A release runs on master (dispatched by tag.yaml), so its cache serves the next release and the
+          # dry runs, which only restore it.
+          save-if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
       - name: Install Zig
         uses: $/.github/actions/setup-zig
         # The download picks a community mirror at random; one that hangs must not eat the job's time.

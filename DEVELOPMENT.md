@@ -58,8 +58,13 @@ on Linux three ref-name tests fail), so the commands above exclude it. CI runs i
 fixtures, and with `--target` also `target/` (never in a main checkout that seeds agent worktrees).
 
 CI (`.github/workflows/ci.yaml`): fmt; clippy, check, the terminal-free GUI check and the tests on Windows, Linux and
-macOS; the `gitcthulhu-git` suite in an Ubuntu 22.04 container with Git 2.34.1 and a German locale. It has not run
-yet for this branch (never pushed).
+macOS; the `gitcthulhu-git` suite in an Ubuntu 22.04 container with Git 2.34.1 and a German locale. It runs on pull
+requests and for every version tag, not on pushes to `master`. A tag push makes `.github/workflows/tag.yaml` dispatch
+CI on `master`, with the tag checked out (see "Releasing"). Only those runs on `master` save the Rust caches.
+GitHub scopes a cache to the ref that saved it, and a cache saved on `master` is the one every pull request and
+release can restore; pull requests only restore. To refresh the caches by hand, start CI on `master` from the Actions
+tab (Run workflow, empty `ref`) or with `gh workflow run ci.yaml --ref master`. Do this, for example, after GitHub
+evicted them: a cache is dropped after 7 days without use, or when the repository exceeds its cache quota.
 
 ## Build tooling for parallel worktrees
 
@@ -180,6 +185,14 @@ Features of the `gitcthulhu` crate:
 2. Tag that commit with the version itself, a [Semantic Versioning 2.0.0](https://semver.org) version without a
    leading `v`, and push the tag: `git tag 0.2.0 && git push origin 0.2.0`. A version with a pre-release part
    (`0.2.0-rc.1`) is published as a pre-release.
+
+The tag push runs `.github/workflows/tag.yaml`, which builds nothing. It dispatches two runs on `master`, both with the
+tag checked out: CI (named `CI refs/tags/<version>`) and the release (named `Release <version>`). This way their Rust
+caches are saved in `master`'s scope, so pull requests and the next release can restore them. A cache saved by a
+run on the tag would only serve that tag. As a consequence, the workflow files are the ones on `master` at that
+moment, not the tagged commit's. The release does not wait for CI. To start a release again for an existing tag,
+use Actions > Release > Run workflow on `master` with the tag, or run
+`gh workflow run release.yaml --ref master -f tag=<version>`.
 
 The workflow builds `cargo build --release --locked -p gitcthulhu` on Windows (x86_64), Linux (x86_64, on the oldest
 Ubuntu runner, so the binaries need glibc 2.35 or newer) and macOS (Apple silicon), and publishes a GitHub release

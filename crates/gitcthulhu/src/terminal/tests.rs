@@ -1054,6 +1054,21 @@ fn the_tab_names_the_shell_in_place_of_its_path() {
         r"C:\Program Files\PowerShell\7\pwsh.exe.bak",
         "only the whole path is replaced"
     );
+    assert_eq!(
+        title(r"Administrator: C:\Program Files\PowerShell\7\pwsh.exe"),
+        "PowerShell 7",
+        "an elevated console's prefix goes with the path"
+    );
+    assert_eq!(
+        title(r"管理者: C:\Program Files\PowerShell\7\pwsh.exe - git log"),
+        "PowerShell 7 - git log",
+        "whatever the prefix's language"
+    );
+    assert_eq!(
+        title(r"notes: C:\Program Files\PowerShell\7\pwsh.exe.bak"),
+        r"notes: C:\Program Files\PowerShell\7\pwsh.exe.bak",
+        "after a prefix too, only the whole path is replaced"
+    );
 }
 
 #[gpui_kit::test]

@@ -863,7 +863,8 @@ impl EntityInputHandler for TerminalView {
 }
 
 /// What the shell titled the terminal, or the shell's `name` while it set no title. A pseudoconsole titles it with the
-/// `program`'s path (cmd.exe adds " - <command>" while one runs), so that path reads as the `name`.
+/// `program`'s path (cmd.exe adds " - <command>" while one runs; an elevated console puts a localized
+/// "Administrator: " before it), so that path, with whatever prefix ends in ": ", reads as the `name`.
 pub(super) fn shown_title(title: &str, program: &str, name: &SharedString) -> SharedString {
     let title = title.trim();
     if title.is_empty() {
@@ -873,16 +874,22 @@ pub(super) fn shown_title(title: &str, program: &str, name: &SharedString) -> Sh
             name.clone()
         };
     }
-    let rest = title.get(program.len()..).unwrap_or_default();
-    let names_program = !program.is_empty()
-        && !name.is_empty()
-        && (rest.is_empty() || rest.starts_with(' '))
-        && title
-            .get(..program.len())
-            .is_some_and(|path| path.eq_ignore_ascii_case(program));
-    if names_program {
-        format!("{name}{rest}").into()
-    } else {
-        title.to_owned().into()
+    if program.is_empty() || name.is_empty() {
+        return title.to_owned().into();
+    }
+    // The path starts the title or follows a prefix's ": " (a path's own colon is followed by a separator).
+    let starts =
+        std::iter::once(0).chain(title.match_indices(": ").map(|(at, sep)| at + sep.len()));
+    let rest = starts
+        .filter(|&start| {
+            title
+                .get(start..start + program.len())
+                .is_some_and(|path| path.eq_ignore_ascii_case(program))
+        })
+        .filter_map(|start| title.get(start + program.len()..))
+        .find(|rest| rest.is_empty() || rest.starts_with(' '));
+    match rest {
+        Some(rest) => format!("{name}{rest}").into(),
+        None => title.to_owned().into(),
     }
 }

@@ -54,7 +54,7 @@ body:
     id: logs
     attributes:
       label: Relevant log output (Optional)
-      description: Please copy and paste any relevant log output. This will be automatically formatted into code, so no need for backticks.
+      description: Please copy and paste any relevant log output (the log file gitcthulhu.log; where to find it: see DEVELOPMENT.md, section Where GitCthulhu keeps its data). This will be automatically formatted into code, so no need for backticks.
       render: shell
     validations:
       required: false

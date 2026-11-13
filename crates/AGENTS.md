@@ -63,8 +63,12 @@ Fixed decisions (owner-approved). The virtual-branch code is gone; the new crate
 ## Database Migrations (`but-db`)
 
 - Keep migrations forward-compatible: stay on the current `SchemaVersion` and leave columns or tables that new
-  code stopped using in place. Bumping the version locks every older binary out of the database; reserve it for
-  planned, coordinated breaks, never routine cleanup.
+  code stopped using in place. `but-db` starts from a fresh GitCthulhu baseline (every table has one baseline
+  migration on `SchemaVersion::Zero`; there is no GitButler database to carry along). Bumping the version locks
+  every older binary out of the database, so switch migrations to the next variant (`SchemaVersion::One`) only
+  when an older binary must reject the
+  migrated data (dropping or repurposing persisted data it still reads), as a planned, coordinated break, never
+  as routine cleanup. The rules are in the `but-db` crate docs (`src/lib.rs`).
 
 ## Version Control
 

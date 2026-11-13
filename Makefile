@@ -32,10 +32,16 @@ clippy:
 .PHONY: test
 test: nextest
 
-# Run all tests in the entire workspace and show all failures in the end.
+# Run all maintained tests of the workspace and show all failures in the end. but-core's legacy GitButler-era
+# suite is excluded (known failures, decision D2); see test-legacy.
 .PHONY: nextest
 nextest:
-	cargo nextest run --workspace --no-fail-fast
+	cargo nextest run --workspace --exclude but-core --no-fail-fast
+
+# but-core's legacy suite: non-blocking, has known failures.
+.PHONY: test-legacy
+test-legacy:
+	cargo nextest run -p but-core --no-fail-fast
 
 # Format: clippy issues --allow-dirty allows the fix to be run even with a dirty
 # working tree which can technically cause code to break, but I've never seen it

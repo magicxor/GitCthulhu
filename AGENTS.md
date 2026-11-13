@@ -32,7 +32,8 @@ Apply all relevant instruction files. If instructions conflict, resolve them in 
 ## Build Prerequisites
 
 - Rust as pinned in `rust-toolchain.toml`.
-- Windows: the Windows SDK (`fxc.exe`). Linux GUI builds: libxcb, xkbcommon-x11 and fontconfig dev packages.
+- Windows: the Windows SDK (`fxc.exe`). Linux GUI builds: the dev packages listed in `DEVELOPMENT.md`.
+- Compile-time variables and cargo features (`GITCTHULHU_GITHUB_CLIENT_ID`, `GITCTHULHU_UPDATE_MANIFEST_URL`, `terminal`, `services`, `qa`): `DEVELOPMENT.md`, section "Build configuration".
 - `but-tty` builds libghostty-vt and needs Zig 0.17 on `PATH`. The `gitcthulhu` crate's default features include
   `terminal` (which depends on `but-tty`), so building the GUI needs Zig too; on a machine without Zig use
   `cargo check -p gitcthulhu --no-default-features --features services` (agents: a portable Zig is at

@@ -13,8 +13,9 @@ removed: it works with ordinary Git branches, the index and the working tree, li
 
 ## Status
 
-Under construction. The virtual-branch code and the old front ends are gone; the new backend (`gitcthulhu-git`),
-the undo log (`gitcthulhu-oplog`) and the GUI (`gitcthulhu`) are being built. There is no usable application yet.
+Milestones 1 and 2 are implemented: the repository view (commit graph, branches, tags, stashes, remotes), staging
+and committing, diffs, blame and file history, interactive rebase, undo/redo, the embedded terminal, AI commit
+messages, forge accounts with pull-request badges, worktrees and an update notice.
 
 ## Building
 
@@ -25,14 +26,32 @@ Requirements:
 - [Zig 0.17](https://ziglang.org/download/) on `PATH` (builds libghostty-vt for the embedded terminal, `but-tty`;
   the GUI's default `terminal` feature needs it). Without Zig, build the GUI without the terminal:
   `cargo build -p gitcthulhu --no-default-features --features services` (the Terminal button is then disabled).
-- Linux: libxcb, xkbcommon-x11, fontconfig and libdbus development packages
+  `--exclude but-tty` alone is not enough: the GUI's `terminal` feature pulls `but-tty` back in, so workspace-wide
+  commands also need `--exclude gitcthulhu`.
+- Linux: the development packages listed in [DEVELOPMENT.md](DEVELOPMENT.md) (libxcb, libx11-xcb, xkbcommon,
+  xkbcommon-x11, wayland, fontconfig, freetype, openssl and libdbus)
+- At runtime: a `git` executable on `PATH`, version 2.34.1 or newer
 
 ```sh
 cargo check --workspace --all-targets
-cargo test --workspace
+cargo test --workspace --exclude but-core
 ```
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for more.
+`but-core` still carries GitButler-era tests with known failures (decision D2); CI runs them non-blocking
+(`cargo test -p but-core`).
+
+## Running
+
+```sh
+cargo run -p gitcthulhu
+```
+
+or `cargo build --release -p gitcthulhu`: the binaries are in `target/release`. `gitcthulhu` (the GUI),
+`gitcthulhu-askpass` (credential helper) and `gitcthulhu-editor` (editor helper) must stay in the same directory.
+A redistributed package should also carry the font licences, `crates/gitcthulhu/assets/fonts/LICENSE-*.txt` (the
+About dialog shows them too).
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for more, including where the application keeps its data.
 
 ## License
 

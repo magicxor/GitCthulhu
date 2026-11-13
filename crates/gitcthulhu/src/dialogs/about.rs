@@ -114,6 +114,19 @@ pub const PROJECTS: [Project; 10] = [
     },
 ];
 
+/// The licence texts of the embedded fonts (SIL OFL 1.1 condition 2: every copy carries the copyright notice and
+/// the licence): title and text. The same files sit next to the font files in `assets/fonts`.
+pub const FONT_LICENSES: [(&str, &str); 2] = [
+    (
+        "Inter",
+        include_str!("../../assets/fonts/LICENSE-Inter.txt"),
+    ),
+    (
+        "Geist Mono Nerd Font Mono",
+        include_str!("../../assets/fonts/LICENSE-GeistMonoNerdFont.txt"),
+    ),
+];
+
 /// One line of the helper status: the text and whether the helper is usable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelperLine {
@@ -267,7 +280,27 @@ fn content(helpers: &[HelperLine], cx: &mut App) -> AnyElement {
                 .child(div().p(dp(16.)).text_body1().child(
                     "GitCthulhu has been possible thanks to the following open source projects:",
                 ))
-                .children(projects),
+                .children(projects)
+                .child(
+                    div()
+                        .p(dp(16.))
+                        .flex()
+                        .flex_col()
+                        .gap(dp(8.))
+                        .child(div().text_body1().semibold().child("Font licenses"))
+                        .children(FONT_LICENSES.iter().map(|(name, text)| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_body2().semibold().child(*name))
+                                .child(
+                                    div()
+                                        .text_caption()
+                                        .text_color(tokens.on_background_secondary)
+                                        .child(*text),
+                                )
+                        })),
+                ),
         )
         .child(
             div()
@@ -298,4 +331,34 @@ pub fn open(window: &mut Window, cx: &mut App) {
         },
         move |_, cx| content(&helpers, cx),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use core::prelude::v1::test;
+
+    use super::FONT_LICENSES;
+
+    #[test]
+    fn font_licenses_carry_the_copyright_notice_and_the_licence() {
+        let [(inter, inter_text), (geist, geist_text)] = FONT_LICENSES;
+        assert_eq!((inter, geist), ("Inter", "Geist Mono Nerd Font Mono"));
+        assert!(
+            inter_text.contains(
+                "Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)"
+            ),
+            "Inter's copyright notice"
+        );
+        assert!(
+            geist_text.contains("(C) 2023 Vercel"),
+            "Geist's copyright notice"
+        );
+        for text in [inter_text, geist_text] {
+            assert!(
+                text.contains("SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007")
+                    && text.contains("PERMISSION AND CONDITIONS"),
+                "the licence text itself, not only a link"
+            );
+        }
+    }
 }

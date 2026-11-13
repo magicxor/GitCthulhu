@@ -804,7 +804,8 @@ fn discard_through_a_lossless_filter_that_changes_the_line_count() {
     let env = TestEnv::new();
     let t = env.repo("r");
     t.git(&["config", "filter.hdr.clean", "{ echo HEADER; cat; }"]);
-    t.git(&["config", "filter.hdr.smudge", "sed 1d"]);
+    // In braces like the clean filter, so that it runs through Git's shell, which has `sed` on every platform.
+    t.git(&["config", "filter.hdr.smudge", "{ sed 1d; }"]);
     t.write(".gitattributes", b"f filter=hdr\n");
     t.write("f", b"a\nb\nc\n");
     t.commit_all("base");

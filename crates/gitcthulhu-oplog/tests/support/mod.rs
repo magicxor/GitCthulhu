@@ -14,6 +14,25 @@ use gitcthulhu_oplog::{
     PageRequest, Scope, UntrackedCapture,
 };
 
+/// The temp directory in the form Git reports paths in: `TEMP` may be an 8.3 short path on Windows
+/// (`C:/Users/RUNNER~1/...` on hosted runners) and is a symlink into `/private/var` on macOS, while Git
+/// prints worktree paths by the real one.
+fn canonical_temp_dir() -> PathBuf {
+    let temp = std::env::temp_dir();
+    let Ok(canonical) = std::fs::canonicalize(&temp) else {
+        return temp;
+    };
+    // Without the verbatim prefix Windows adds, which Git does not understand.
+    match canonical
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+    {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ if cfg!(windows) => temp,
+        _ => canonical,
+    }
+}
+
 /// A temporary repository created with `git init -b main`.
 pub struct Fixture {
     tmp: std::sync::Arc<tempfile::TempDir>,
@@ -26,7 +45,7 @@ impl Fixture {
     pub fn empty() -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("oplog")
-            .tempdir()
+            .tempdir_in(canonical_temp_dir())
             .expect("a temporary directory can be created");
         let path = tmp.path().join("repo");
         std::fs::create_dir_all(&path).expect("the repository directory can be created");

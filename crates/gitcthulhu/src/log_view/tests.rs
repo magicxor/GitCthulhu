@@ -691,15 +691,19 @@ fn chips_order_and_grouping(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn chip_double_click_checks_out(cx: &mut TestAppContext) {
+fn chip_click_selects_row_double_click_checks_out(cx: &mut TestAppContext) {
     let (handle, _app, tab) = mount_seeded(cx, RepoSeed::branchy(), DEFAULT_SIZE);
     let ui = ui_of(&tab, cx);
     // Row 2 = 'Feature work' with the 'feature' branch chip.
     frame(cx, handle, |window, cx| window.click(ids::chip(2, 0), cx));
     assert_eq!(
         cx.update(|cx| ui.read(cx).selection.clone()),
-        crate::tab::ui::Selection::UncommittedChanges,
-        "a chip swallows the click: the row is not selected"
+        crate::tab::ui::Selection::Commit {
+            id: oid(11),
+            is_stash: false,
+            scroll_to: false
+        },
+        "a click on a chip selects its row's commit"
     );
     frame(cx, handle, |window, cx| {
         window.double_click(ids::chip(2, 0), cx)

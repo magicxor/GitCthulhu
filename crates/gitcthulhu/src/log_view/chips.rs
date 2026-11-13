@@ -340,8 +340,10 @@ impl LogView {
                             .border_color(colors.lane),
                     )
                     .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                        // A chip swallows clicks: the row is not selected (08 §2.7.1).
+                        // A click on a chip selects its row like a click on the row itself; a double click also
+                        // checks the ref out. The chip handles the click, so the row's listener does not run again.
                         cx.stop_propagation();
+                        this.select_commit(click_chip.target, false, row, cx);
                         if ev.click_count() >= 2 {
                             this.checkout_chip(&click_chip, window, cx);
                         }

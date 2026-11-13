@@ -139,7 +139,36 @@ jobs:
           GITCTHULHU_GITHUB_CLIENT_ID: ${{ vars.GITCTHULHU_GITHUB_CLIENT_ID }}
           GITCTHULHU_UPDATE_MANIFEST_URL: ${{ vars.GITCTHULHU_UPDATE_MANIFEST_URL }}
           GITCTHULHU_CHANNEL: release
-        run: cargo build --release --locked -p gitcthulhu
+        run: |
+          # libghostty-vt-sys's build script downloads Ghostty (a partial git clone whose checkout fetches the
+          # files) and its Zig packages; a download that breaks off ("build.zig.zon:9:20: error: unable to unpack
+          # tarball to temporary directory: ReadFailed") fails the build. Such a build is retried: Cargo keeps what
+          # it compiled, the build script reuses a finished clone and Zig the packages it already has, so a retry
+          # repeats only the download. Any other error (a compile error, a bad manifest, a 404) fails at once.
+          log="${RUNNER_TEMP}/cargo-build.log"
+          # The transport errors of Zig's package fetch (lib/compiler/Maker/Fetch.zig in Zig 0.17); a read that
+          # breaks off mid-stream surfaces as ReadFailed while unpacking.
+          zig_download='build\.zig\.zon:[0-9]+:[0-9]+: error: (server connection failed|HTTP request failed|HTTP response read failure|invalid HTTP response|bad HTTP response code: .(5[0-9][0-9]|429) |unable to (discover remote git server capabilities|list refs|create fetch stream)|unable to (unpack tarball to temporary directory|decompress tarball|unpack git files): ReadFailed)'
+          # A failed clone or checkout of Ghostty counts only together with one of Git's transport errors.
+          git_step='git (clone ghostty|checkout ghostty commit) failed'
+          git_download='fatal: unable to access|RPC failed|early EOF|the remote end hung up unexpectedly|could not fetch [0-9a-f]+ from promisor remote'
+          download_failed() {
+            grep -Eq "${zig_download}" "${log}" || { grep -Eq "${git_step}" "${log}" && grep -Eq "${git_download}" "${log}"; }
+          }
+          for attempt in 1 2 3; do
+            if cargo build --release --locked -p gitcthulhu 2>&1 | tee "${log}"; [ "${PIPESTATUS[0]}" -eq 0 ]; then
+              exit 0
+            fi
+            if ! download_failed; then
+              exit 1
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "::warning::Downloading Ghostty's dependencies failed (attempt ${attempt} of 3); retrying."
+              sleep 30
+            fi
+          done
+          echo "::error::Downloading Ghostty's dependencies failed 3 times."
+          exit 1
       - name: Package
         env:
           VERSION: ${{ needs.check.outputs.version }}

@@ -172,6 +172,9 @@ pub fn unstage_all(
 ///   --worktree`, which deletes staged new files), or with an unborn HEAD removes the entries from the index
 ///   (`git rm --cached -r -q`) and deletes their files.
 ///
+/// A path that would delete a nested repository (a directory with a `.git` entry at or below it) is refused with
+/// [`GitError::NestedRepository`] before anything changes, unless `allow_nested` (the user agreed to lose it).
+///
 /// Refresh: `STATUS`, plus `REPO_STATE` if a conflicted path was discarded.
 pub fn discard_paths(
     repo: &Repo,
@@ -179,6 +182,7 @@ pub fn discard_paths(
     ctx: &OpContext,
     paths: &[RelaPath],
     mode: DiscardMode,
+    allow_nested: bool,
 ) -> Result<OpOutcome<()>> {
     ctx.cancel.check()?;
     let workdir = require_workdir(repo)?.to_owned();
@@ -207,6 +211,9 @@ pub fn discard_paths(
         .iter()
         .map(|path| content::writable_worktree_path(&workdir, path.as_ref()))
         .collect::<Result<Vec<_>>>()?;
+    if !allow_nested {
+        refuse_nested_repositories(&untracked_targets)?;
+    }
 
     let mut run = Run::default();
     if !conflicted.is_empty() {
@@ -228,6 +235,9 @@ pub fn discard_paths(
                         .iter()
                         .map(|path| content::writable_worktree_path(&workdir, path.as_ref()))
                         .collect::<Result<Vec<_>>>()?;
+                    if !allow_nested {
+                        refuse_nested_repositories(&targets)?;
+                    }
                     let cmd = GitCommand::new(repo, CommandKind::Mutation)
                         .args(["rm", "--cached", "-r", "-q"])
                         .pathspecs(&tracked);
@@ -254,13 +264,15 @@ pub fn discard_paths(
 
 /// Delete untracked files and directories with `std::fs`, after verifying that every path is untracked (no index
 /// entry at or below it) and inside the worktree (no `..`, no `.git`, no symlink escape). Nothing is deleted if any
-/// path fails the checks; a tracked path is refused with `InvalidName { what: "untracked path" }`.
+/// path fails the checks; a tracked path is refused with `InvalidName { what: "untracked path" }`, a path that holds
+/// a nested repository with [`GitError::NestedRepository`] unless `allow_nested` (the user agreed to lose it).
 /// Refresh: `STATUS`.
 pub fn delete_untracked(
     repo: &Repo,
     _perm: &mut RepoExclusive,
     ctx: &OpContext,
     paths: &[RelaPath],
+    allow_nested: bool,
 ) -> Result<OpOutcome<()>> {
     ctx.cancel.check()?;
     let workdir = require_workdir(repo)?.to_owned();
@@ -278,6 +290,9 @@ pub fn delete_untracked(
             });
         }
         targets.push(content::writable_worktree_path(&workdir, path.as_ref())?);
+    }
+    if !allow_nested {
+        refuse_nested_repositories(&targets)?;
     }
     for target in &targets {
         remove_worktree_item(target)?;
@@ -1092,6 +1107,84 @@ fn copy_permissions(
     // Windows has no executable bit; a read-only flag is not copied, as the rename could not replace such a file
     // afterwards anyway.
     Ok(())
+}
+
+/// The nested repositories that deleting the untracked `paths` with [`delete_untracked`] or [`discard_paths`] would
+/// take with them: every directory at or below one of the paths that holds a `.git` entry (a nested repository, or
+/// a work tree whose `.git` file points elsewhere), worktree-relative, sorted. These are exactly what those
+/// functions refuse without `allow_nested`, so a caller names them in its question before it passes the flag. Links
+/// are not followed; a missing path holds none. Read-only (no lock needed).
+///
+/// Errors: `BareRepository`, `InvalidName` (a path outside the worktree), `Io`.
+pub fn nested_repositories(repo: &Repo, paths: &[RelaPath]) -> Result<Vec<RelaPath>> {
+    let workdir = require_workdir(repo)?.to_owned();
+    validate_paths(paths)?;
+    let targets = paths
+        .iter()
+        .map(|path| content::writable_worktree_path(&workdir, path.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+    // A directory that cannot be named is an error, never left out of the caller's question.
+    let mut out = find_nested_repositories(&targets, false)?
+        .into_iter()
+        .map(|dir| {
+            dir.strip_prefix(&workdir)
+                .ok()
+                .and_then(|rela| gix::path::into_bstr(rela).ok())
+                .map(|rela| gix::path::to_unix_separators_on_windows(rela).into_owned())
+                .ok_or_else(|| GitError::NestedRepository { path: dir.clone() })
+        })
+        .collect::<Result<Vec<RelaPath>>>()?;
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// `NestedRepository` for the first of `targets` that is, or holds below it, a directory with a `.git` entry (a
+/// nested repository or a submodule work tree): `remove_dir_all` would delete its history, and snapshots never
+/// capture nested repositories. Links are not followed, as [`remove_worktree_item`] does not follow them either.
+fn refuse_nested_repositories(targets: &[PathBuf]) -> Result<()> {
+    match find_nested_repositories(targets, true)?.into_iter().next() {
+        Some(path) => Err(GitError::NestedRepository { path }),
+        None => Ok(()),
+    }
+}
+
+/// The directories at or below `targets` that hold a `.git` entry (not descended into further; links not
+/// followed), only the first one if `first_only`.
+fn find_nested_repositories(targets: &[PathBuf], first_only: bool) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for target in targets {
+        let mut pending = match std::fs::symlink_metadata(target) {
+            Ok(md) if md.is_dir() => vec![target.clone()],
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(GitError::io(target, err)),
+        };
+        while let Some(dir) = pending.pop() {
+            let mut subdirs = Vec::new();
+            let mut is_repository = false;
+            let entries = std::fs::read_dir(&dir).map_err(|err| GitError::io(&dir, err))?;
+            for entry in entries {
+                let entry = entry.map_err(|err| GitError::io(&dir, err))?;
+                if entry.file_name().eq_ignore_ascii_case(".git") {
+                    is_repository = true;
+                    break;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    subdirs.push(entry.path());
+                }
+            }
+            if is_repository {
+                found.push(dir);
+                if first_only {
+                    return Ok(found);
+                }
+            } else {
+                pending.extend(subdirs);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Remove a file, a symlink (not its target) or a whole directory. A path that is already gone is fine.

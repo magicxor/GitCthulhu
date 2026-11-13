@@ -317,6 +317,15 @@ impl TestRepo {
         std::fs::write(&path, content).expect("file can be written");
     }
 
+    /// Whether the index holds sparse directory entries (`git ls-files --sparse` needs Git 2.35).
+    pub fn index_is_sparse(&self) -> bool {
+        gix::open(&self.path)
+            .expect("the repository opens")
+            .index_or_empty()
+            .expect("the index can be read")
+            .is_sparse()
+    }
+
     /// Read a file.
     pub fn read(&self, rela: &str) -> Vec<u8> {
         std::fs::read(self.path.join(rela)).expect("file can be read")

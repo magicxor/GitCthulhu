@@ -268,6 +268,9 @@ pub enum SkipReason {
     Unreadable,
     /// `OplogOptions::capture_untracked == false`.
     CaptureDisabled,
+    /// A directory holding a nested Git repository (a `.git` entry): snapshots never capture one, so deleting it
+    /// loses its history for good. Only reported by `Oplog::preview_skipped`.
+    NestedRepository,
 }
 
 /// A sequencer operation in progress, mirroring [`gix::state::InProgress`].

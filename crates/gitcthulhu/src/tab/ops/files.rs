@@ -2,6 +2,9 @@
 //! untracked files and resolving conflicts. Operations that can lose untracked files record a snapshot that
 //! captures them and ask first when the snapshot cannot hold them.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use gpui_kit::{Context, Window};
 
 use super::{OpKind, OpSpec, Prepared};
@@ -10,7 +13,7 @@ use crate::backend::present::{OpFailure, confirm_unrestorable};
 use crate::backend::prompt::Asker;
 use crate::backend::{
     ByteSlice as _, DiscardMode, OperationDescriptor, OperationKind, RefreshSet, RelaPath,
-    Resolution, Scope, SelectionRequest, UntrackedCapture, git,
+    Resolution, Scope, SelectionRequest, SkipReason, SkippedFile, UntrackedCapture, git,
 };
 use crate::tab::RepoTab;
 
@@ -89,11 +92,15 @@ impl RepoTab {
             scope: Scope::Full,
             untracked: UntrackedCapture::Paths(paths.clone()),
         };
+        let nested_agreed = NestedAgreed::default();
+        let agreed = nested_agreed.clone();
         let spec = OpSpec::new(OpKind::DiscardFile, move |env| {
             let (repo, ctx) = (env.repo, env.ctx);
-            git::stage::discard_paths(repo, env.perm(), ctx, &paths, mode)
+            git::stage::discard_paths(repo, env.perm(), ctx, &paths, mode, agreed.get())
         })
-        .prepare(move |handle, asker| confirm_untracked_loss(handle, asker, &title, &untracked))
+        .prepare(move |handle, asker| {
+            confirm_untracked_loss(handle, asker, &title, &untracked, Some(&nested_agreed))
+        })
         .record(descriptor)
         .base_refresh(RefreshSet::STATUS | RefreshSet::REPO_STATE);
         self.run_op(spec, window, cx)
@@ -223,7 +230,9 @@ impl RepoTab {
             let (repo, ctx) = (env.repo, env.ctx);
             git::stage::discard_selection(repo, env.perm(), ctx, &req)
         })
-        .prepare(move |handle, asker| confirm_untracked_loss(handle, asker, &title, &confirm_paths))
+        .prepare(move |handle, asker| {
+            confirm_untracked_loss(handle, asker, &title, &confirm_paths, None)
+        })
         .record(descriptor)
         .base_refresh(RefreshSet::STATUS);
         self.run_op(spec, window, cx)
@@ -246,11 +255,15 @@ impl RepoTab {
             untracked: UntrackedCapture::Paths(paths.clone()),
         };
         let confirm_paths = paths.clone();
+        let nested_agreed = NestedAgreed::default();
+        let agreed = nested_agreed.clone();
         let spec = OpSpec::new(OpKind::DeleteFile, move |env| {
             let (repo, ctx) = (env.repo, env.ctx);
-            git::stage::delete_untracked(repo, env.perm(), ctx, &paths)
+            git::stage::delete_untracked(repo, env.perm(), ctx, &paths, agreed.get())
         })
-        .prepare(move |handle, asker| confirm_untracked_loss(handle, asker, &title, &confirm_paths))
+        .prepare(move |handle, asker| {
+            confirm_untracked_loss(handle, asker, &title, &confirm_paths, Some(&nested_agreed))
+        })
         .record(descriptor)
         .base_refresh(RefreshSet::STATUS);
         self.run_op(spec, window, cx)
@@ -283,23 +296,70 @@ impl RepoTab {
     }
 }
 
+/// Set by `prepare` once the user agreed to lose the listed untracked paths; the backend call passes it as its
+/// `allow_nested` flag, so a nested repository the user was not asked about is refused there.
+#[derive(Clone, Default)]
+pub(crate) struct NestedAgreed(Arc<AtomicBool>);
+
+impl NestedAgreed {
+    pub(crate) fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// The `prepare` step of every operation that deletes untracked files (discard, delete, `stash push -u`): asks
 /// first when the snapshot would not hold them. `preview_skipped` fails closed: a repository without an oplog,
 /// with undo history switched off, or whose probe failed holds nothing, so every path is reported as unrestorable
 /// (32 review, T6). The runner refuses to run such an operation when the snapshot itself then fails.
+///
+/// `nested`: the operation deletes the nested repositories among the paths (discard, delete), which are always asked
+/// about, by name, also when the preview fails closed (undo history off, no oplog): they come from the same walk the
+/// backend refuses on (`stage::nested_repositories`). The agreement is stored there only if that walk succeeded, so
+/// the question named every repository the backend would otherwise refuse. `None` (`stash push -u`, which leaves
+/// nested repositories alone, or a single file): they are not reported.
 pub(crate) fn confirm_untracked_loss(
     handle: &RepoHandle,
     asker: &Asker,
     title: &str,
     untracked: &[RelaPath],
+    nested: Option<&NestedAgreed>,
 ) -> Result<Prepared, OpFailure> {
     if untracked.is_empty() {
         return Ok(Prepared::Continue { untracked: None });
     }
-    let skipped = handle.preview_skipped(untracked);
-    if skipped.is_empty() || asker.confirm(confirm_unrestorable(title, &skipped)) {
-        Ok(Prepared::Continue { untracked: None })
-    } else {
-        Ok(Prepared::Cancelled)
+    let mut skipped = handle.preview_skipped(untracked);
+    let mut nested_named = false;
+    match nested {
+        None => skipped.retain(|s| s.reason != SkipReason::NestedRepository),
+        Some(_) => match git::stage::nested_repositories(&handle.repo, untracked) {
+            Ok(repositories) => {
+                // A path the fail-closed preview lists itself is the repository: named once, as such.
+                let trimmed = |path: &RelaPath| RelaPath::from(path.trim_end_with(|c| c == '/'));
+                skipped.retain(|s| {
+                    s.reason != SkipReason::NestedRepository
+                        && !repositories.contains(&trimmed(&s.path))
+                });
+                skipped.extend(repositories.into_iter().map(|path| SkippedFile {
+                    path,
+                    size: 0,
+                    reason: SkipReason::NestedRepository,
+                }));
+                nested_named = true;
+            }
+            // The backend then refuses the repositories itself (`allow_nested` stays off).
+            Err(err) => tracing::warn!("cannot look for nested repositories: {err}"),
+        },
     }
+    if skipped.is_empty() {
+        return Ok(Prepared::Continue { untracked: None });
+    }
+    if !asker.confirm(confirm_unrestorable(title, &skipped)) {
+        return Ok(Prepared::Cancelled);
+    }
+    if let Some(nested) = nested
+        && nested_named
+    {
+        nested.0.store(true, Ordering::Release);
+    }
+    Ok(Prepared::Continue { untracked: None })
 }

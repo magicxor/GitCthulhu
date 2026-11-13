@@ -375,7 +375,8 @@ impl Oplog {
 
     /// Which of the given untracked `paths` (worktree-relative; directories expand to the untracked files below them)
     /// a capture would skip, and why: size > untracked_file_limit (TooLarge), unreadable (Unreadable), capture disabled
-    /// (CaptureDisabled). `OverBudget` is not predicted (the budget depends on the set; reported by `prepare`).
+    /// (CaptureDisabled), an untracked nested repository (NestedRepository, never captured). `OverBudget` is not
+    /// predicted (the budget depends on the set; reported by `prepare`).
     /// stat + open probe only; no hashing, no lock. The GUI calls it before taking the guard (§4.4).
     pub fn preview_skipped(
         &self,

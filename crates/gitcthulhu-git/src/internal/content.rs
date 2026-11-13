@@ -11,6 +11,7 @@
 //!   the NUL heuristic) for both the displayed diff and the partial operations.
 //!
 //! Sizes are checked before reading (`find_header` / `metadata().len()`), so a side above the limit costs no read.
+//! In a partial clone, [`fetch_missing_objects`] first lets Git fetch the objects that are not present locally.
 
 use std::{
     io::Read,
@@ -20,7 +21,11 @@ use std::{
 use bstr::{BStr, ByteSlice};
 use gix::{ObjectId, index::entry::Stage};
 
-use crate::{BlobSide, EntryKind, GitError, Result, Side};
+use crate::{
+    BlobSide, CancelToken, EntryKind, GitError, OpClass, OpContext, PostState, Repo, Result, Side,
+    cli::{self, CommandKind, GitCommand},
+    error::classify,
+};
 
 /// One side of a diff plus the bytes the line engine needs.
 #[derive(Debug, Clone)]
@@ -110,6 +115,76 @@ pub(crate) fn head_entry(repo: &gix::Repository, path: &BStr) -> Result<Option<S
         return Ok(None);
     }
     tree_entry(repo, tree, path)
+}
+
+/// Make the objects `ids` readable by gix in a partial clone (`extensions.partialClone`, or a remote with
+/// `promisor = true`). Git fetches objects that are missing locally (after `clone --filter=blob:none` the blobs of
+/// older commits) from the promisor remote on demand; gix does not. Missing objects are looked up by
+/// `git cat-file --batch-check` (several, one process) or `git cat-file -s <id>`, which trigger Git's lazy fetch
+/// (credential helpers apply; prompts are refused).
+///
+/// Nothing runs outside partial clones or when every object is present. Errors: `Cancelled`, and the classified
+/// failure of the fetch (`Network`, `AuthFailed`, ...).
+pub(crate) fn fetch_missing_objects(
+    repo: &Repo,
+    ids: &[ObjectId],
+    cancel: &CancelToken,
+) -> Result<()> {
+    let g = repo.local();
+    let mut missing: Vec<ObjectId> = ids
+        .iter()
+        .filter(|id| !id.is_null() && !g.has_object(id))
+        .copied()
+        .collect();
+    if missing.is_empty() || !is_partial_clone(&g) {
+        return Ok(());
+    }
+    missing.sort();
+    missing.dedup();
+    let ctx = OpContext::silent(cancel.clone());
+    let lazy_fetching = |cmd: GitCommand| {
+        let mut cmd = cmd;
+        // A user's `GIT_NO_LAZY_FETCH=1` would turn the fetch off.
+        cmd.extra_env.push(("GIT_NO_LAZY_FETCH".into(), "0".into()));
+        cmd
+    };
+    if missing.len() > 1 {
+        let mut cmd = lazy_fetching(
+            GitCommand::new(repo, CommandKind::Network).args(["cat-file", "--batch-check"]),
+        );
+        cmd.stdin = Some(
+            missing
+                .iter()
+                .map(|id| format!("{id}\n"))
+                .collect::<String>()
+                .into(),
+        );
+        // An object it could not fetch is reported as missing; the single lookups below name the failure.
+        cli::run(repo.runtime(), cmd, &ctx)?;
+        missing.retain(|id| !g.has_object(id));
+    }
+    for id in missing {
+        let cmd = lazy_fetching(
+            GitCommand::new(repo, CommandKind::Network)
+                .args(["cat-file", "-s"])
+                .arg(id.to_string()),
+        );
+        let out = cli::run(repo.runtime(), cmd, &ctx)?;
+        if !out.success() {
+            return Err(classify(OpClass::Fetch, &out, &PostState::default()));
+        }
+    }
+    Ok(())
+}
+
+/// Whether Git may fetch missing objects on demand: `extensions.partialClone` or any `remote.<name>.promisor`.
+pub(crate) fn is_partial_clone(repo: &gix::Repository) -> bool {
+    let config = repo.config_snapshot();
+    config.string("extensions.partialClone").is_some()
+        || repo
+            .remote_names()
+            .iter()
+            .any(|name| config.boolean(format!("remote.{name}.promisor").as_str()) == Some(true))
 }
 
 /// Read the object side `side`. Submodules and trees (a directory entry of a sparse index) are not read. If the

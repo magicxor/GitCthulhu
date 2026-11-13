@@ -368,10 +368,13 @@ pub fn post_hook_warning(
 }
 
 /// "Some files can't be restored by Undo" confirmation before an operation that would lose untracked files the
-/// snapshot cannot hold.
+/// snapshot cannot hold. Nested Git repositories are listed first and named in the message: their whole history goes.
 pub fn confirm_unrestorable(op_title: &str, skipped: &[SkippedFile]) -> ConfirmRequest {
+    let is_nested = |s: &&SkippedFile| s.reason == SkipReason::NestedRepository;
     let details = skipped
         .iter()
+        .filter(is_nested)
+        .chain(skipped.iter().filter(|s| !is_nested(s)))
         .take(MAX_LISTED_PATHS)
         .map(|s| {
             let why = match s.reason {
@@ -379,18 +382,30 @@ pub fn confirm_unrestorable(op_title: &str, skipped: &[SkippedFile]) -> ConfirmR
                 SkipReason::OverBudget => "over the capture budget",
                 SkipReason::Unreadable => "cannot be read",
                 SkipReason::CaptureDisabled => "capturing untracked files is off",
+                SkipReason::NestedRepository => "contains a Git repository",
             };
             SharedString::from(format!("{} ({why})", s.path.to_str_lossy()))
         })
         .collect();
     let count = skipped.len();
     let files = if count == 1 { "file" } else { "files" };
+    let message = match skipped.iter().filter(is_nested).count() {
+        0 => format!("{op_title}: {count} untracked {files} can't be restored by Undo. Continue?"),
+        nested => {
+            let repositories = if nested == 1 {
+                "a Git repository".to_owned()
+            } else {
+                format!("{nested} Git repositories")
+            };
+            format!(
+                "{op_title}: {count} untracked items can't be restored by Undo, including {repositories} with all \
+                 commits, stashes and uncommitted files. Continue?"
+            )
+        }
+    };
     ConfirmRequest {
         title: "Some files can't be restored by Undo".into(),
-        message: format!(
-            "{op_title}: {count} untracked {files} can't be restored by Undo. Continue?"
-        )
-        .into(),
+        message: message.into(),
         details,
         confirm_label: "Continue".into(),
         cancel_label: "Cancel".into(),

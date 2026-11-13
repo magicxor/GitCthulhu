@@ -142,9 +142,11 @@ fn scan_with_gix(
 }
 
 /// Every file below `dir` whose path relative to the common dir is a valid reference name, as `(path, name)`.
-/// A missing directory has no references.
+/// A missing directory has no references. Symbolic links are followed, as Git does (old repositories may link
+/// loose reference files); a linked directory is entered once, so a link cycle ends.
 fn collect_loose_paths(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, FullName)>) -> Result<()> {
     let mut pending = vec![(dir.to_owned(), BString::from(prefix))];
+    let mut linked_dirs = std::collections::HashSet::new();
     while let Some((dir, name_prefix)) = pending.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -153,9 +155,22 @@ fn collect_loose_paths(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, FullNam
         };
         for entry in entries {
             let entry = entry.map_err(|err| GitError::io(&dir, err))?;
-            let Ok(file_type) = entry.file_type() else {
+            let Ok(mut file_type) = entry.file_type() else {
                 continue;
             };
+            if file_type.is_symlink() {
+                // A dangling link is no reference.
+                let Ok(target) = std::fs::metadata(entry.path()) else {
+                    continue;
+                };
+                if target.is_dir()
+                    && !std::fs::canonicalize(entry.path())
+                        .is_ok_and(|canonical| linked_dirs.insert(canonical))
+                {
+                    continue;
+                }
+                file_type = target.file_type();
+            }
             let file_name = entry.file_name();
             // Names are bytes on Unix (as in gix); on Windows a name that is no UTF-8 cannot be a reference.
             let Ok(file_name) = gix::path::os_str_into_bstr(&file_name) else {
@@ -408,6 +423,48 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "sorted by name");
+    }
+
+    /// Git follows symbolic links to loose reference files and directories; a link cycle ends.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_loose_refs_are_followed() {
+        let repo = fixture::repo();
+        repo.write("f", "1\n");
+        repo.git(&["add", "f"]);
+        repo.git(&["commit", "-q", "-m", "one"]);
+        let head = repo.git(&["rev-parse", "HEAD"]);
+        let elsewhere = repo.path.join(".git/elsewhere");
+        std::fs::create_dir_all(elsewhere.join("group")).expect("writable");
+        std::fs::write(elsewhere.join("file-ref"), format!("{head}\n")).expect("writable");
+        std::fs::write(elsewhere.join("group/inner"), format!("{head}\n")).expect("writable");
+        let heads = repo.path.join(".git/refs/heads");
+        std::os::unix::fs::symlink(elsewhere.join("file-ref"), heads.join("linked"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(elsewhere.join("group"), heads.join("group")).expect("symlink");
+        std::os::unix::fs::symlink(&heads, elsewhere.join("group/cycle")).expect("symlink");
+        std::os::unix::fs::symlink(elsewhere.join("missing"), heads.join("dangling"))
+            .expect("symlink");
+
+        let gix_repo = gix::open(&repo.path).expect("the repository opens");
+        let names: Vec<String> = with_scan(&gix_repo, RefNamespace::LocalBranches)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for expected in [
+            "refs/heads/linked",
+            "refs/heads/group/inner",
+            "refs/heads/main",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "{expected} is listed: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|name| name.ends_with("dangling")),
+            "a dangling link is no reference: {names:?}"
+        );
     }
 
     #[test]

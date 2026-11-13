@@ -1395,3 +1395,154 @@ fn perf_file_diff_50k_lines() {
         );
     }
 }
+
+/// A blob:none partial clone lacks the blobs of older commits; Git fetches them from the promisor remote on demand,
+/// and so must the diff (and `read_blob`).
+#[test]
+fn commit_diff_in_a_partial_clone_fetches_missing_blobs() {
+    let env = TestEnv::new();
+    let origin = env.repo("origin");
+    origin.git(&["config", "uploadpack.allowFilter", "true"]);
+    for i in 1..=4 {
+        origin.write(
+            "f",
+            numbered(10).replace("line 5\n", &format!("version {i}\n")),
+        );
+        origin.commit_all(&format!("version {i}"));
+    }
+    let url = format!(
+        "file:///{}",
+        origin
+            .path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    let clone_dir = env.path("partial");
+    let clone = TestRepo::init_with(
+        &env,
+        &clone_dir,
+        &["clone", "-q", "--filter=blob:none", &url, "."],
+    );
+    let middle = rev(&clone, "HEAD~1");
+    let missing = clone.git(&["rev-list", "--objects", "--all", "--missing=print"]);
+    assert!(
+        missing.lines().any(|line| line.starts_with('?')),
+        "older blobs are missing locally: {missing}"
+    );
+    let files = diff::commit_files(
+        &clone.open(),
+        middle,
+        Against::FirstParent,
+        CommitFilesOptions::default(),
+    )
+    .expect("the file list needs no blobs");
+    assert_eq!(files.len(), 1, "one changed file");
+
+    let target = DiffTarget::Commit {
+        commit: middle,
+        against: Against::FirstParent,
+        path: "f".into(),
+        previous_path: None,
+    };
+    let d = file_diff(&clone, &target, &DiffOptions::default());
+    assert_eq!(
+        render(text(&d))
+            .into_iter()
+            .filter(|line| !line.starts_with(' '))
+            .collect::<Vec<_>>(),
+        ["-version 2", "+version 3"],
+        "the diff of an older commit is computed from the fetched blobs"
+    );
+
+    let older_blob = rev(&clone, "HEAD~2:f");
+    let missing = clone.git(&["rev-list", "--objects", "--all", "--missing=print"]);
+    assert!(
+        !missing
+            .lines()
+            .any(|line| line.starts_with('?') && line.ends_with(&older_blob.to_string())),
+        "the diff fetched the old blob"
+    );
+    let first_blob = rev(&clone, "HEAD~3:f");
+    assert!(
+        missing.lines().any(|line| line == format!("?{first_blob}")),
+        "the first version is still missing: {missing}"
+    );
+    let bytes = diff::read_blob(&clone.open(), first_blob, u64::MAX).expect("fetched and read");
+    assert!(
+        bytes.windows(9).any(|w| w == b"version 1"),
+        "read_blob fetches a missing blob"
+    );
+}
+
+/// The commit file list of a partial clone tracks renames, which compares the contents of the deleted and the added
+/// file: the blobs the rename detection needs are fetched as well.
+#[test]
+fn commit_files_in_a_partial_clone_track_renames() {
+    let env = TestEnv::new();
+    let origin = env.repo("origin");
+    origin.git(&["config", "uploadpack.allowFilter", "true"]);
+    origin.write("a.txt", numbered(30));
+    origin.write("x.txt", numbered(40));
+    origin.commit_all("add a and x");
+    std::fs::remove_file(origin.path.join("a.txt")).expect("removable");
+    std::fs::remove_file(origin.path.join("x.txt")).expect("removable");
+    origin.write("b.txt", numbered(30).replace("line 7\n", "seven\n"));
+    origin.write("y.txt", numbered(40).replace("line 9\n", "nine\n"));
+    origin.commit_all("move a to b and x to y, with edits");
+    origin.write("c.txt", "c\n");
+    origin.commit_all("add c");
+    let url = format!(
+        "file:///{}",
+        origin
+            .path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    let clone_dir = env.path("partial");
+    let clone = TestRepo::init_with(
+        &env,
+        &clone_dir,
+        &["clone", "-q", "--filter=blob:none", &url, "."],
+    );
+    let old_a = rev(&clone, "HEAD~2:a.txt");
+    let missing = clone.git(&["rev-list", "--objects", "--all", "--missing=print"]);
+    assert!(
+        missing.lines().any(|line| line == format!("?{old_a}")),
+        "the deleted blob is missing locally: {missing}"
+    );
+    let files = diff::commit_files(
+        &clone.open(),
+        rev(&clone, "HEAD~1"),
+        Against::FirstParent,
+        CommitFilesOptions::default(),
+    )
+    .expect("the rename detection fetches what it compares");
+    let renames: Vec<_> = files
+        .iter()
+        .map(|file| {
+            (
+                file.kind,
+                file.previous_path.as_ref().map(ToString::to_string),
+                file.path.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        renames,
+        [
+            (
+                ChangeKind::Renamed,
+                Some("a.txt".to_owned()),
+                "b.txt".to_owned()
+            ),
+            (
+                ChangeKind::Renamed,
+                Some("x.txt".to_owned()),
+                "y.txt".to_owned()
+            ),
+        ],
+        "both renames are found"
+    );
+}

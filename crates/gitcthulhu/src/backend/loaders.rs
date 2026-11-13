@@ -6,16 +6,22 @@ use std::time::Duration;
 use super::handle::RepoHandle;
 use super::{
     AheadBehind, CancelToken, ConfigScope, FileStamp, GitError, IdentityInfo, ObjectId, RefList,
-    RefListOptions, RefreshSet, RelaPath, Repo, RepoState, Status, StatusOptions, SubmoduleInfo,
-    WorktreeInfo,
+    RefListOptions, RefreshSet, RelaPath, RenameMode, Repo, RepoState, Status, StatusOptions,
+    SubmoduleInfo, WorktreeInfo,
 };
 
 /// Ahead/behind walks stop after this many commits per side ("999+" style display).
 pub const AHEAD_BEHIND_CAP: u32 = 10_000;
 
-/// `status::status` with `StatusOptions::default()`.
+/// `status::status` with `StatusOptions::default()` but staged renames only (`RenameMode::IndexOnly`, like
+/// `git status`): tracking worktree renames repeats the index-worktree half and hashes every untracked file whenever
+/// a tracked file is deleted, seconds per watcher tick in a large repository.
 pub fn status(repo: &Repo, cancel: &CancelToken) -> Result<Status, GitError> {
-    gitcthulhu_git::status::status(repo, &StatusOptions::default(), cancel)
+    let opts = StatusOptions {
+        renames: RenameMode::IndexOnly,
+        ..StatusOptions::default()
+    };
+    gitcthulhu_git::status::status(repo, &opts, cancel)
 }
 
 /// `state::repo_state`.
@@ -94,4 +100,49 @@ pub fn refresh_index(
         return Ok(None);
     };
     gitcthulhu_git::status::refresh_index(&handle.repo, guard.write_permission(), cancel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::ChangeKind;
+    use crate::test_support::fixture::Fixture;
+
+    /// A deleted tracked file next to an untracked copy stays a deletion plus an untracked file (the costly worktree
+    /// rename pass does not run); a staged rename is still found.
+    #[test]
+    fn status_tracks_staged_renames_only() {
+        let fx = Fixture::new();
+        fx.write("old.txt", "the same content\n");
+        fx.write("moved.txt", "staged rename\n");
+        fx.commit_all("base");
+        std::fs::remove_file(fx.path().join("old.txt")).expect("removable");
+        fx.write("copy.txt", "the same content\n");
+        fx.git(&["mv", "moved.txt", "renamed.txt"]);
+        let repo = Repo::open(&fx.runtime(), fx.path()).expect("the fixture opens");
+        let status = status(&repo, &CancelToken::new()).expect("status");
+        let unstaged: Vec<_> = status
+            .unstaged
+            .iter()
+            .map(|e| (e.path.to_string(), e.kind))
+            .collect();
+        assert_eq!(
+            unstaged,
+            [
+                ("copy.txt".to_owned(), ChangeKind::Untracked),
+                ("old.txt".to_owned(), ChangeKind::Deleted),
+            ],
+            "no worktree rename"
+        );
+        let staged: Vec<_> = status
+            .staged
+            .iter()
+            .map(|e| (e.path.to_string(), e.kind))
+            .collect();
+        assert_eq!(
+            staged,
+            [("renamed.txt".to_owned(), ChangeKind::Renamed)],
+            "the staged rename is still tracked"
+        );
+    }
 }

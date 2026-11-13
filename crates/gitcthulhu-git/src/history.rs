@@ -258,16 +258,18 @@ impl FileHistoryWalker {
             return Ok(None);
         }
 
+        // A rename seen from a side parent only changes the path followed there: the entry (and the GUI's diff of
+        // it) describes the change against the first parent, so only the first parent's rename is its source.
         let mut previous_path = None;
         let mut enqueue_with: SmallVec<[(ObjectId, BString); 2]> = SmallVec::new();
-        for (parent, parent_entry) in parents.iter().zip(&parent_entries) {
+        for (ix, (parent, parent_entry)) in parents.iter().zip(&parent_entries).enumerate() {
             let mut tracked = path.clone();
             if self.follow
                 && here.is_some()
                 && parent_entry.is_none()
                 && let Some(source) = self.renamed_from(*parent, id, path.as_ref())?
             {
-                if previous_path.is_none() {
+                if ix == 0 {
                     previous_path = Some(source.clone());
                 }
                 tracked = source;
@@ -280,7 +282,7 @@ impl FileHistoryWalker {
 
         let kind = match (here, parent_entries.iter().flatten().next()) {
             (None, _) => ChangeKind::Deleted,
-            (Some(_), None) if previous_path.is_some() => ChangeKind::Renamed,
+            (Some(_), _) if previous_path.is_some() => ChangeKind::Renamed,
             (Some(_), None) => ChangeKind::Added,
             (Some((_, mode)), Some((_, previous_mode))) => {
                 if is_same_entry_type(mode, *previous_mode) {

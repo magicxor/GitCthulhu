@@ -161,6 +161,7 @@ pub use gitcthulhu_git::{
     RemoteBranch,
     RemoteInfo,
     RemoteRef,
+    RenameMode,
     Repo,
     RepoExclusive,
     RepoExclusiveGuard,

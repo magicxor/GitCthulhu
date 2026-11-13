@@ -5,7 +5,7 @@ use gitcthulhu_oplog::{
     testing::capture_round_trip,
 };
 
-use crate::support::{Fixture, b, desc, has_blob_of, record, record_ok, show_json};
+use crate::support::{Fixture, b, desc, git_in, has_blob_of, record, record_ok, show_json};
 
 const MAIN_REF: &str = "refs/gitcthulhu/oplog/main";
 
@@ -458,6 +458,40 @@ fn preview_skipped_expands_directories_and_respects_capture_untracked() {
             ("dir/big.bin".to_owned(), SkipReason::CaptureDisabled),
             ("dir/ok.txt".to_owned(), SkipReason::CaptureDisabled),
         ]
+    );
+}
+
+#[test]
+fn preview_skipped_reports_nested_repositories() {
+    let fx = Fixture::new();
+    fx.write("nested/n.txt", "n\n");
+    git_in(&fx.path.join("nested"), &["init", "-q"]);
+    fx.write("dir/inner/.git", "gitdir: ../../elsewhere\n");
+    fx.write("dir/ok.txt", "ok\n");
+    let oplog = fx.oplog();
+    let reasons = |paths: &[_]| -> Vec<(String, SkipReason)> {
+        oplog
+            .preview_skipped(&fx.repo(), paths)
+            .expect("preview works")
+            .into_iter()
+            .map(|s| (s.path.to_string(), s.reason))
+            .collect()
+    };
+    // No snapshot holds a nested repository, so deleting it must be confirmed even when every file fits.
+    assert_eq!(
+        reasons(&[b("nested"), b("dir/")]),
+        vec![
+            ("dir/inner".to_owned(), SkipReason::NestedRepository),
+            ("nested".to_owned(), SkipReason::NestedRepository),
+        ]
+    );
+    assert_eq!(
+        reasons(&[b("")]),
+        vec![
+            ("dir/inner".to_owned(), SkipReason::NestedRepository),
+            ("nested".to_owned(), SkipReason::NestedRepository),
+        ],
+        "the worktree root expands to the repositories below it"
     );
 }
 

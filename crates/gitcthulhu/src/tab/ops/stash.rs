@@ -199,7 +199,7 @@ impl RepoTab {
         });
         if include_untracked {
             spec = spec.prepare(move |handle, asker| {
-                super::files::confirm_untracked_loss(handle, asker, &title, &untracked)
+                super::files::confirm_untracked_loss(handle, asker, &title, &untracked, None)
             });
         }
         self.run_op(spec, window, cx)

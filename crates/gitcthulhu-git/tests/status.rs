@@ -569,6 +569,48 @@ fn submodule_moved_pointer_with_clean_worktree_is_not_dirty() {
     );
 }
 
+/// `submodule.<name>.ignore = all` (committed in `.gitmodules`): Git lists nothing for the submodule and `git add -A`
+/// skips it, so it is not reported as modified in any mode; a staged pointer change still shows.
+#[test]
+fn submodule_configured_ignore_all_is_not_reported() {
+    let env = TestEnv::new();
+    let repo = submodule_repo(&env);
+    repo.git(&["config", "-f", ".gitmodules", "submodule.sub.ignore", "all"]);
+    repo.commit_all("ignore the submodule");
+    let sub = TestRepo::init_with(&env, &repo.path.join("sub"), &["status"]);
+    sub.write("s.txt", "2\n");
+    sub.commit_all("sub two");
+    std::fs::write(repo.path.join("sub").join("s.txt"), "dirty\n").expect("modify the submodule");
+    assert!(
+        repo.git(&["status", "--porcelain=v2"]).is_empty(),
+        "Git reports nothing"
+    );
+    for mode in [
+        SubmoduleStatusMode::HeadOnly,
+        SubmoduleStatusMode::HeadAndDirty,
+    ] {
+        let status = run(
+            &repo,
+            &StatusOptions {
+                submodules: mode,
+                ..StatusOptions::default()
+            },
+        );
+        assert!(
+            status.unstaged.is_empty(),
+            "{mode:?}: the ignored submodule is not listed: {:?}",
+            status.unstaged
+        );
+    }
+    repo.git(&["add", "-f", "sub"]);
+    let status = run_default(&repo);
+    assert_eq!(
+        find(&status.staged, "sub").kind,
+        ChangeKind::Modified,
+        "a staged pointer change is shown, as in git status"
+    );
+}
+
 #[test]
 fn typechange_file_to_symlink() {
     if !symlinks_supported() {
@@ -925,6 +967,116 @@ fn non_utf8_path_roundtrips() {
     );
 }
 
+/// `index.sparse` (Scalar's default): sparse directory entries, which gix cannot diff against a tree. The status
+/// comes from `git status --porcelain=v2` there and equals gix's status of the same state with a full index.
+#[test]
+fn sparse_index_status_equals_full_index_status() {
+    let env = TestEnv::new();
+    // The same changes in a cone-mode sparse checkout, with a sparse or a full index.
+    let changed = |name: &str, sparse_index: bool| {
+        let repo = env.repo(name);
+        repo.write("in/x/a.txt", LINES);
+        repo.write("in/x/gone.txt", "gone\n");
+        repo.write("in/staged-gone.txt", "staged gone\n");
+        repo.write("in/move-me.txt", LINES);
+        repo.write("in/both.txt", "base\n");
+        repo.write("out/y/b.txt", "outside the cone\n");
+        repo.commit_all("base");
+        let index_mode = if sparse_index {
+            "--sparse-index"
+        } else {
+            "--no-sparse-index"
+        };
+        repo.git(&["sparse-checkout", "init", "--cone", index_mode]);
+        repo.git(&["sparse-checkout", "set", "in"]);
+        assert_eq!(
+            repo.index_is_sparse(),
+            sparse_index,
+            "a sparse directory entry is in the index exactly with --sparse-index"
+        );
+        repo.write("in/x/a.txt", format!("{LINES}kilo\n"));
+        repo.remove("in/x/gone.txt");
+        repo.git(&["rm", "-q", "in/staged-gone.txt"]);
+        repo.git(&["mv", "in/move-me.txt", "in/moved.txt"]);
+        repo.write("in/added.txt", "added\n");
+        repo.git(&["add", "in/added.txt"]);
+        repo.write("in/both.txt", "staged\n");
+        repo.git(&["add", "in/both.txt"]);
+        repo.write("in/both.txt", "staged and changed again\n");
+        repo.write("in/ita.txt", "intent\n");
+        repo.git(&["add", "-N", "in/ita.txt"]);
+        repo.write("in/new/untracked.txt", "u\n");
+        repo.write("in/space name.txt", "u\n");
+        repo
+    };
+    let expect = |status: &Status| {
+        let line = |e: &StatusEntry| format!("{:?} {} <- {:?}", e.kind, e.path, prev(e));
+        (
+            status.staged.iter().map(line).collect::<Vec<_>>(),
+            status.unstaged.iter().map(line).collect::<Vec<_>>(),
+        )
+    };
+
+    let sparse = run_default(&changed("sparse", true));
+    assert_eq!(
+        expect(&sparse),
+        (
+            vec![
+                "Added in/added.txt <- None".to_owned(),
+                "Modified in/both.txt <- None".to_owned(),
+                "Renamed in/moved.txt <- Some(\"in/move-me.txt\")".to_owned(),
+                "Deleted in/staged-gone.txt <- None".to_owned(),
+            ],
+            vec![
+                "Modified in/both.txt <- None".to_owned(),
+                "IntentToAdd in/ita.txt <- None".to_owned(),
+                "Untracked in/new/untracked.txt <- None".to_owned(),
+                "Untracked in/space name.txt <- None".to_owned(),
+                "Modified in/x/a.txt <- None".to_owned(),
+                "Deleted in/x/gone.txt <- None".to_owned(),
+            ]
+        ),
+        "the sparse index's status lists every change in the cone"
+    );
+
+    // The same state with a full index, computed by gix: every field (kinds, sides, ids) must agree.
+    let full = run_default(&changed("full", false));
+    assert_eq!(sparse.staged, full.staged, "staged entries equal gix's");
+    assert_eq!(
+        sparse.unstaged, full.unstaged,
+        "unstaged entries equal gix's"
+    );
+}
+
+/// A conflict in a sparse index is reported with its stages.
+#[test]
+fn sparse_index_status_reports_conflicts() {
+    let env = TestEnv::new();
+    let repo = env.repo("repo");
+    repo.write("in/c.txt", "base\n");
+    repo.write("out/o.txt", "outside\n");
+    repo.commit_all("base");
+    repo.git(&["switch", "-q", "-c", "side"]);
+    repo.write("in/c.txt", "side\n");
+    repo.commit_all("side");
+    repo.git(&["switch", "-q", "main"]);
+    repo.write("in/c.txt", "main\n");
+    repo.commit_all("main");
+    repo.git(&["sparse-checkout", "init", "--cone", "--sparse-index"]);
+    repo.git(&["sparse-checkout", "set", "in"]);
+    let _ = repo.git_fail(&["merge", "side"]);
+    let status = run_default(&repo);
+    assert!(status.staged.is_empty(), "{:?}", status.staged);
+    let entry = find(&status.unstaged, "in/c.txt");
+    assert_eq!(entry.kind, ChangeKind::Conflicted, "conflicted");
+    let conflict = entry.conflict.as_ref().expect("conflict details");
+    assert_eq!(conflict.kind, ConflictKind::BothModified, "both modified");
+    assert!(
+        conflict.base.is_some() && conflict.ours.is_some() && conflict.theirs.is_some(),
+        "all three stages: {conflict:?}"
+    );
+}
+
 /// 100k tracked files, 1k untracked: `status` must stay within budget (spec §9: <= 400 ms, Linux <= 150 ms).
 /// Budgets are asserted only with `GITCTHULHU_PERF_ASSERT=1`.
 #[test]
@@ -983,6 +1135,21 @@ fn perf_status_100k_files() {
         with_deletion.counts.unstaged.deleted, 1,
         "the deletion is found"
     );
+    // The GUI's options (staged renames only, as `git status`): the deletion costs no second pass.
+    let index_only = StatusOptions {
+        renames: RenameMode::IndexOnly,
+        ..StatusOptions::default()
+    };
+    let started = std::time::Instant::now();
+    let gui_with_deletion = status(&opened, &index_only, &cancel).expect("status");
+    let gui_elapsed = started.elapsed();
+    eprintln!(
+        "status of 100k files with a worktree deletion, staged renames only: {gui_elapsed:?}"
+    );
+    assert_eq!(
+        gui_with_deletion.counts.unstaged.deleted, 1,
+        "the deletion is found"
+    );
     assert_eq!(
         result.counts.unstaged.untracked, 1000,
         "untracked files found"
@@ -992,6 +1159,10 @@ fn perf_status_100k_files() {
         assert!(
             elapsed.as_millis() <= budget,
             "status took {elapsed:?}, budget {budget} ms"
+        );
+        assert!(
+            gui_elapsed.as_millis() <= budget,
+            "status with a deletion (staged renames only) took {gui_elapsed:?}, budget {budget} ms"
         );
     }
 }

@@ -43,12 +43,15 @@ impl Default for StatusOptions {
 /// `index_needs_refresh` reports whether gix found entries with outdated stat data; the caller may then run
 /// [`refresh_index()`] (writing the index from here would silently undo a `git add` made while the status ran).
 ///
-/// Errors: `BareRepository`, `Cancelled`, `Other` (gix failures), `Io`.
+/// An index with sparse directory entries (`index.sparse`, Scalar's default) cannot be compared with a tree by gix:
+/// there the status comes from `git status --porcelain=v2` (a read; `index_needs_refresh` is then `false`).
+///
+/// Errors: `BareRepository`, `Cancelled`, `Other` (gix failures), `Io`, and the classified failure of
+/// `git status`.
 pub fn status(repo: &Repo, opts: &StatusOptions, cancel: &CancelToken) -> Result<Status> {
     let workdir = repo.workdir().ok_or(GitError::BareRepository)?;
     cancel.check()?;
     let local = repo.local();
-    let null = local.object_hash().null();
     // Taken *before* the index and HEAD are read: a change made while the status runs then leaves a fingerprint
     // that no longer matches, so the caller sees the result as outdated instead of trusting it.
     let fingerprint = StatusFingerprint {
@@ -56,6 +59,53 @@ pub fn status(repo: &Repo, opts: &StatusOptions, cancel: &CancelToken) -> Result
         head: local.head_id().ok().map(|id| id.detach()),
     };
 
+    let sparse_index = local.index_or_empty().map_err(gix_error)?.is_sparse();
+    let (mut staged, mut unstaged, index_needs_refresh) = if sparse_index {
+        let (staged, unstaged) = cli_status(repo, workdir, opts, cancel)?;
+        (staged, unstaged, false)
+    } else {
+        gix_status(&local, workdir, opts, cancel)?
+    };
+
+    if opts.submodules == SubmoduleStatusMode::HeadOnly {
+        drop_submodules_ignoring_all(&local, &mut unstaged);
+    }
+
+    // Conflicted paths are reported once, as unstaged conflicts. The dirwalk of gix looks paths up in the index with
+    // `entry_by_path`, which only finds stage 0 or 2: a path that only has a "theirs" entry (added by them) is walked
+    // as untracked as well on case-sensitive file systems. Git never calls an unmerged path untracked.
+    if unstaged.iter().any(|e| e.kind == ChangeKind::Conflicted) {
+        let conflicted: HashSet<BString> = unstaged
+            .iter()
+            .filter(|e| e.kind == ChangeKind::Conflicted)
+            .map(|e| e.path.clone())
+            .collect();
+        staged.retain(|e| !conflicted.contains(&e.path));
+        unstaged.retain(|e| e.kind != ChangeKind::Untracked || !conflicted.contains(&e.path));
+    }
+    staged.sort_by(|a, b| a.path.cmp(&b.path));
+    unstaged.sort_by(|a, b| a.path.cmp(&b.path));
+    let counts = StatusCounts {
+        staged: count(&staged),
+        unstaged: count(&unstaged),
+    };
+    Ok(Status {
+        staged,
+        unstaged,
+        counts,
+        fingerprint,
+        index_needs_refresh,
+    })
+}
+
+/// The staged and unstaged entries plus `index_needs_refresh`, computed by gix.
+fn gix_status(
+    local: &gix::Repository,
+    workdir: &Path,
+    opts: &StatusOptions,
+    cancel: &CancelToken,
+) -> Result<(Vec<StatusEntry>, Vec<StatusEntry>, bool)> {
+    let null = local.object_hash().null();
     let rewrites = gix::diff::Rewrites {
         copies: None,
         percentage: Some(0.5),
@@ -75,14 +125,14 @@ pub fn status(repo: &Repo, opts: &StatusOptions, cancel: &CancelToken) -> Result
             ignore: gix::submodule::config::Ignore::All,
             check_dirty: false,
         },
+        // Only the checked-out commit is compared, which `ignore = dirty` gives cheaply for every submodule; the ones
+        // configured with `ignore = all` are dropped afterwards (`drop_submodules_ignoring_all`).
         SubmoduleStatusMode::HeadOnly => status::Submodule::Given {
             ignore: gix::submodule::config::Ignore::Dirty,
             check_dirty: false,
         },
-        SubmoduleStatusMode::HeadAndDirty => status::Submodule::Given {
-            ignore: gix::submodule::config::Ignore::None,
-            check_dirty: true,
-        },
+        // `submodule.<name>.ignore` decides how far each submodule is looked at, as in Git.
+        SubmoduleStatusMode::HeadAndDirty => status::Submodule::AsConfigured { check_dirty: true },
     };
     let (untracked, emission) = match opts.untracked {
         UntrackedMode::Files => (
@@ -188,32 +238,292 @@ pub fn status(repo: &Repo, opts: &StatusOptions, cancel: &CancelToken) -> Result
             .outcome_mut()
             .is_some_and(|outcome| outcome.has_changes());
     }
+    Ok((staged, unstaged, index_needs_refresh))
+}
 
-    // Conflicted paths are reported once, as unstaged conflicts. The dirwalk of gix looks paths up in the index with
-    // `entry_by_path`, which only finds stage 0 or 2: a path that only has a "theirs" entry (added by them) is walked
-    // as untracked as well on case-sensitive file systems. Git never calls an unmerged path untracked.
-    if unstaged.iter().any(|e| e.kind == ChangeKind::Conflicted) {
-        let conflicted: HashSet<BString> = unstaged
-            .iter()
-            .filter(|e| e.kind == ChangeKind::Conflicted)
-            .map(|e| e.path.clone())
-            .collect();
-        staged.retain(|e| !conflicted.contains(&e.path));
-        unstaged.retain(|e| e.kind != ChangeKind::Untracked || !conflicted.contains(&e.path));
-    }
-    staged.sort_by(|a, b| a.path.cmp(&b.path));
-    unstaged.sort_by(|a, b| a.path.cmp(&b.path));
-    let counts = StatusCounts {
-        staged: count(&staged),
-        unstaged: count(&unstaged),
+/// The staged and unstaged entries from `git status --porcelain=v2 -z` (for a sparse index, see [`status()`]), with
+/// the options mapped to Git's: untracked files `all` / `normal` / `no`, `--find-renames` / `--no-renames` (Git
+/// tracks staged renames only), `--ignore-submodules=dirty` for `HeadOnly`, `=all` for `Ignore`.
+fn cli_status(
+    repo: &Repo,
+    workdir: &Path,
+    opts: &StatusOptions,
+    cancel: &CancelToken,
+) -> Result<(Vec<StatusEntry>, Vec<StatusEntry>)> {
+    let mut cmd = GitCommand::new(repo, CommandKind::Read).args([
+        "status",
+        "--porcelain=v2",
+        "-z",
+        match opts.untracked {
+            UntrackedMode::Files => "--untracked-files=all",
+            UntrackedMode::Collapsed => "--untracked-files=normal",
+            UntrackedMode::None => "--untracked-files=no",
+        },
+        match opts.renames {
+            RenameMode::Off => "--no-renames",
+            RenameMode::IndexOnly | RenameMode::IndexAndWorktree { .. } => "--find-renames",
+        },
+    ]);
+    cmd = match opts.submodules {
+        SubmoduleStatusMode::Ignore => cmd.arg("--ignore-submodules=all"),
+        SubmoduleStatusMode::HeadOnly => cmd.arg("--ignore-submodules=dirty"),
+        SubmoduleStatusMode::HeadAndDirty => cmd,
     };
-    Ok(Status {
-        staged,
-        unstaged,
-        counts,
-        fingerprint,
-        index_needs_refresh,
-    })
+    if !opts.pathspec.is_empty() {
+        cmd = cmd.literal_paths_after_dashdash(&opts.pathspec);
+    }
+    let out = cli::run(repo.runtime(), cmd, &OpContext::silent(cancel.clone()))?;
+    if !out.success() {
+        return Err(classify(OpClass::Generic, &out, &PostState::default()));
+    }
+    let null = repo.local().object_hash().null();
+    parse_porcelain_v2(&out.stdout, workdir, null, opts.submodules)
+}
+
+/// Parse `git status --porcelain=v2 -z` into staged and unstaged entries shaped like gix's (see
+/// [`tree_index_entry`] and [`index_worktree_entry`]): `1` ordinary and `2` renamed records give a staged entry for
+/// `X` and an unstaged one for `Y`, `u` a conflict, `?` an untracked path. Worktree sides have a null id; a moved
+/// submodule's new commit is read from its `HEAD`.
+fn parse_porcelain_v2(
+    stdout: &[u8],
+    workdir: &Path,
+    null: ObjectId,
+    submodules: SubmoduleStatusMode,
+) -> Result<(Vec<StatusEntry>, Vec<StatusEntry>)> {
+    let bad = |record: &[u8]| {
+        GitError::Other(anyhow::anyhow!(
+            "unexpected `git status --porcelain=v2` record: {:?}",
+            record.as_bstr()
+        ))
+    };
+    let mode = |record: &[u8], field: &[u8]| porcelain_kind(field).ok_or_else(|| bad(record));
+    let id = |record: &[u8], field: &[u8]| ObjectId::from_hex(field).map_err(|_| bad(record));
+
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut records = stdout.split(|b| *b == 0).filter(|r| !r.is_empty());
+    while let Some(record) = records.next() {
+        match record[0] {
+            b'1' | b'2' => {
+                let renamed = record[0] == b'2';
+                let f = porcelain_fields(record, if renamed { 10 } else { 9 })
+                    .ok_or_else(|| bad(record))?;
+                let (x, y) = (f[1][0], f[1][1]);
+                let sub = f[2];
+                let (m_head, m_index, m_worktree) = (
+                    mode(record, f[3])?,
+                    mode(record, f[4])?,
+                    mode(record, f[5])?,
+                );
+                let (h_head, h_index) = (id(record, f[6])?, id(record, f[7])?);
+                let path = BString::from(f[if renamed { 9 } else { 8 }]);
+                let previous_path = if renamed {
+                    Some(BString::from(records.next().ok_or_else(|| bad(record))?))
+                } else {
+                    None
+                };
+                let head_side = m_head.map(|kind| side(h_head, kind));
+                let index_side = m_index.map(|kind| side(h_index, kind));
+                let worktree_side = m_worktree.map(|kind| side(null, kind));
+                if x != b'.' {
+                    let kind = match x {
+                        b'A' | b'C' => ChangeKind::Added,
+                        b'D' => ChangeKind::Deleted,
+                        b'R' => ChangeKind::Renamed,
+                        b'T' => ChangeKind::TypeChanged,
+                        b'M' => match head_side.zip(index_side) {
+                            Some((old, new)) if kind_changed(old.kind, new.kind) => {
+                                ChangeKind::TypeChanged
+                            }
+                            _ => ChangeKind::Modified,
+                        },
+                        _ => return Err(bad(record)),
+                    };
+                    let (old, new) = match kind {
+                        ChangeKind::Added => (None, index_side),
+                        ChangeKind::Deleted => (head_side, None),
+                        _ => (head_side, index_side),
+                    };
+                    let mut entry = plain(path.clone(), kind, old, new);
+                    if kind == ChangeKind::Renamed {
+                        entry.previous_path = previous_path.clone();
+                    }
+                    if let (Some(old), Some(new)) = (old, new)
+                        && old.kind == EntryKind::Submodule
+                        && new.kind == EntryKind::Submodule
+                    {
+                        entry.submodule = Some(SubmoduleChange {
+                            old_commit: Some(old.id),
+                            new_commit: Some(new.id),
+                            dirty: None,
+                        });
+                    }
+                    staged.push(entry);
+                }
+                let entry = match y {
+                    b'.' => continue,
+                    b'M' if sub.first() == Some(&b'S') => {
+                        let Some(entry) =
+                            porcelain_submodule(sub, workdir, path, h_index, submodules)
+                        else {
+                            continue;
+                        };
+                        entry
+                    }
+                    b'M' => plain(path, ChangeKind::Modified, index_side, worktree_side),
+                    b'T' => plain(path, ChangeKind::TypeChanged, index_side, worktree_side),
+                    b'D' => plain(path, ChangeKind::Deleted, index_side, None),
+                    // `git add -N`: the index side is not a real entry yet.
+                    b'A' => plain(
+                        path,
+                        ChangeKind::IntentToAdd,
+                        None,
+                        Some(side(null, m_worktree.unwrap_or(EntryKind::Blob))),
+                    ),
+                    // A rename onto an intent-to-add path.
+                    b'R' => {
+                        let mut entry = plain(path, ChangeKind::Renamed, None, worktree_side);
+                        entry.previous_path = previous_path;
+                        entry
+                    }
+                    _ => return Err(bad(record)),
+                };
+                unstaged.push(entry);
+            }
+            b'u' => {
+                let f = porcelain_fields(record, 11).ok_or_else(|| bad(record))?;
+                let stage = |m: &[u8], h: &[u8]| -> Result<Option<Side>> {
+                    Ok(match mode(record, m)? {
+                        Some(kind) => Some(side(id(record, h)?, kind)),
+                        None => None,
+                    })
+                };
+                let kind = match f[1] {
+                    b"DD" => ConflictKind::BothDeleted,
+                    b"AU" => ConflictKind::AddedByUs,
+                    b"UD" => ConflictKind::DeletedByThem,
+                    b"UA" => ConflictKind::AddedByThem,
+                    b"DU" => ConflictKind::DeletedByUs,
+                    b"AA" => ConflictKind::BothAdded,
+                    b"UU" => ConflictKind::BothModified,
+                    _ => return Err(bad(record)),
+                };
+                let mut entry = plain(BString::from(f[10]), ChangeKind::Conflicted, None, None);
+                entry.conflict = Some(ConflictInfo {
+                    kind,
+                    base: stage(f[3], f[7])?,
+                    ours: stage(f[4], f[8])?,
+                    theirs: stage(f[5], f[9])?,
+                });
+                unstaged.push(entry);
+            }
+            b'?' => {
+                let mut path = BString::from(record.get(2..).ok_or_else(|| bad(record))?);
+                let full = workdir.join(os_path(&path));
+                let kind = if path.ends_with(b"/") {
+                    if full.join(".git").exists() {
+                        path.pop();
+                        EntryKind::Submodule
+                    } else {
+                        EntryKind::Tree
+                    }
+                } else {
+                    match full.symlink_metadata() {
+                        Ok(meta) if meta.file_type().is_symlink() => EntryKind::Link,
+                        Ok(meta) if gix::fs::is_executable(&meta) => EntryKind::BlobExecutable,
+                        _ => EntryKind::Blob,
+                    }
+                };
+                unstaged.push(plain(
+                    path,
+                    ChangeKind::Untracked,
+                    None,
+                    Some(side(null, kind)),
+                ));
+            }
+            b'!' | b'#' => {}
+            _ => return Err(bad(record)),
+        }
+    }
+    Ok((staged, unstaged))
+}
+
+/// The `count` space-separated fields of a record (the last one is the path, which may contain spaces); the second
+/// is the two-letter `XY` state.
+fn porcelain_fields(record: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+    let fields: Vec<&[u8]> = record.splitn(count, |b| *b == b' ').collect();
+    (fields.len() == count && fields[1].len() == 2).then_some(fields)
+}
+
+/// The kind of a porcelain mode (octal); `Some(None)` for `000000` (no such side), `None` if it is no mode.
+fn porcelain_kind(field: &[u8]) -> Option<Option<EntryKind>> {
+    let mode = u32::from_str_radix(std::str::from_utf8(field).ok()?, 8).ok()?;
+    Some(Some(match mode & 0o170000 {
+        0 if mode == 0 => return Some(None),
+        0o100000 if mode & 0o111 != 0 => EntryKind::BlobExecutable,
+        0o100000 => EntryKind::Blob,
+        0o120000 => EntryKind::Link,
+        0o160000 => EntryKind::Submodule,
+        0o040000 => EntryKind::Tree,
+        _ => return None,
+    }))
+}
+
+/// The unstaged entry of a submodule from its porcelain state `S<c><m><u>` (commit changed, tracked changes,
+/// untracked files), filtered like gix's: a change that is only "dirty" shows in `HeadAndDirty` mode only.
+fn porcelain_submodule(
+    sub: &[u8],
+    workdir: &Path,
+    path: BString,
+    index_commit: ObjectId,
+    submodules: SubmoduleStatusMode,
+) -> Option<StatusEntry> {
+    let flag = |ix: usize, set: u8| sub.get(ix) == Some(&set);
+    let moved = flag(1, b'C');
+    let dirty = flag(2, b'M') || flag(3, b'U');
+    let with_dirty = submodules == SubmoduleStatusMode::HeadAndDirty;
+    if !moved && !(with_dirty && dirty) {
+        return None;
+    }
+    let new_commit = if moved {
+        gix::open(workdir.join(os_path(&path)))
+            .ok()
+            .and_then(|sm| sm.head_id().ok().map(gix::Id::detach))
+            .unwrap_or_else(|| index_commit.kind().null())
+    } else {
+        index_commit
+    };
+    let mut out = plain(
+        path,
+        ChangeKind::Modified,
+        Some(side(index_commit, EntryKind::Submodule)),
+        Some(side(new_commit, EntryKind::Submodule)),
+    );
+    out.submodule = Some(SubmoduleChange {
+        old_commit: Some(index_commit),
+        new_commit: Some(new_commit),
+        dirty: with_dirty.then_some(dirty),
+    });
+    Some(out)
+}
+
+/// Drop the work tree changes of submodules configured with `ignore = all` (`.gitmodules` or
+/// `submodule.<name>.ignore`): Git never reports them as modified, and `git add` skips them, so such an entry could
+/// never be staged. Staged changes stay, as in `git status`. An unreadable `.gitmodules` filters nothing.
+fn drop_submodules_ignoring_all(repo: &gix::Repository, unstaged: &mut Vec<StatusEntry>) {
+    if !unstaged.iter().any(|entry| entry.submodule.is_some()) {
+        return;
+    }
+    let Ok(Some(submodules)) = repo.submodules() else {
+        return;
+    };
+    let ignored: HashSet<BString> = submodules
+        .filter(|sm| matches!(sm.ignore(), Ok(Some(gix::submodule::config::Ignore::All))))
+        .filter_map(|sm| sm.path().ok())
+        .collect();
+    if !ignored.is_empty() {
+        unstaged.retain(|entry| entry.submodule.is_none() || !ignored.contains(&entry.path));
+    }
 }
 
 /// `git update-index -q --ignore-submodules --unmerged --refresh` (CommandKind::Mutation, no hooks, no progress).

@@ -1338,6 +1338,7 @@ fn discard_paths_glob_chars_literal() {
         &ctx(&t),
         &["[12].txt".into()],
         DiscardMode::Unstaged,
+        false,
     )
     .expect("git restore works");
     assert_eq!(
@@ -1415,6 +1416,7 @@ fn discard_conflicted_path_unstaged_mode() {
         &ctx(&t),
         &["f".into()],
         DiscardMode::Unstaged,
+        false,
     )
     .expect("an unmerged path is reset to HEAD");
     assert_eq!(
@@ -1577,6 +1579,7 @@ fn discard_paths_staged_and_unstaged_removes_added_file() {
         &ctx(&t),
         &["a".into(), "new".into()],
         DiscardMode::StagedAndUnstaged,
+        false,
     )
     .expect("git restore --source=HEAD --staged --worktree");
     assert_eq!(t.read("a").as_bstr(), b"a\n".as_bstr(), "a is back at HEAD");
@@ -1602,6 +1605,7 @@ fn discard_paths_unborn_staged_and_unstaged() {
         &ctx(&t),
         &["a".into()],
         DiscardMode::StagedAndUnstaged,
+        false,
     )
     .expect("git rm --cached plus file deletion");
     assert!(ls_files(&t).is_empty(), "the index is empty again");
@@ -1774,8 +1778,13 @@ fn whole_file_functions_refuse_paths_outside_the_worktree() {
         let mut guard = repo.lock_exclusive();
         let result = stage::stage_paths(&repo, guard.write_permission(), &ctx(&t), &[bad.into()]);
         expect_kind(result, GitErrorKind::InvalidName);
-        let result =
-            stage::delete_untracked(&repo, guard.write_permission(), &ctx(&t), &[bad.into()]);
+        let result = stage::delete_untracked(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            &[bad.into()],
+            false,
+        );
         expect_kind(result, GitErrorKind::InvalidName);
     }
 }
@@ -1826,6 +1835,7 @@ fn delete_untracked_removes_files_and_directories() {
         guard.write_permission(),
         &ctx(&t),
         &["junk.txt".into(), "build/".into(), "already-gone".into()],
+        false,
     )
     .expect("untracked paths are deleted");
     assert_eq!(outcome.refresh, RefreshSet::STATUS, "status only");
@@ -1852,6 +1862,7 @@ fn delete_untracked_refuses_tracked_paths_before_deleting_anything() {
             guard.write_permission(),
             &ctx(&t),
             &["junk.txt".into(), RelaPath::from(tracked)],
+            false,
         );
         match result {
             Err(GitError::InvalidName { what, name }) => {
@@ -1881,6 +1892,7 @@ fn delete_untracked_refuses_case_variant_of_tracked_path() {
         guard.write_permission(),
         &ctx(&t),
         &["readme.MD".into()],
+        false,
     );
     expect_kind(result, GitErrorKind::InvalidName);
     // In a discard the case variant counts as tracked: Git either restores the file from the index or refuses the
@@ -1891,6 +1903,7 @@ fn delete_untracked_refuses_case_variant_of_tracked_path() {
         &ctx(&t),
         &["readme.MD".into()],
         DiscardMode::Unstaged,
+        false,
     );
     assert_eq!(
         t.read("README.md").as_bstr(),
@@ -1939,6 +1952,7 @@ fn delete_untracked_never_follows_a_symlinked_directory() {
         guard.write_permission(),
         &ctx(&t),
         &["link/victim".into()],
+        false,
     );
     expect_kind(result, GitErrorKind::InvalidName);
     assert!(
@@ -1946,8 +1960,14 @@ fn delete_untracked_never_follows_a_symlinked_directory() {
         "nothing outside the worktree is deleted through a link"
     );
 
-    stage::delete_untracked(&repo, guard.write_permission(), &ctx(&t), &["link".into()])
-        .expect("the untracked link itself can be deleted");
+    stage::delete_untracked(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        &["link".into()],
+        false,
+    )
+    .expect("the untracked link itself can be deleted");
     assert!(
         std::fs::symlink_metadata(t.path.join("link")).is_err(),
         "the link is gone"
@@ -1956,6 +1976,83 @@ fn delete_untracked_never_follows_a_symlinked_directory() {
         outside.join("victim").exists(),
         "deleting the link leaves its target alone"
     );
+}
+
+#[test]
+fn deleting_a_nested_repository_needs_allow_nested() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("tracked", b"t\n");
+    t.commit_all("base");
+    let nested = env.repo("r/nested");
+    nested.write("n", b"n\n");
+    nested.commit_all("nested history");
+    nested.write("uncommitted", b"u\n");
+    t.write("dir/deeper/repo/.git", b"gitdir: ../../../elsewhere\n");
+    t.write("junk.txt", b"j\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+
+    for paths in [vec!["junk.txt", "nested"], vec!["dir/"]] {
+        let paths: Vec<RelaPath> = paths.into_iter().map(RelaPath::from).collect();
+        let deleted =
+            stage::delete_untracked(&repo, guard.write_permission(), &ctx(&t), &paths, false);
+        expect_kind(deleted, GitErrorKind::NestedRepository);
+        let discarded = stage::discard_paths(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            &paths,
+            DiscardMode::StagedAndUnstaged,
+            false,
+        );
+        expect_kind(discarded, GitErrorKind::NestedRepository);
+    }
+    assert!(
+        t.path.join("junk.txt").exists(),
+        "nothing is deleted when one path holds a repository"
+    );
+    assert!(
+        t.path.join("nested/.git").exists() && t.path.join("dir/deeper/repo/.git").exists(),
+        "the nested repositories (a .git directory and a .git file) stay"
+    );
+    assert_eq!(
+        stage::nested_repositories(
+            &repo,
+            &[
+                "junk.txt".into(),
+                "nested".into(),
+                "dir/".into(),
+                "gone".into()
+            ]
+        )
+        .expect("a read-only walk"),
+        [RelaPath::from("dir/deeper/repo"), RelaPath::from("nested")],
+        "a caller can name exactly what is refused"
+    );
+
+    stage::delete_untracked(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        &["junk.txt".into(), "nested".into()],
+        true,
+    )
+    .expect("the caller agreed to delete the nested repository");
+    stage::discard_paths(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        &["dir/".into()],
+        DiscardMode::Unstaged,
+        true,
+    )
+    .expect("the caller agreed to delete the directory with the repository in it");
+    assert!(
+        !t.path.join("nested").exists() && !t.path.join("dir").exists(),
+        "with allow_nested both are deleted"
+    );
+    assert!(t.path.join("tracked").exists(), "tracked files stay");
 }
 
 /// A directory junction on Windows (`mklink /J` needs no privilege), a symlink on Unix.
@@ -2049,6 +2146,7 @@ fn discard_paths_deletes_untracked_without_git() {
         &ctx(&t),
         &["junk.txt".into()],
         DiscardMode::Unstaged,
+        false,
     )
     .expect("untracked paths in a discard are deleted");
     assert!(
@@ -2192,4 +2290,57 @@ fn big_file_50k_lines_under_50ms() {
             "budget of §9: {elapsed:?}"
         );
     }
+}
+
+/// A sparse index (`index.sparse`): staging and unstaging lines keeps the sparse directory entries, and Git reads the
+/// written index as it should.
+#[test]
+fn partial_stage_in_a_sparse_index() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("in/f.txt", b"one\ntwo\nthree\n");
+    t.write("out/o.txt", b"outside the cone\n");
+    t.commit_all("base");
+    t.git(&["sparse-checkout", "init", "--cone", "--sparse-index"]);
+    t.git(&["sparse-checkout", "set", "in"]);
+    t.write("in/f.txt", b"zero\none\ntwo\nthree\nfour\n");
+    let repo = t.open();
+    let req = SelectionRequest {
+        path: "in/f.txt".into(),
+        previous_path: None,
+        base_old: index_id(&t, "in/f.txt"),
+        base_new: worktree_id(&t, "in/f.txt"),
+        algorithm: None,
+        selection: lines(&[add(1)]),
+    };
+    stage_sel(&t, &repo, &req).expect("the line is staged");
+    assert_eq!(
+        t.git(&["show", ":in/f.txt"]),
+        "zero\none\ntwo\nthree",
+        "only the selected line is staged"
+    );
+    assert!(t.index_is_sparse(), "the index is still sparse");
+    assert_eq!(
+        t.git(&["status", "--porcelain=v2"]),
+        "1 MM N... 100644 100644 100644 ".to_owned()
+            + &t.git(&["rev-parse", "HEAD:in/f.txt"])
+            + " "
+            + &t.git(&["rev-parse", ":in/f.txt"])
+            + " in/f.txt",
+        "Git reads the written index"
+    );
+    let req = SelectionRequest {
+        path: "in/f.txt".into(),
+        previous_path: None,
+        base_old: Some(oid(&t.git(&["rev-parse", "HEAD:in/f.txt"]))),
+        base_new: index_id(&t, "in/f.txt"),
+        algorithm: None,
+        selection: lines(&[add(1)]),
+    };
+    unstage_sel(&t, &repo, &req).expect("the line is unstaged");
+    assert!(
+        t.git(&["diff", "--cached", "--name-only"]).is_empty(),
+        "nothing staged any more"
+    );
+    assert!(t.index_is_sparse(), "the index is still sparse");
 }

@@ -125,11 +125,13 @@ fn public_functions_have_the_documented_signatures() {
             &OpContext,
             &[RelaPath],
             DiscardMode,
+            bool,
         ) -> Result<OpOutcome<()>>;
     let _ = stage::discard_selection
         as fn(&Repo, &mut RepoExclusive, &OpContext, &SelectionRequest) -> Result<OpOutcome<()>>;
     let _ = stage::delete_untracked
-        as fn(&Repo, &mut RepoExclusive, &OpContext, &[RelaPath]) -> Result<OpOutcome<()>>;
+        as fn(&Repo, &mut RepoExclusive, &OpContext, &[RelaPath], bool) -> Result<OpOutcome<()>>;
+    let _ = stage::nested_repositories as fn(&Repo, &[RelaPath]) -> Result<Vec<RelaPath>>;
     let _ = stage::resolve_conflict
         as fn(
             &Repo,

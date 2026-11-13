@@ -335,6 +335,136 @@ fn discard_without_untracked_capture_asks_first_and_restores_the_rest(cx: &mut T
     assert!(r.errors(cx).is_empty(), "{:?}", r.errors(cx));
 }
 
+/// No snapshot holds an untracked nested repository: deleting or discarding one always asks first, even with the
+/// untracked capture on, and declined it stays with its `.git`.
+#[gpui_kit::test]
+fn deleting_a_nested_repository_asks_first(cx: &mut TestAppContext) {
+    for ask in [false, true] {
+        let fx = base();
+        fx.git(&["init", "-q", "nested"]);
+        fx.write("nested/n.txt", "n\n");
+        fx.write("junk/inner/.git", "gitdir: ../../elsewhere\n");
+        fx.write("junk/inner/file.txt", "f\n");
+        let r = rig(cx, fx, ask);
+        r.run(cx, |t, w, cx| {
+            t.delete_untracked(vec![RelaPath::from("nested")], w, cx)
+        });
+        r.run(cx, |t, w, cx| {
+            t.discard_paths(
+                vec![RelaPath::from("junk/")],
+                DiscardMode::Unstaged,
+                vec![RelaPath::from("junk/")],
+                w,
+                cx,
+            )
+        });
+        let path = r.fx.path().to_owned();
+        assert_eq!(
+            path.join("nested/.git").exists(),
+            !ask,
+            "the nested repository is deleted only when the question is accepted (ask = {ask})"
+        );
+        assert_eq!(
+            path.join("junk/inner/.git").exists(),
+            !ask,
+            "the directory holding a repository is discarded only when accepted (ask = {ask})"
+        );
+        assert!(r.errors(cx).is_empty(), "{:?}", r.errors(cx));
+        drop(r);
+    }
+}
+
+/// With undo history off the preview fails closed (every path "can't be restored") and probes nothing: the nested
+/// repository is still named as such, and only an accepted question that named it lets the backend delete it.
+#[gpui_kit::test]
+fn nested_repository_is_named_with_undo_history_off(cx: &mut TestAppContext) {
+    use super::super::Prepared;
+    use super::super::files::{NestedAgreed, confirm_untracked_loss};
+
+    let fx = base();
+    fx.git(&["init", "-q", "junk/nested"]);
+    fx.write("junk/nested/n.txt", "n\n");
+    fx.write("junk/plain.txt", "p\n");
+    fx.write("solo/.git", "gitdir: ../elsewhere\n");
+    let r = rig(cx, fx, true);
+    cx.update(|cx| crate::settings::update(cx, |s| s.record_undo_history = false));
+    cx.run_until_parked();
+    cx.run_until_parked();
+    let handle = r.handle(cx);
+
+    for answer in [false, true] {
+        let (tx, mut rx) = UiRequestSender::channel();
+        let asker = Asker::Ui { tx, tab: None };
+        let agreed = NestedAgreed::default();
+        let worker = {
+            let (handle, agreed) = (handle.clone(), agreed.clone());
+            std::thread::spawn(move || {
+                let paths = [RelaPath::from("junk/"), RelaPath::from("solo")];
+                let prepared =
+                    confirm_untracked_loss(&handle, &asker, "Delete", &paths, Some(&agreed));
+                matches!(prepared, Ok(Prepared::Continue { .. }))
+            })
+        };
+        let request = loop {
+            match rx.try_recv() {
+                Ok(request) => break request,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let UiRequest::Confirm { request, reply, .. } = request else {
+            panic!("a confirmation was expected");
+        };
+        assert!(request.destructive);
+        assert!(
+            request.message.contains("including 2 Git repositories"),
+            "the repositories are named: {}",
+            request.message
+        );
+        assert_eq!(
+            request.details,
+            [
+                "junk/nested (contains a Git repository)",
+                "solo (contains a Git repository)",
+                "junk/ (capturing untracked files is off)",
+            ],
+            "each repository once, before the other paths"
+        );
+        reply.send(answer).expect("the worker waits");
+        let continued = worker.join().expect("the worker does not panic");
+        assert_eq!(continued, answer, "declined, the operation is cancelled");
+        assert_eq!(agreed.get(), answer, "only an accepted question agrees");
+    }
+}
+
+#[test]
+fn nested_repositories_lead_the_unrestorable_question() {
+    use crate::backend::{SkipReason, SkippedFile};
+    let skipped = [
+        SkippedFile {
+            path: "big.bin".into(),
+            size: 9,
+            reason: SkipReason::TooLarge,
+        },
+        SkippedFile {
+            path: "nested".into(),
+            size: 0,
+            reason: SkipReason::NestedRepository,
+        },
+    ];
+    let request = crate::backend::present::confirm_unrestorable("Delete 2 files", &skipped);
+    assert!(request.destructive, "losing a repository is destructive");
+    assert_eq!(
+        request.details,
+        ["nested (contains a Git repository)", "big.bin (too large)"],
+        "the repository is listed first"
+    );
+    assert!(
+        request.message.contains("including a Git repository"),
+        "the message names the repository: {}",
+        request.message
+    );
+}
+
 #[gpui_kit::test]
 fn stash_undo_redo(cx: &mut TestAppContext) {
     let fx = base();

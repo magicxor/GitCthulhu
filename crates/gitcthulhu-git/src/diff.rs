@@ -540,7 +540,15 @@ fn diff_sides(
         ));
     }
 
-    // (3) size thresholds, before any object is read (worktree sides above the limit were not read either).
+    // (3) size thresholds, before any object is read (worktree sides above the limit were not read either). A partial
+    // clone fetches the blobs it lacks first, as Git does.
+    let object_ids: Vec<ObjectId> = [old_ref, new_ref]
+        .into_iter()
+        .flatten()
+        .filter(|side| matches!(side.source, Source::Object))
+        .map(|side| side.id)
+        .collect();
+    content::fetch_missing_objects(repo, &object_ids, cancel)?;
     let size_of = |side: &Resolved| -> Result<u64> {
         Ok(match &side.source {
             Source::Worktree(content) => content.side.size,
@@ -1061,7 +1069,7 @@ fn cached_commit_files(
     {
         return Ok(hit);
     }
-    let files = Arc::new(commit_files_inner(g, commit, against, opts)?);
+    let files = Arc::new(commit_files_inner(repo, g, commit, against, opts)?);
     if let Ok(mut cache) = files_cache().lock() {
         cache.put(key, files.clone());
     }
@@ -1119,6 +1127,7 @@ fn first_parent_tree_for_stats(
 
 /// Changed files between two trees, sorted by path. `target` builds the per-file diff target.
 fn changed_files(
+    repo: &Repo,
     g: &gix::Repository,
     old: Option<ObjectId>,
     new: ObjectId,
@@ -1131,9 +1140,34 @@ fn changed_files(
         limit: 1000,
         ..Default::default()
     }));
-    let changes = g
-        .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), options)
-        .map_err(eh)?;
+    let changes = match g.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), options) {
+        Ok(changes) => changes,
+        // The rename detection compares deleted with added blobs, which a partial clone may lack: fetch them, retry.
+        Err(_) if content::is_partial_clone(g) => {
+            let plain = g
+                .diff_tree_to_tree(
+                    Some(&old_tree),
+                    Some(&new_tree),
+                    gix::diff::Options::default().with_rewrites(None),
+                )
+                .map_err(eh)?;
+            let candidates: Vec<ObjectId> = plain
+                .iter()
+                .filter_map(|change| match change {
+                    C::Addition { entry_mode, id, .. } | C::Deletion { entry_mode, id, .. }
+                        if !entry_mode.is_tree() && !entry_mode.is_commit() =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            content::fetch_missing_objects(repo, &candidates, &CancelToken::new())?;
+            g.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), options)
+                .map_err(eh)?
+        }
+        Err(err) => return Err(eh(err)),
+    };
     let mut cache = if line_stats {
         Some(g.diff_resource_cache_for_tree_diff().map_err(eh)?)
     } else {
@@ -1242,6 +1276,7 @@ fn changed_files(
 }
 
 fn commit_files_inner(
+    repo: &Repo,
     g: &gix::Repository,
     commit: ObjectId,
     against: Against,
@@ -1251,14 +1286,19 @@ fn commit_files_inner(
         .find_commit(commit)
         .map_err(|_| not_found("commit", commit))?;
     let old_tree = against_tree(g, &commit_obj, against)?.map(|t| t.id);
-    let mut files = changed_files(g, old_tree, commit, opts.line_stats, &|path, previous| {
-        DiffTarget::Commit {
+    let mut files = changed_files(
+        repo,
+        g,
+        old_tree,
+        commit,
+        opts.line_stats,
+        &|path, previous| DiffTarget::Commit {
             commit,
             against,
             path: path.clone(),
             previous_path: previous.cloned(),
-        }
-    })?;
+        },
+    )?;
     if opts.stash {
         let parents: Vec<ObjectId> = commit_obj.parent_ids().map(|id| id.detach()).collect();
         if let [_, _, untracked] = parents[..] {
@@ -1266,14 +1306,15 @@ fn commit_files_inner(
                 .find_commit(untracked)
                 .map_err(|_| not_found("commit", untracked))?;
             if untracked_commit.parent_ids().next().is_none() {
-                let extra = changed_files(g, None, untracked, opts.line_stats, &|path, _| {
-                    DiffTarget::Commit {
-                        commit: untracked,
-                        against: Against::Empty,
-                        path: path.clone(),
-                        previous_path: None,
-                    }
-                })?;
+                let extra =
+                    changed_files(repo, g, None, untracked, opts.line_stats, &|path, _| {
+                        DiffTarget::Commit {
+                            commit: untracked,
+                            against: Against::Empty,
+                            path: path.clone(),
+                            previous_path: None,
+                        }
+                    })?;
                 files.extend(extra);
             }
         }
@@ -1370,7 +1411,7 @@ pub fn tree_files(
 ) -> Result<Vec<CommitFile>> {
     let g = repo.local();
     let against = old.map_or(Against::Empty, Against::Commit);
-    changed_files(&g, old, new, line_stats, &|path, previous| {
+    changed_files(repo, &g, old, new, line_stats, &|path, previous| {
         DiffTarget::Commit {
             commit: new,
             against,
@@ -1791,11 +1832,13 @@ pub fn export_patch(repo: &Repo, what: &ExportPatch, cancel: &CancelToken) -> Re
     Ok(out.into())
 }
 
-/// Raw blob bytes (image previews, "open file at revision"), refusing above `max_bytes`.
+/// Raw blob bytes (image previews, "open file at revision"), refusing above `max_bytes`. In a partial clone a blob
+/// that is missing locally is fetched from the promisor remote first, as Git does.
 ///
 /// Errors: `NotFound` (no such blob), `TooLarge` (the blob is larger than `max_bytes`; the check reads only the
-/// object header).
+/// object header), the classified failure of fetching a missing blob (`Network`, `AuthFailed`, ...).
 pub fn read_blob(repo: &Repo, id: ObjectId, max_bytes: u64) -> Result<Arc<[u8]>> {
+    content::fetch_missing_objects(repo, &[id], &CancelToken::new())?;
     let g = repo.local();
     let size = g
         .try_find_header(id)

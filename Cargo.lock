@@ -2905,15 +2905,10 @@ name = "gitbutler-git"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "but-core",
  "but-testsupport",
  "file-id",
- "futures",
  "gix",
- "nix 0.30.1",
  "rand 0.9.4",
- "serde",
- "snapbox",
  "sysinfo 0.37.2",
  "thiserror 2.0.18",
  "tokio",
@@ -6553,7 +6548,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
- "memoffset",
 ]
 
 [[package]]

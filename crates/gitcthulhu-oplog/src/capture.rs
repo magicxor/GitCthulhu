@@ -352,8 +352,9 @@ fn probe_unreadable(path: &Path) -> bool {
 }
 
 /// Which of the untracked `paths` (directories expand to the untracked, non-ignored files below them) a capture
-/// would skip: `CaptureDisabled`, `TooLarge` or `Unreadable`. Stat and open probe only: no hashing, no object
-/// writes, no lock. Tracked, ignored and missing paths and nested repositories are not reported.
+/// would skip: `CaptureDisabled`, `TooLarge` or `Unreadable`, and untracked nested repositories at or below them
+/// (`NestedRepository`, whatever the options: no snapshot holds them). Stat and open probe only: no hashing, no
+/// object writes, no lock. Tracked, ignored and missing paths are not reported.
 pub(crate) fn preview_skipped(
     repo: &gix::Repository,
     paths: &[BString],
@@ -366,11 +367,11 @@ pub(crate) fn preview_skipped(
         None,
         gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
     )?;
-    let mut files = BTreeSet::new();
+    let mut found = Untracked::default();
     for path in paths {
         let rela = normalize_rela(path.as_bstr());
         if rela.is_empty() {
-            collect_children(workdir, workdir, rela, &index, &mut excludes, &mut files)?;
+            collect_children(workdir, workdir, rela, &index, &mut excludes, &mut found)?;
             continue;
         }
         // Git never descends into an ignored directory, so nothing below one is untracked.
@@ -385,11 +386,19 @@ pub(crate) fn preview_skipped(
             }
         }
         if !below_ignored_dir {
-            collect_untracked_files(workdir, rela, &index, &mut excludes, &mut files)?;
+            collect_untracked_files(workdir, rela, &index, &mut excludes, &mut found)?;
         }
     }
-    let mut out = Vec::new();
-    for rela in files {
+    let mut out: Vec<SkippedFile> = found
+        .nested_repositories
+        .into_iter()
+        .map(|path| SkippedFile {
+            path,
+            size: 0,
+            reason: SkipReason::NestedRepository,
+        })
+        .collect();
+    for rela in found.files {
         let full_path = workdir.join(gix::path::from_bstr(rela.as_bstr())?);
         let size = file_size(&full_path);
         let reason = if !limits.capture_untracked {
@@ -409,17 +418,27 @@ pub(crate) fn preview_skipped(
             });
         }
     }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
 
-/// Add `rela` (or, for a directory, every file below it) to `out` unless it is tracked, ignored, inside `.git` or a
-/// nested repository.
+/// What [`collect_untracked_files()`] finds.
+#[derive(Default)]
+struct Untracked {
+    /// Untracked files.
+    files: BTreeSet<BString>,
+    /// Untracked directories with a `.git` entry (not descended into).
+    nested_repositories: BTreeSet<BString>,
+}
+
+/// Add `rela` (or, for a directory, every file below it) to `out` unless it is tracked, ignored or inside `.git`. An
+/// untracked directory with a `.git` entry is a nested repository: recorded as such, not descended into.
 fn collect_untracked_files(
     workdir: &Path,
     rela: &BStr,
     index: &gix::index::State,
     excludes: &mut gix::AttributeStack<'_>,
-    out: &mut BTreeSet<BString>,
+    out: &mut Untracked,
 ) -> anyhow::Result<()> {
     if rela.is_empty() || rela.split_str("/").any(|c| c.eq_ignore_ascii_case(b".git")) {
         return Ok(());
@@ -439,11 +458,15 @@ fn collect_untracked_files(
     }
     if !is_dir {
         if index.entry_by_path(rela).is_none() {
-            out.insert(rela.to_owned());
+            out.files.insert(rela.to_owned());
         }
         return Ok(());
     }
     if full_path.join(".git").exists() {
+        // A submodule's work tree is tracked (a gitlink entry); anything else is a nested repository.
+        if index.entry_by_path(rela).is_none() {
+            out.nested_repositories.insert(rela.to_owned());
+        }
         return Ok(());
     }
     collect_children(workdir, &full_path, rela, index, excludes, out)
@@ -457,7 +480,7 @@ fn collect_children(
     rela: &BStr,
     index: &gix::index::State,
     excludes: &mut gix::AttributeStack<'_>,
-    out: &mut BTreeSet<BString>,
+    out: &mut Untracked,
 ) -> anyhow::Result<()> {
     let mut children = Vec::new();
     for entry in std::fs::read_dir(full_path)

@@ -304,6 +304,13 @@ pub enum GitError {
         /// The branch.
         branch: String,
     },
+    /// Deleting an untracked path would delete a nested Git repository (a directory with a `.git` entry at or below
+    /// it) with its whole history, which no snapshot can restore. Pass `allow_nested` once the user agreed.
+    #[error("'{}' contains a Git repository; deleting it would also delete that repository's history", path.display())]
+    NestedRepository {
+        /// The directory that holds the `.git` entry.
+        path: PathBuf,
+    },
     /// Something does not exist.
     #[error("'{name}' does not exist")]
     NotFound {
@@ -479,6 +486,7 @@ pub enum GitErrorKind {
     AlreadyExists,
     InvalidName,
     NotFullyMerged,
+    NestedRepository,
     NotFound,
     HookFailed,
     SigningFailed,
@@ -534,6 +542,7 @@ impl GitError {
             GitError::AlreadyExists { .. } => K::AlreadyExists,
             GitError::InvalidName { .. } => K::InvalidName,
             GitError::NotFullyMerged { .. } => K::NotFullyMerged,
+            GitError::NestedRepository { .. } => K::NestedRepository,
             GitError::NotFound { .. } => K::NotFound,
             GitError::HookFailed { .. } => K::HookFailed,
             GitError::SigningFailed { .. } => K::SigningFailed,

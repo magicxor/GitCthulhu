@@ -12,18 +12,12 @@ doctest = false
 [features]
 default = ["tokio"]
 tokio = ["dep:tokio"]
-## a flag to indicate benchmarks are run
-benches = []
-## a flag to turn on the askpass machinery for Git commands (should be enabled for GUI, disabled for CLI)
-askpass = []
 
 [dependencies]
-but-core.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, optional = true, features = [
-    "process",
     "time",
     "io-util",
     "net",
@@ -31,13 +25,8 @@ tokio = { workspace = true, optional = true, features = [
     "rt-multi-thread",
 ] }
 rand.workspace = true
-futures.workspace = true
 sysinfo = { workspace = true, features = ["system"] }
 gix.workspace = true
-serde.workspace = true
-
-[target."cfg(unix)".dependencies]
-nix = { workspace = true, features = ["process", "socket", "user"] }
 
 [target."cfg(windows)".dependencies]
 windows = { version = "0.62.0", features = [
@@ -55,7 +44,6 @@ file-id.workspace = true
 
 [dev-dependencies]
 but-testsupport.workspace = true
-snapbox.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]

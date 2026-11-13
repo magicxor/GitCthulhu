@@ -282,6 +282,56 @@ fn matches_git_log_follow_on_fixture() {
     }
 }
 
+/// main renames `b.txt` to `d/c.txt`; a branch forked before the rename edits `b.txt` and is merged in. The merge
+/// modifies `d/c.txt` relative to its first parent: the rename seen from the side parent is followed, but is not the
+/// merge's rename source (the GUI diffs an entry against the first parent with `previous_path` as the old path).
+#[test]
+fn merge_with_rename_on_the_side_parent_is_a_modification() {
+    let env = TestEnv::new();
+    let fixture = env.repo("repo");
+    let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    fixture.write("b.txt", &body);
+    fixture.commit_all("add b");
+    fixture.git(&["switch", "-q", "-c", "side"]);
+    fixture.write("b.txt", body.replace("line 25\n", "SIDE 25\n"));
+    let side_edit = fixture.commit_all("side edits b");
+    fixture.git(&["switch", "-q", "main"]);
+    std::fs::create_dir_all(fixture.path.join("d")).expect("directory");
+    fixture.git(&["mv", "b.txt", "d/c.txt"]);
+    let rename = fixture.commit_all("move b to d/c");
+    fixture.git(&["merge", "-q", "--no-edit", "side"]);
+    let merge = ObjectId::from_hex(fixture.git(&["rev-parse", "HEAD"]).as_bytes()).expect("hex");
+
+    let entries = history(&fixture, "d/c.txt", true);
+    let merge_entry = entries
+        .iter()
+        .find(|entry| entry.commit.id == merge)
+        .expect("the merge changes d/c.txt against both parents");
+    assert_eq!(
+        merge_entry.kind,
+        ChangeKind::Modified,
+        "against its first parent the merge modifies d/c.txt"
+    );
+    assert_eq!(
+        merge_entry.previous_path, None,
+        "the side parent's rename is no source of the merge's change"
+    );
+    let rename_entry = entries
+        .iter()
+        .find(|entry| entry.commit.id == rename)
+        .expect("the rename is listed");
+    assert_eq!(rename_entry.kind, ChangeKind::Renamed, "main's rename");
+    assert_eq!(
+        rename_entry.previous_path.as_ref().map(ToString::to_string),
+        Some("b.txt".to_owned()),
+        "main's rename names its source"
+    );
+    assert!(
+        ids(&entries).contains(&side_edit),
+        "the side branch is still followed under the old name"
+    );
+}
+
 #[test]
 fn history_merge_diamond_no_duplicates() {
     let env = TestEnv::new();

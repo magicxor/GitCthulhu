@@ -1,46 +1,131 @@
 # Developing GitCthulhu
 
-GitCthulhu is a Rust workspace (`crates/`); see [`crates/AGENTS.md`](crates/AGENTS.md) for the crate layout and
-engineering rules.
+GitCthulhu is one Rust workspace (`crates/`). [`crates/AGENTS.md`](crates/AGENTS.md) holds the engineering rules;
+[`AGENTS.md`](AGENTS.md) the rules for agents working on this checkout.
+
+## Workspace layout
+
+| Group | Crates |
+| --- | --- |
+| GUI | `gitcthulhu`: the binary (gpui-kit 0.7.3, pinned), plus the helper programs `gitcthulhu-askpass` and `gitcthulhu-editor` |
+| Git backend | `gitcthulhu-git`: plain-Git backend, blocking API, no GPUI; `gitcthulhu-oplog`: snapshot undo/redo |
+| Services | `gitcthulhu-services`: forge, AI and update services over the crates below, no GPUI |
+| Preserved from GitButler | `but-forge`, `but-forge-storage`, `but-github`, `but-gitlab`, `but-bitbucket`, `but-secret` (forges and keychain), `but-llm` (AI), `but-tty` (terminal emulation, libghostty-vt), `but-update`, `but-installer`, `but-db` |
+| Git core and support | `but-core` (snapshots for the oplog; GitButler-era tests with known failures), `gitbutler-git` (askpass harness), `gitbutler-filemonitor` (+ `gitbutler-notify-debouncer`), `but-error`, `but-serde`, `but-utils`, `but-path`, `but-project-handle`, `but-askpass`, `but-testsupport` |
+
+`but-path`, `but-project-handle`, `but-askpass` and `but-installer` have no dependents in the workspace.
+
+## Git engine policy
+
+- Reads (status, diff, log and graph walk, refs, blame, file history, config) run in-process through `gix`.
+- Mutations (commit, checkout, merge, rebase, cherry-pick, revert, reset, stash, tag, branch, remote, submodule,
+  worktree, clone, fetch, pull, push) run the `git` executable (2.34.1 or newer) with askpass-based credential
+  prompts, so hooks run natively; `--no-verify` is only passed for an explicit "Retry without hooks".
+- Whole-file staging runs `git add` / `git restore` / `git rm`; hunk and line staging is an in-process index edit
+  under `index.lock` after a stale check.
+- No `git2`/libgit2.
 
 ## Prerequisites
 
 - Rust, as pinned in `rust-toolchain.toml` (install with rustup).
 - Windows: the Windows SDK (provides `fxc.exe`).
-- Zig 0.17 on `PATH`: `but-tty` builds libghostty-vt with it. The GUI's default `terminal` feature depends on
-  `but-tty`, so `--exclude but-tty` alone does not help. Without Zig use
-  `cargo check --workspace --exclude but-tty --exclude gitcthulhu` plus
-  `cargo check -p gitcthulhu --no-default-features --features services` for the GUI (see `README.md`); the
-  Terminal button is then disabled. `cargo test --workspace` needs the same two exclusions; the `make` targets
-  build the whole workspace and so need Zig.
+- Zig 0.17 on `PATH`: `but-tty` builds libghostty-vt with it, and its build script clones the Ghostty sources at the
+  pinned commit (network and `git` needed on the first build; `GHOSTTY_SOURCE_DIR` points it at a local checkout
+  instead). The GUI's default `terminal` feature depends on `but-tty`, so `--exclude but-tty` alone does not help.
+  Without Zig use `cargo check --workspace --exclude but-tty --exclude gitcthulhu` plus `cargo check -p gitcthulhu
+  --no-default-features --features services` for the GUI; the Terminal button is then disabled.
 - Linux: `libxcb1-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev
-  libfreetype-dev libssl-dev` (GUI and `-sys` crates) and `libdbus-1-dev pkg-config` (keyring);
-  `scripts/install-minimal-debian-dependencies.sh` installs the latter on Debian/Ubuntu. On Windows, `pwsh -NoProfile
-  -File tools/dev/linux-test.ps1 <cargo arguments>` runs cargo in a Linux container (`--git-min`: Git 2.34.1).
-- Optional: `nix develop` (or `direnv allow`) gives a dev shell with Rust and Zig; `cargo-nextest` for faster tests.
+  libfreetype-dev libssl-dev pkg-config`. CI and the Docker image also install `libdbus-1-dev`
+  (`scripts/install-minimal-debian-dependencies.sh`), although no crate of the current dependency graph links it.
+- Optional: `cargo-nextest` (`make test`); `nix develop` gives Rust, Zig, nextest, cargo-deny and a few tools, but
+  not the Linux GUI libraries above.
 
 ## Everyday commands
 
 ```sh
-make            # fmt, fmt-check, check, clippy
+make            # fmt, fmt-check, check, clippy (the whole workspace: needs Zig)
 make test       # cargo nextest run --workspace --exclude but-core
 cargo test --workspace --exclude but-core
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt
 ```
 
-`but-core` still carries GitButler-era tests with known failures (decision D2, slated for the slimming stage), so
-the commands above exclude it. CI runs it separately and non-blocking: `cargo test -p but-core` (`make
-test-legacy`).
+`but-core` still carries GitButler-era tests with known failures (on Windows its fixtures need Unix shell scripts;
+on Linux three ref-name tests fail), so the commands above exclude it. CI runs it separately and non-blocking:
+`cargo test -p but-core` (`make test-legacy`).
 
-`scripts/cargo-test.sh` deletes generated fixtures before running tests; `scripts/clean.sh` removes build output.
+`scripts/cargo-test.sh` deletes generated fixtures before running tests. `scripts/clean.sh` deletes the generated
+fixtures, and with `--target` also `target/` (never in a main checkout that seeds agent worktrees).
+
+CI (`.github/workflows/ci.yaml`): fmt; clippy, check, the terminal-free GUI check and the tests on Windows, Linux and
+macOS; the `gitcthulhu-git` suite in an Ubuntu 22.04 container with Git 2.34.1 and a German locale. It has not run
+yet for this branch (never pushed).
+
+## Build tooling for parallel worktrees
+
+- `tools/dev/seed-target.ps1` copies the main checkout's compiled dependencies into a fresh worktree's `target/`, so
+  only the workspace crates are compiled there. The main checkout's `target/` is the seed: never `cargo clean` it.
+- `.cargo/config.toml` sets `--cfg tokio_unstable` for Tokio diagnostics; `[profile.dev]` keeps line tables only for
+  the workspace crates.
+
+## Linux runner (Docker)
+
+`pwsh -NoProfile -File tools/dev/linux-test.ps1 <cargo arguments>` runs cargo for this checkout in a container
+(image `gitcthulhu-linux-dev:<toolchain>-<hash>`, rust:1-trixie with the Linux packages and Zig, user uid 1000). Build
+state lives in named volumes: `gitcthulhu-target-main-<hash>` for the main checkout,
+`gitcthulhu-target-wt-<folder>-<hash>` for a worktree, and the shared `gitcthulhu-cargo-home`. `--git-min` uses a
+second image built from ubuntu:22.04 (Git 2.34.1) with its own volumes. `--update` refreshes the image,
+`--drop-volume` deletes a worktree's volume, `--gc` deletes the volumes of worktrees that no longer exist,
+`--prune-images` deletes other tags of the image. The script header documents every option. Examples:
+
+```powershell
+pwsh -NoProfile -File tools/dev/linux-test.ps1 test --workspace --exclude but-core
+pwsh -NoProfile -File tools/dev/linux-test.ps1 --git-min test -p gitcthulhu-git
+```
+
+## QA runner: screenshots of the real window (Windows)
+
+Headless gpui tests (`#[gpui_kit::test]`) check element bounds against the layout specs. To see the real window, the
+`qa` feature adds an in-process scenario runner (`crates/gitcthulhu/src/qa`, `tools/qa`): the app drives itself
+through its own actions, waits until it is idle and captures its own window with `PrintWindow` into PNG files. No OS
+input is injected. Screen capture is implemented for Windows only.
+
+```powershell
+pwsh -NoProfile -File tools\qa\new-sandbox.ps1 -Dest <a folder below "scratch" or %TEMP%>\sbx
+pwsh -NoProfile -File tools\qa\run-gui.ps1 -Sandbox <sbx> -Scenario tools\qa\scenarios\main-window.qa
+pwsh -NoProfile -File tools\qa\run-credential-flow.ps1 -Sandbox <sbx>    # push through a local http server
+```
+
+The sandbox holds synthetic fixture repositories and the app data of the run; a qa build refuses to start outside
+one (no network, no real profile). `run-gui.ps1` builds with `--features qa`, writes `report.txt` (one PASS/FAIL/SKIP
+line per step), `verbs.txt` (the scenario language of the build) and the screenshots into `<sbx>\out\<scenario>`.
+Exit codes: 0 passed, 1 a step failed, 2 usage error, 3 the sandbox gate refused, 101 panic (`panic.txt`), 124
+timeout, 125 no report. The scenarios in `tools/qa/scenarios` cover the welcome page, the main window, dialogs,
+rebase, undo, terminal, AI, forge, worktrees, update notice and credentials. `AGENTS.md` describes the scenario
+language and how to add verbs. Never run a qa build outside `run-gui.ps1`.
+
+## Performance tests
+
+The budgets are in spec 20 §9 (backend) and 21 §4.1 (GUI). The perf tests are `#[ignore]`d; they print their
+measurements and assert the budget only with `GITCTHULHU_PERF_ASSERT=1`. Run them in release, one at a time, on a
+quiet machine, and judge by the median of several runs:
+
+```sh
+GITCTHULHU_PERF_ASSERT=1 cargo test --release -p gitcthulhu-git --test perf -- --ignored --exact perf_repo_open --nocapture
+GITCTHULHU_PERF_ASSERT=1 cargo test --release -p gitcthulhu-git --test status -- --ignored perf_status_100k_files --nocapture
+cargo test --release -p gitcthulhu-oplog --test restore -- --ignored perf --nocapture
+cargo test --release -p gitcthulhu --lib diff_50k -- --ignored
+```
+
+`tests/perf.rs` holds the log, refs, commit details, blame and file history tests (sizes overridable through
+`GITCTHULHU_PERF_*`, see its header); status, graph, diff and stage have theirs next to their modules. CI does not
+run them.
 
 ## Debugging
 
-- Logs honour `RUST_LOG` and are written to the log file described below. A release build on Windows has no
-  console (`windows_subsystem = "windows"`), so `RUST_LOG` output only reaches the log file there.
-- App data, config and cache live under the `gitcthulhu` identity (`crates/gitcthulhu/src/paths.rs`, mirrored by
-  `but-path`); `GITCTHULHU_HOME` redirects all of them, which the tests use for throw-away directories.
-- `.cargo/config.toml` sets `--cfg tokio_unstable` for Tokio diagnostics.
+- Logs honour `RUST_LOG` and go to the log file below. A Windows release build has no console
+  (`windows_subsystem = "windows"`), so output only reaches the log file there.
+- `GITCTHULHU_HOME` redirects all application directories (the tests and the QA sandbox use it).
 
 ## Where GitCthulhu keeps its data
 
@@ -51,13 +136,13 @@ test-legacy`).
 | Logs: `gitcthulhu.log`, rotated at 10 MB, 5 files kept | `<data>/logs` |
 | Cache | `dirs::cache_dir()/gitcthulhu` (`%LOCALAPPDATA%\gitcthulhu`, `~/.cache/gitcthulhu`, `~/Library/Caches/gitcthulhu`) |
 
-`GITCTHULHU_HOME` replaces all of them by `config`, `data`, `logs` and `cache` below it. Attach `gitcthulhu.log` to
-bug reports.
+On Windows data and cache are the same folder. `GITCTHULHU_HOME` replaces all of them by `config`, `data`, `logs`
+and `cache` below it. Attach `gitcthulhu.log` to bug reports.
 
 - **Inside your repositories**: the undo log is kept as Git objects under `refs/gitcthulhu/oplog/main` (a linked
-  worktree uses `refs/gitcthulhu/oplog/linked/<id>`). Inspect them with `git for-each-ref refs/gitcthulhu`; remove
-  one with `git update-ref -d <ref>` (this drops the undo history of that repository; `git gc` then frees the
-  objects).
+  worktree uses `refs/gitcthulhu/oplog/linked/<id>`), and the commit message draft in
+  `.git/gitcthulhu/commit-draft`. Inspect the refs with `git for-each-ref refs/gitcthulhu`; remove one with `git
+  update-ref -d <ref>` (this drops the undo history of that repository; `git gc` then frees the objects).
 - **OS keychain**: forge tokens, AI provider keys and the proxy password are stored in the OS keychain (service
   names start with `gitcthulhu-`, user name `GitCthulhu`), never in the files above.
 - **Reset**: close the application and delete the directories above. To remove everything, also delete the
@@ -94,4 +179,4 @@ the bootstrap script additionally `GITCTHULHU_INSTALLER_URL`; release informatio
 configured host, downloads also from its subdomains, always over HTTPS. The macOS installer expects a
 `GitCthulhu.app` bundle with `Contents/MacOS/{gitcthulhu,gitcthulhu-askpass,gitcthulhu-editor}`, the Linux one a
 `gitcthulhu` binary (plus `gitcthulhu.sig`) next to the platform download. The release pipeline that publishes these
-is future work.
+does not exist yet, and the bootstrap script downloads the installer without a signature check.

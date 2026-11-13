@@ -14,7 +14,10 @@ Apply all relevant instruction files. If instructions conflict, resolve them in 
 
 - `crates/` - all code is Rust; see `crates/AGENTS.md` for the crate layout and Rust rules.
 - `scripts/` - helper scripts for the Rust workspace and the installer bootstrap.
-- `.github/` - one Rust CI workflow (Windows, Linux, macOS) plus security scans.
+- `tools/dev/` - `seed-target.ps1` (worktree build seed) and `linux-test.ps1` (cargo in Docker).
+- `tools/qa/` - the QA runner scripts and scenarios (real-window screenshots, see below).
+- `.github/` - one Rust CI workflow (Windows, Linux, macOS, Git 2.34.1) plus security scans.
+- `README.md` (users), `DEVELOPMENT.md` (build, data locations, build configuration, perf tests).
 
 ## Working Style
 
@@ -120,9 +123,9 @@ pwsh -NoProfile -File tools\qa\run-gui.ps1 -Sandbox <sbx> -Scenario tools\qa\sce
 Then `Read` the PNG files (the output directory defaults to `<sbx>\out\<scenario>`; `report.txt` has one PASS/FAIL/SKIP
 line per step, `verbs.txt` lists every verb of the build). The window opens briefly on the desktop at 1280x720 and
 does not take the keyboard focus; keep runs short and few (one scenario per question, several `shot` steps per run).
-Exit codes: 0 passed, 1 a step failed, 2 usage error, 3 the gate refused, 124 timeout (the app's watchdog, or the
-script kills the process it started 15 s later), 125 no report (crash: see `stderr.txt`, `panic.txt`). A qa build
-only runs scenarios: it never opens an interactive window.
+Exit codes: 0 passed, 1 a step failed, 2 usage error, 3 the gate refused, 101 panic (`panic.txt`), 124 timeout
+(the app's watchdog, or the script kills the process it started 15 s later), 125 no report (crash: see
+`stderr.txt`). A qa build only runs scenarios: it never opens an interactive window.
 
 - **Scenario language** (`tools/qa/scenarios/*.qa`, one step per line, `#` comments): `open repository <fixture|path>`,
   `select tab|log row|commit|branch|tag|stash|file|uncommitted row ...`, `open diff`, `set diff split|unified`,

@@ -5,7 +5,8 @@
 //! Loading: the details of the selected commit are read in the background (`backend::details::commit_details`).
 //! The previous commit's content stays visible while the next one loads (anti-flicker); a progress bar appears
 //! only when loading takes longer than 150 ms. Only one file can be selected; selecting it opens its diff in the
-//! centre pane (`RepoUi::click_file`). The loaded files are also published in `RepoUi::commit_files`, which is
+//! centre pane (`RepoUi::click_file`). After a click on a row the list has the keyboard focus: Up / Down select the
+//! previous / next file (directory rows of tree mode are skipped). The loaded files are also published in `RepoUi::commit_files`, which is
 //! where `RepoUi::diff_target` takes renames and the untracked files of a stash from.
 
 use std::collections::HashSet;
@@ -13,13 +14,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::{
-    App, AppContext as _, AsyncApp, Context, Entity, IntoElement, Render, SharedString,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    App, AppContext as _, AsyncApp, Context, Entity, FocusHandle, IntoElement, KeyBinding,
+    Modifiers, Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle,
+    WeakEntity, Window,
 };
 
 use crate::backend::{CommitDetails, GitError, GitTime, ObjectId, details};
 use crate::notifications::ToastKind;
-use crate::tab::ui::CloseableView;
+use crate::tab::ui::{CloseableView, FileList};
 use crate::tab::{ReadSlot, RepoUiEvent, TabCtx};
 use crate::widgets::field::{SearchEvent, SearchField};
 
@@ -28,6 +30,19 @@ mod render;
 pub mod rows;
 
 use rows::Rows;
+
+/// Key context of the files column (Up / Down move the file selection).
+pub const COMMIT_CHANGES_CONTEXT: &str = "CommitChanges";
+
+gpui_kit::actions!(
+    gitcthulhu_commit_changes,
+    [
+        /// Selects the previous file of the list (Up).
+        SelectPreviousFile,
+        /// Selects the next file of the list (Down).
+        SelectNextFile,
+    ]
+);
 
 /// Element ids of the commit changes view.
 pub mod ids {
@@ -136,6 +151,9 @@ pub struct CommitChangesView {
     rows_tree: bool,
     rows_dirty: bool,
     scroll: UniformListScrollHandle,
+    /// Keyboard focus of the list (taken by a click on a row); a zero-size target, so it is not an ancestor of the
+    /// filter field.
+    focus: FocusHandle,
     copied: bool,
     copied_task: Option<Task<()>>,
     /// Tests: holds a finished load back (virtual time) so the loading states can be observed.
@@ -170,6 +188,7 @@ impl CommitChangesView {
             rows_tree: false,
             rows_dirty: false,
             scroll: UniformListScrollHandle::new(),
+            focus: cx.focus_handle(),
             copied: false,
             copied_task: None,
             #[cfg(test)]
@@ -455,6 +474,44 @@ impl CommitChangesView {
         cx.notify();
     }
 
+    /// Up / Down: selects the previous / next file row like a click (the diff follows) and scrolls it into view. A
+    /// selection that is not in the list (filtered out, in a collapsed directory) moves to the first / last file.
+    fn move_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.list_is_current() {
+            return;
+        }
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let selected = self
+            .ctx
+            .ui
+            .read(cx)
+            .files
+            .single(FileList::CommitFiles)
+            .cloned();
+        let path_of = |row: usize| Some(&loaded.files.get(self.rows.file_index(row)?)?.path);
+        let from = selected
+            .and_then(|selected| (0..self.rows.len()).find(|&row| path_of(row) == Some(&selected)));
+        let Some(row) = self.rows.adjacent_file_row(from, forward) else {
+            return;
+        };
+        let Some(path) = path_of(row).cloned() else {
+            return;
+        };
+        self.ctx.ui.update(cx, |ui, cx| {
+            ui.click_file(
+                FileList::CommitFiles,
+                path.clone(),
+                Modifiers::default(),
+                std::slice::from_ref(&path),
+                cx,
+            )
+        });
+        self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
     // -- footer ----------------------------------------------------------------------------------------------
 
     /// Copies the full hash and shows "Copied!" for two seconds (08 §5.1).
@@ -490,10 +547,16 @@ impl Render for CommitChangesView {
     }
 }
 
-/// Registers the view's key bindings, actions and menu extenders (G6). The region binds no keys of its own:
-/// Escape (closing the filter) is handled by the repository frame through `RepoUi::close_last_view`, and the
-/// committed-file menu is built by `menus::commit_files`.
-pub fn register(_cx: &mut App) {}
+/// Registers the view's key bindings (G6): Up / Down in [`COMMIT_CHANGES_CONTEXT`]. Escape (closing the filter) is
+/// handled by the repository frame through `RepoUi::close_last_view`, and the committed-file menu is built by
+/// `menus::commit_files`.
+pub fn register(cx: &mut App) {
+    let context = Some(COMMIT_CHANGES_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPreviousFile, context),
+        KeyBinding::new("down", SelectNextFile, context),
+    ]);
+}
 
 #[cfg(test)]
 mod tests;

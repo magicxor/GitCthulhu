@@ -950,7 +950,9 @@ fn pathspec_with_glob_chars_is_literal() {
     }
 }
 
-#[cfg(unix)]
+// Not on macOS: its file systems refuse a name that is no UTF-8 ("Illegal byte sequence"), so such a
+// file cannot be in a worktree there.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_path_roundtrips() {
     use std::os::unix::ffi::OsStrExt;

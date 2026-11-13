@@ -133,7 +133,8 @@ mod service {
     pub fn endpoint_hint(provider: AiProvider) -> String {
         let defaults = AiSettings::default();
         match provider {
-            AiProvider::OpenAi => "https://api.openai.com/v1 (default)".to_owned(),
+            // The row text says that a blank field means OpenAI; "(default)" would not fit the 240 dp field.
+            AiProvider::OpenAi => "https://api.openai.com/v1".to_owned(),
             AiProvider::Anthropic => String::new(),
             other => endpoint_of(&defaults, other),
         }

@@ -12,7 +12,10 @@ use gpui_kit::{
 };
 
 use super::rows::blame_revision;
-use super::{AVATAR_SIZE, CommitChangesView, FOOTER_H, LIST_PAD_BOTTOM, Loaded, MESSAGE_H, ids};
+use super::{
+    AVATAR_SIZE, COMMIT_CHANGES_CONTEXT, CommitChangesView, FOOTER_H, LIST_PAD_BOTTOM, Loaded,
+    MESSAGE_H, SelectNextFile, SelectPreviousFile, ids,
+};
 use crate::backend::{ByteSlice as _, GitTime};
 use crate::icons::AppIcon;
 use crate::menus::{self, MenuKind, MenuTarget};
@@ -123,6 +126,10 @@ impl CommitChangesView {
             .flex()
             .flex_col()
             .pb(dp(LIST_PAD_BOTTOM))
+            .key_context(COMMIT_CHANGES_CONTEXT)
+            .on_action(cx.listener(|v, _: &SelectPreviousFile, _, cx| v.move_selection(false, cx)))
+            .on_action(cx.listener(|v, _: &SelectNextFile, _, cx| v.move_selection(true, cx)))
+            .child(div().track_focus(&self.focus).size_0())
             .child(column)
     }
 
@@ -159,6 +166,7 @@ impl CommitChangesView {
             .cloned();
         let ctx = Rc::new(self.ctx.clone());
         let view = cx.entity().downgrade();
+        let focus = self.focus.clone();
         let count = rows.len();
         let list = uniform_list(LIST_ELEMENT, count, move |range, _window, _cx| {
             range
@@ -172,9 +180,10 @@ impl CommitChangesView {
                             let menu_ctx = ctx.clone();
                             let menu_path = path.clone();
                             let menu_commit = blame_revision(file, selected_commit, first_parent);
+                            let click_focus = focus.clone();
                             let row = FileRow::new((ids::ROW, ix), path.to_vec(), file.kind)
                                 .selected(selected.as_ref() == Some(&path))
-                                .on_click(move |event: &ClickEvent, _window, cx| {
+                                .on_click(move |event: &ClickEvent, window, cx| {
                                     // Single selection only (08 §5.2): the modifiers are ignored by
                                     // `click_file` for this list; a stale list (the next commit is still
                                     // loading) is inert.
@@ -191,6 +200,8 @@ impl CommitChangesView {
                                             cx,
                                         )
                                     });
+                                    // Up / Down move the selection from here on.
+                                    window.focus(&click_focus, cx);
                                 })
                                 .on_context_menu(move |event, window, cx| {
                                     if !current {
@@ -219,13 +230,15 @@ impl CommitChangesView {
                         } => {
                             let view = view.clone();
                             let dir = path.clone();
+                            let toggle_focus = focus.clone();
                             DirectoryRow::new(
                                 (ids::DIR_ROW, ix),
                                 SharedString::from(name.to_str_lossy().into_owned()),
                                 *depth,
                                 *expanded,
                             )
-                            .on_toggle(move |_, cx| {
+                            .on_toggle(move |window, cx| {
+                                window.focus(&toggle_focus, cx);
                                 view.update(cx, |v, cx| v.toggle_dir(dir.clone(), cx)).ok();
                             })
                             .into_any_element()

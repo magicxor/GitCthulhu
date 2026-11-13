@@ -34,6 +34,18 @@ impl Rows {
             TreeRow::Dir { .. } => None,
         }
     }
+
+    /// The nearest file row after (`forward`) or before `from`, skipping directory rows; with no `from` the first
+    /// (`forward`) or the last file row. `None` when there is no such row (the list's end).
+    pub fn adjacent_file_row(&self, from: Option<usize>, forward: bool) -> Option<usize> {
+        let is_file = |row: &usize| matches!(self.rows[*row], TreeRow::File { .. });
+        match (from, forward) {
+            (Some(from), true) => (from + 1..self.rows.len()).find(is_file),
+            (Some(from), false) => (0..from.min(self.rows.len())).rev().find(is_file),
+            (None, true) => (0..self.rows.len()).find(is_file),
+            (None, false) => (0..self.rows.len()).rev().find(is_file),
+        }
+    }
 }
 
 /// Whether `path` contains `needle_lower` (already lower-cased), ignoring case (08 §4.3: case-insensitive
@@ -143,6 +155,29 @@ mod tests {
         // a/ (collapsed), top.txt
         assert_eq!(closed.len(), 2);
         assert_eq!(closed.file_index(1), Some(2));
+    }
+
+    #[test]
+    fn adjacent_file_row_skips_directories_and_stops_at_the_ends() {
+        let files = vec![
+            file("a/b/one.txt", ChangeKind::Added),
+            file("a/two.txt", ChangeKind::Modified),
+            file("top.txt", ChangeKind::Deleted),
+        ];
+        // a/, a/b/, one.txt, two.txt, top.txt
+        let rows = build(&files, "", true, &HashSet::new());
+        assert_eq!(rows.adjacent_file_row(None, true), Some(2));
+        assert_eq!(rows.adjacent_file_row(None, false), Some(4));
+        assert_eq!(rows.adjacent_file_row(Some(2), true), Some(3));
+        assert_eq!(rows.adjacent_file_row(Some(3), false), Some(2));
+        assert_eq!(
+            rows.adjacent_file_row(Some(2), false),
+            None,
+            "only directories above"
+        );
+        assert_eq!(rows.adjacent_file_row(Some(4), true), None);
+        assert_eq!(rows.adjacent_file_row(Some(0), true), Some(2));
+        assert_eq!(Rows::default().adjacent_file_row(None, true), None);
     }
 
     #[test]

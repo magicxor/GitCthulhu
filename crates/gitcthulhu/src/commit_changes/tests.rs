@@ -759,3 +759,106 @@ fn file_kinds_follow_the_commit(cx: &mut TestAppContext) {
         );
     });
 }
+
+fn press(cx: &mut TestAppContext, handle: AnyWindowHandle, key: &str) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press(key, cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
+}
+
+fn selected_path(cx: &mut TestAppContext, ui: &Entity<RepoUi>) -> Option<RelaPath> {
+    cx.update(|cx| ui.read(cx).files.single(FileList::CommitFiles).cloned())
+}
+
+/// Up / Down move the single selection to the neighbouring file after a click on a file row; the diff follows.
+#[gpui_kit::test]
+fn arrow_keys_move_the_selection_in_list_mode(cx: &mut TestAppContext) {
+    let h = history();
+    let (handle, _app, tab) = mount_fixture(cx, &h.fixture, DEFAULT_SIZE);
+    select_commit(cx, &tab, h.second);
+    let ui = cx.update(|cx| ui_of(&tab, cx));
+    click_row(cx, handle, 0);
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("docs/guide.md"))
+    );
+    press(cx, handle, "up");
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("docs/guide.md")),
+        "Up on the first file keeps it"
+    );
+    press(cx, handle, "down");
+    press(cx, handle, "down");
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("src/new/deep.rs"))
+    );
+    cx.update(|cx| assert!(ui.read(cx).views.contains(CloseableView::Diff)));
+    press(cx, handle, "up");
+    assert_eq!(selected_path(cx, &ui), Some(RelaPath::from("src/lib.rs")));
+    press(cx, handle, "down");
+    press(cx, handle, "down");
+    press(cx, handle, "down");
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("src/renamed.rs")),
+        "Down on the last file keeps it"
+    );
+}
+
+/// Tree mode: the arrows skip directory rows and the files of collapsed directories.
+#[gpui_kit::test]
+fn arrow_keys_skip_directories_in_tree_mode(cx: &mut TestAppContext) {
+    let h = history();
+    let (handle, _app, tab) = mount_fixture(cx, &h.fixture, DEFAULT_SIZE);
+    select_commit(cx, &tab, h.second);
+    render(cx, handle);
+    cx.update_window(handle, |_, window, cx| {
+        window.click(ids::TOGGLE_TREE, cx);
+        window.render_frame(cx);
+    })
+    .expect("window");
+    let ui = cx.update(|cx| ui_of(&tab, cx));
+    // docs/, guide.md, src/, lib.rs, new/, deep.rs, renamed.rs
+    click_row(cx, handle, 1);
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("docs/guide.md"))
+    );
+    press(cx, handle, "down");
+    assert_eq!(selected_path(cx, &ui), Some(RelaPath::from("src/lib.rs")));
+    press(cx, handle, "down");
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("src/new/deep.rs"))
+    );
+    press(cx, handle, "down");
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("src/renamed.rs"))
+    );
+    // Collapse new/: from lib.rs Down goes straight to renamed.rs.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(dir(4), cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
+    press(cx, handle, "up");
+    assert_eq!(selected_path(cx, &ui), Some(RelaPath::from("src/lib.rs")));
+    press(cx, handle, "down");
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("src/renamed.rs"))
+    );
+    press(cx, handle, "up");
+    press(cx, handle, "up");
+    assert_eq!(
+        selected_path(cx, &ui),
+        Some(RelaPath::from("docs/guide.md"))
+    );
+}

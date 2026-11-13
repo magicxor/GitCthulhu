@@ -267,7 +267,7 @@ fn a_worktree_modification_the_target_deletes_stays_a_conflict() -> anyhow::Resu
     )?;
 
     // Like `git checkout -m b`, the modified file stays, conflicted with its deletion.
-    // GitButler's `ours` is the worktree, so the sides are swapped compared to Git.
+    // but-core's `ours` is the worktree, so the sides are swapped compared to Git.
     assert!(out.conflict_occurred);
     snapbox::assert_data_eq!(
         std::fs::read_to_string(repo.workdir().unwrap().join("x"))?,
@@ -1280,7 +1280,7 @@ fn checkout_gives_files_what_their_directory_gives_new_files_like_git() -> anyho
     }
     assert_eq!(
         files[1], files[0],
-        "GitButler gives the files what Git gives them"
+        "but-core gives the files what Git gives them"
     );
     assert!(
         files[0][1].ends_with(&format!("group {group}")),
@@ -3707,7 +3707,7 @@ mod symlinks {
         checkout_matches_git("tracked-dir-turned-symlink-where-target-modifies-a-file")
     }
 
-    /// Git refuses as `d/x` has a local change, the deletion. GitButler carries local changes into
+    /// Git refuses as `d/x` has a local change, the deletion. but-core carries local changes into
     /// the target instead of refusing, and here both sides deleted `d/x`, so it checks out `b`.
     /// The worktree ends up as Git leaves it, and nothing behind the symlink changes.
     #[test]
@@ -3775,7 +3775,7 @@ mod symlinks {
         assert_eq!(
             ours.is_ok(),
             git_succeeded,
-            "{scenario}: Git succeeded: {git_succeeded}, GitButler: {:?}",
+            "{scenario}: Git succeeded: {git_succeeded}, but-core: {:?}",
             ours.map(|_| ())
         );
         assert_eq!(

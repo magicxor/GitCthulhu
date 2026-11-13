@@ -69,12 +69,12 @@ fn complex_valid() -> anyhow::Result<()> {
     assert_eq!(normalize_short_name("#[test]")?, "#-test]");
     assert_eq!(normalize_short_name("foo#branch")?, "foo#branch");
     assert_eq!(normalize_short_name("foo!branch")?, "foo!branch");
-    let input = r#"Revert "GitButler Workspace Commit"
+    let input = r#"Revert "Some Feature Commit"
 
 This reverts commit d6efa5fd96d36da445d5d1345b84163f05f5f229."#;
     assert_eq!(
         normalize_short_name(input)?,
-        "Revert-\"GitButler-Workspace-Commit\"-This-reverts-commit-d6efa5fd96d36da445d5d1345b84163f05f5f229"
+        "Revert-\"Some-Feature-Commit\"-This-reverts-commit-d6efa5fd96d36da445d5d1345b84163f05f5f229"
     );
     Ok(())
 }

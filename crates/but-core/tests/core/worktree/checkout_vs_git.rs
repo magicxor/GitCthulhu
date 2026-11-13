@@ -1,21 +1,23 @@
 //! Check out every combination of what `HEAD`, the target, the index and the worktree hold at
-//! one path, `p`, with `git checkout`, with `git checkout -m` and with GitButler, and list the
-//! cases where GitButler differs from both.
+//! one path, `p`, with `git checkout`, with `git checkout -m` and with but-core, and list the
+//! cases where but-core differs from both.
 //!
 //! The lists are the snapshots. Nothing reads them: a change to checkout changes them, so their
-//! diff shows which cases it changes. Run with `SNAPSHOTS=overwrite` to record them.
+//! diff shows which cases it changes. Run with `SNAPSHOTS=overwrite` to record them. They record
+//! the `git checkout -m` of Git 2.55 and later, which stashes, so with an older Git the
+//! comparisons are skipped.
 //!
 //! In the lists, a file holds `head`, `target`, `staged`, `edited` or `worktree`, after where its
 //! content comes from, and a state says what the index and the worktree hold.
 //!
-//! - [`checkout_differs_from_git_only_where_listed`] compares the checkouts. GitButler carries
+//! - [`checkout_differs_from_git_only_where_listed`] compares the checkouts. but-core carries
 //!   uncommitted changes into the target like `git checkout -m`, so a case matches Git if it
 //!   matches either.
 //! - [`checkout_of_paths_differing_in_case_differs_from_git_only_where_listed`] repeats the
 //!   comparison where the target names `p` what `HEAD` names `P`, on case-insensitive
 //!   filesystems.
 //! - [`changes_during_checkout_are_refused_or_carried_like_before_it`] makes each worktree change
-//!   while checkout runs, which Git doesn't guard against, and lists the cases where GitButler
+//!   while checkout runs, which Git doesn't guard against, and lists the cases where but-core
 //!   loses it.
 
 use std::{
@@ -31,6 +33,9 @@ use but_testsupport::{invoke_bash_at_dir, open_repo};
 
 #[test]
 fn checkout_differs_from_git_only_where_listed() -> anyhow::Result<()> {
+    if !git_checks_out_like_the_snapshots()? {
+        return Ok(());
+    }
     let cases = in_parallel(&Pair::all(), compare_with_git)?;
     snapbox::assert_data_eq!(
         report(cases.into_iter().flatten().collect()),
@@ -42,7 +47,9 @@ fn checkout_differs_from_git_only_where_listed() -> anyhow::Result<()> {
 #[test]
 fn checkout_of_paths_differing_in_case_differs_from_git_only_where_listed() -> anyhow::Result<()> {
     let probe = but_testsupport::gix_testtools::tempfile::TempDir::new()?;
-    if !gix::fs::Capabilities::probe_dir(probe.path()).ignore_case {
+    if !gix::fs::Capabilities::probe_dir(probe.path()).ignore_case
+        || !git_checks_out_like_the_snapshots()?
+    {
         return Ok(());
     }
     let cases = in_parallel(&Pair::differing_in_case(), compare_with_git)?;
@@ -65,6 +72,53 @@ fn changes_during_checkout_are_refused_or_carried_like_before_it() -> anyhow::Re
     }
     snapbox::assert_data_eq!(report, snapbox::str!["540 cases"]);
     Ok(())
+}
+
+#[test]
+fn snapshots_are_compared_only_with_a_git_whose_checkout_m_stashes() {
+    let compared =
+        |version: &str| parse_git_version(version).map(|version| version >= GIT_CHECKOUT_M_STASHES);
+    assert_eq!(compared("git version 2.47.3"), Some(false), "Debian trixie");
+    assert_eq!(compared("git version 2.54.1"), Some(false));
+    assert_eq!(compared("git version 2.55.0"), Some(true));
+    assert_eq!(compared("git version 2.56.0.windows.4"), Some(true));
+    assert_eq!(compared("git version 2.39.5 (Apple Git-154)"), Some(false));
+    assert_eq!(compared("git version 3.0.0"), Some(true));
+    assert_eq!(compared("not git"), None);
+}
+
+/// The first Git whose `git checkout -m` stashes the local changes before switching and reapplies
+/// them after (Git 2.55 release notes). Older Git merges them in place and refuses where it stashes,
+/// so the `git -m` lines, and which cases the lists have, differ from the snapshots, which record
+/// the stashing `git checkout -m`. but-core's own lines are the same with either.
+const GIT_CHECKOUT_M_STASHES: (u32, u32) = (2, 55);
+
+/// Whether the `git` the scripts run checks out with `-m` as the snapshots record it. Says on stderr
+/// why the comparison is skipped where it doesn't.
+fn git_checks_out_like_the_snapshots() -> anyhow::Result<bool> {
+    let output = std::process::Command::new("git")
+        .arg("--version")
+        .output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = parse_git_version(&text)
+        .ok_or_else(|| anyhow::anyhow!("unexpected `git --version` output: {text:?}"))?;
+    let like_the_snapshots = version >= GIT_CHECKOUT_M_STASHES;
+    if !like_the_snapshots {
+        eprintln!(
+            "skipped: {} is older than Git {}.{}, whose `git checkout -m` the snapshots record",
+            text.trim(),
+            GIT_CHECKOUT_M_STASHES.0,
+            GIT_CHECKOUT_M_STASHES.1
+        );
+    }
+    Ok(like_the_snapshots)
+}
+
+/// The major and minor version in `git --version` output, like `git version 2.56.0.windows.4`.
+fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+    let version = output.trim().strip_prefix("git version ")?;
+    let mut parts = version.split_whitespace().next()?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 /// What a tree holds at the path.
@@ -408,10 +462,10 @@ struct Case {
     before: State,
     git: Checkout,
     git_m: Checkout,
-    gitbutler: Checkout,
+    but_core: Checkout,
 }
 
-/// Check out each combination of `pair` with Git and with GitButler.
+/// Check out each combination of `pair` with Git and with but-core.
 fn compare_with_git(pair: Pair) -> anyhow::Result<Vec<Case>> {
     let tmp = but_testsupport::gix_testtools::tempfile::TempDir::new()?;
     let mut script = pair.script();
@@ -431,7 +485,7 @@ fn compare_with_git(pair: Pair) -> anyhow::Result<Vec<Case>> {
                 script,
                 r#"mkdir {at} && cp -a base {at}/repo
 (cd {at}/repo && {setup})
-cp -a {at}/repo {at}/git && cp -a {at}/repo {at}/gitbutler
+cp -a {at}/repo {at}/git && cp -a {at}/repo {at}/but-core
 if (cd {at}/git && git checkout -q target) >/dev/null 2>&1; then
   echo checked-out >{at}/git.outcome
 else
@@ -465,7 +519,7 @@ fi
             before: State::read(&dir.join("repo"), &names)?,
             git,
             git_m,
-            gitbutler: Checkout::by_gitbutler(&dir.join("gitbutler"), &names)?,
+            but_core: Checkout::by_but_core(&dir.join("but-core"), &names)?,
         });
     }
     Ok(cases)
@@ -488,8 +542,8 @@ impl Checkout {
         })
     }
 
-    /// Check out the target in the repository at `dir` with GitButler.
-    fn by_gitbutler(dir: &Path, names: &Names) -> anyhow::Result<Self> {
+    /// Check out the target in the repository at `dir` with but-core.
+    fn by_but_core(dir: &Path, names: &Names) -> anyhow::Result<Self> {
         let repo = open_repo(dir)?;
         let checked_out = safe_checkout_from_head(names.target, &repo, Default::default()).is_ok();
         Ok(Checkout {
@@ -694,14 +748,14 @@ impl Names {
     }
 }
 
-/// A report of the `cases` where GitButler differs from both Git checkouts, by how it differs
+/// A report of the `cases` where but-core differs from both Git checkouts, by how it differs
 /// from `git checkout`.
 fn report(cases: Vec<Case>) -> String {
     let total = cases.len();
-    let like_git = cases.iter().filter(|c| c.gitbutler == c.git).count();
+    let like_git = cases.iter().filter(|c| c.but_core == c.git).count();
     let like_git_m = cases
         .iter()
-        .filter(|c| c.gitbutler != c.git && c.gitbutler == c.git_m)
+        .filter(|c| c.but_core != c.git && c.but_core == c.git_m)
         .count();
     let mut out = format!(
         "{total} cases: {like_git} like `git checkout`, {like_git_m} like `git checkout -m`, {} different\n",
@@ -711,23 +765,22 @@ fn report(cases: Vec<Case>) -> String {
         (
             false,
             true,
-            "GitButler checks out where `git checkout` refuses",
+            "but-core checks out where `git checkout` refuses",
         ),
         (
             true,
             false,
-            "GitButler refuses where `git checkout` checks out",
+            "but-core refuses where `git checkout` checks out",
         ),
         (true, true, "Both check out, differently"),
         (false, false, "Both refuse, leaving different states"),
     ];
-    for (git_checks_out, gitbutler_checks_out, title) in sections {
+    for (git_checks_out, but_core_checks_out, title) in sections {
         let differences: Vec<&Case> = cases
             .iter()
-            .filter(|c| c.gitbutler != c.git && c.gitbutler != c.git_m)
+            .filter(|c| c.but_core != c.git && c.but_core != c.git_m)
             .filter(|c| {
-                (c.git.checked_out, c.gitbutler.checked_out)
-                    == (git_checks_out, gitbutler_checks_out)
+                (c.git.checked_out, c.but_core.checked_out) == (git_checks_out, but_core_checks_out)
             })
             .collect();
         if differences.is_empty() {
@@ -737,11 +790,11 @@ fn report(cases: Vec<Case>) -> String {
         for case in differences {
             let before = &case.before;
             out.push_str(&format!(
-                "\n{}\n  before:    {before}\n  git:       {}\n  git -m:    {}\n  GitButler: {}\n",
+                "\n{}\n  before:    {before}\n  git:       {}\n  git -m:    {}\n  but-core:  {}\n",
                 case.name,
                 case.git.describe(before),
                 case.git_m.describe(before),
-                case.gitbutler.describe(before)
+                case.but_core.describe(before)
             ));
         }
     }
@@ -753,9 +806,9 @@ struct During {
     name: String,
     /// The worktree with the change, before any checkout.
     changed: State,
-    /// GitButler's checkout of the worktree with the change made before it.
+    /// but-core's checkout of the worktree with the change made before it.
     after: Checkout,
-    /// GitButler's checkout during which the change was made.
+    /// but-core's checkout during which the change was made.
     during: Checkout,
     /// Whether everything the change created is still on disk after the checkout during it.
     change_kept: bool,
@@ -862,12 +915,12 @@ EOF
             .into_iter()
             .filter(|entry| !unchanged.contains(entry))
             .collect();
-        let checked_out_during = Checkout::by_gitbutler(&during, &names)?;
+        let checked_out_during = Checkout::by_but_core(&during, &names)?;
         let after_during = disk(&during)?;
         cases.push(During {
             name,
             changed: State::read(&dir.join("changed"), &names)?,
-            after: Checkout::by_gitbutler(&dir.join("after"), &names)?,
+            after: Checkout::by_but_core(&dir.join("after"), &names)?,
             during: checked_out_during,
             change_kept: created.iter().all(|entry| after_during.contains(entry)),
             behind_symlinks: behind_symlinks(&during)?,

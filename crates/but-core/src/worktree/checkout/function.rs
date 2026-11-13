@@ -94,8 +94,9 @@ fn write_merged_worktree(
     untracked_size_limit: Option<u64>,
 ) -> anyhow::Result<bool> {
     // Reopen to ensure that there is no "object memory" (i.e. all object
-    // writes actually happen on disk).
-    let mut repo = gix::open(repo.git_dir())?;
+    // writes actually happen on disk). With the caller's open options: the worktree is written
+    // with the configuration (`core.autocrlf`, filters) the caller reads it with.
+    let mut repo = gix::open_opts(repo.git_dir(), repo.open_options().clone())?;
     // Like Git, don't write over an unresolved conflict, as the write would replace its stages.
     let mut conflicted: Vec<_> = index
         .entries

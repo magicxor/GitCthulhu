@@ -526,6 +526,35 @@ fn checkout_adding_and_modifying_files_keeps_one_index_entry_per_path() -> anyho
 }
 
 #[test]
+fn checkout_writes_the_worktree_with_the_configuration_of_the_given_repository()
+-> anyhow::Result<()> {
+    // Both values: whatever the system and global configuration of this machine say, one of them differs.
+    for (autocrlf, expected) in [("true", "line\r\n"), ("false", "line\n")] {
+        let (repo, _tmp) = writable_scenario("unborn-empty");
+        let blob = repo.write_blob(b"line\n")?;
+        let mut editor = repo.empty_tree().edit()?;
+        editor.upsert("f.txt", EntryKind::Blob, blob)?;
+        let tree_id = editor.write()?.detach();
+        let commit = repo.new_commit("init", tree_id, None::<gix::ObjectId>)?;
+
+        // A setting that no configuration file has, only the options this repository was opened with.
+        let configured = gix::open_opts(
+            repo.git_dir(),
+            repo.open_options()
+                .clone()
+                .cli_overrides([format!("core.autocrlf={autocrlf}")]),
+        )?;
+        safe_checkout_from_head(commit.id, &configured, Default::default())?;
+        assert_eq!(
+            std::fs::read(configured.workdir().expect("non-bare").join("f.txt"))?.as_bstr(),
+            expected,
+            "core.autocrlf={autocrlf} of the caller applies, not what a fresh open would read"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn pure_deletion_checkout_keeps_empty_worktree_root() -> anyhow::Result<()> {
     let root = but_testsupport::gix_testtools::tempfile::TempDir::new()?;
     let git_dir = root.path().join("git-dir");

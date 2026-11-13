@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, BoxShadow, Context, Entity, FocusHandle, Focusable, Global,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    Anchor, AnyElement, App, AppContext as _, BoxShadow, Context, Entity, FocusHandle, Focusable,
+    Global, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     ParentElement as _, Point, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     TestSupportExt as _, Window, anchored, deferred, div, point, px,
 };
@@ -163,6 +163,8 @@ struct OpenMenu {
     items: Vec<MenuItem>,
     at: Point<gpui_kit::Pixels>,
     show_icons: bool,
+    /// `at` is the bottom-left corner of the menu instead of its top-left one (it grows upwards).
+    above: bool,
 }
 
 /// The single popup layer of the window.
@@ -170,6 +172,9 @@ pub struct MenuHost {
     open: Option<OpenMenu>,
     focus: FocusHandle,
     opened_at: Option<Instant>,
+    /// The element that had the keyboard focus when the menu opened: Escape gives it back (a menu opened with
+    /// the keyboard must not strand the keyboard).
+    previous_focus: Option<FocusHandle>,
 }
 
 /// The window's menu host entity.
@@ -184,6 +189,7 @@ impl MenuHost {
             open: None,
             focus: cx.focus_handle(),
             opened_at: None,
+            previous_focus: None,
         });
         cx.set_global(MenuHostGlobal(host.clone()));
         host
@@ -201,6 +207,7 @@ impl MenuHost {
         at: Point<gpui_kit::Pixels>,
         items: Vec<MenuItem>,
         show_icons: bool,
+        above: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -218,7 +225,14 @@ impl MenuHost {
             items,
             at,
             show_icons,
+            above,
         });
+        // A menu that replaces an open one keeps the focus to give back; otherwise it is whatever has the focus now
+        // (nothing: nothing is given back, not the element of an earlier menu).
+        self.previous_focus = match window.focused(cx) {
+            Some(handle) if handle == self.focus => self.previous_focus.take(),
+            other => other,
+        };
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -320,7 +334,7 @@ impl Render for MenuHost {
             .iter()
             .map(|item| self.render_item(item, open.show_icons, cx))
             .collect();
-        let at = open.at;
+        let (at, above) = (open.at, open.above);
         let menu = observed(ids::MENU)
             .flex()
             .flex_col()
@@ -344,9 +358,12 @@ impl Render for MenuHost {
             // Presses inside the menu must not reach the dismissing backdrop behind it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_key_down(cx.listener(|host, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|host, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
                     host.close(cx);
+                    if let Some(previous) = host.previous_focus.take() {
+                        window.focus(&previous, cx);
+                    }
                     cx.stop_propagation();
                 }
             }))
@@ -363,7 +380,13 @@ impl Render for MenuHost {
                 MouseButton::Right,
                 cx.listener(|host, _: &MouseDownEvent, _, cx| host.close(cx)),
             )
-            .child(anchored().position(at).snap_to_window().child(popup))
+            .child(
+                anchored()
+                    .position(at)
+                    .when(above, |a| a.anchor(Anchor::BottomLeft))
+                    .snap_to_window()
+                    .child(popup),
+            )
             .id(ids::MENU_LAYER)
             .test_support();
         deferred(layer).with_priority(1).into_any_element()
@@ -377,7 +400,18 @@ pub fn open_context_menu(
     at: Point<gpui_kit::Pixels>,
     items: Vec<MenuItem>,
 ) {
-    open_with(window, cx, at, items, true);
+    open_with(window, cx, at, items, true, false);
+}
+
+/// Opens a context menu that grows upwards: its bottom-left corner is `anchor` (for a trigger at the bottom of the
+/// window that the menu must not cover, `anchor` is the trigger's top-left corner).
+pub fn open_menu_above(
+    window: &mut Window,
+    cx: &mut App,
+    anchor: Point<gpui_kit::Pixels>,
+    items: Vec<MenuItem>,
+) {
+    open_with(window, cx, anchor, items, true, true);
 }
 
 /// Opens a dropdown whose top-left corner is `anchor` (the bottom-left of the trigger element). `show_icons`
@@ -389,7 +423,7 @@ pub fn open_dropdown(
     items: Vec<MenuItem>,
     show_icons: bool,
 ) {
-    open_with(window, cx, anchor, items, show_icons);
+    open_with(window, cx, anchor, items, show_icons, false);
 }
 
 fn open_with(
@@ -398,12 +432,15 @@ fn open_with(
     at: Point<gpui_kit::Pixels>,
     items: Vec<MenuItem>,
     show_icons: bool,
+    above: bool,
 ) {
     let Some(host) = cx.try_global::<MenuHostGlobal>().map(|g| g.0.clone()) else {
         tracing::warn!("a menu was requested before the menu host was installed");
         return;
     };
-    host.update(cx, |host, cx| host.open(at, items, show_icons, window, cx));
+    host.update(cx, |host, cx| {
+        host.open(at, items, show_icons, above, window, cx)
+    });
 }
 
 /// Closes the open menu, if any.

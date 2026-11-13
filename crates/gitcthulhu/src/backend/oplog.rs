@@ -150,7 +150,7 @@ impl RepoHandle {
         }
     }
 
-    /// `Oplog::finish`: `Ok(true)` when an entry was written, `Ok(false)` when the oplog dropped it because the
+    /// `Oplog::finish`: `Ok(Some(id))` when an entry was written, `Ok(None)` when the oplog dropped it because the
     /// operation changed nothing (the stacks are untouched, so there is nothing to undo); `Err` is the text of the
     /// "{title} can't be undone: {error}" warning (nothing recorded).
     pub fn oplog_finish(
@@ -158,14 +158,13 @@ impl RepoHandle {
         pending: PendingOperation,
         result: OperationResult,
         perm: &mut RepoExclusive,
-    ) -> Result<bool, SharedString> {
+    ) -> Result<Option<EntryId>, SharedString> {
         let Some(oplog) = &self.oplog else {
             return Err(self.unavailable());
         };
         oplog
             .read()
             .finish(&self.repo.local(), pending, result, perm)
-            .map(|entry| entry.is_some())
             .map_err(|e| oplog_error_text(&e))
     }
 

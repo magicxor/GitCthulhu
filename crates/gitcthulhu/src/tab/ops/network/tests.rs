@@ -386,6 +386,69 @@ fn no_upstream_opens_upstream_dialog(cx: &mut TestAppContext) {
     );
 }
 
+/// Accepting the dialog while the tab is busy with another upstream change starts nothing: the wait ends at once,
+/// so that change finishing later does not retry the pull.
+#[gpui_kit::test]
+fn no_upstream_wait_ends_when_the_accepted_change_is_refused(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::branchy(), DEFAULT_SIZE);
+    cx.update(|cx| {
+        script_op(
+            &tab,
+            cx,
+            failure(GitError::NoUpstream {
+                branch: Some("main".to_owned()),
+                stderr: String::new(),
+            }),
+            Duration::ZERO,
+        )
+    });
+    run_on(cx, handle, &tab, |t, w, cx| t.pull(None, w, cx));
+    frame(cx, handle, |_, _| ());
+    assert!(
+        cx.update_window(handle, |_, window, cx| window.has_active_dialog(cx))
+            .unwrap_or(false),
+        "the Change-upstream dialog is open"
+    );
+    // A slow upstream change from elsewhere keeps the tab busy (its start does not end the wait).
+    cx.update(|cx| {
+        script_op(
+            &tab,
+            cx,
+            Ok(OpOutcome {
+                value: (),
+                refresh: RefreshSet::BRANCHES,
+                log: Default::default(),
+                warnings: Vec::new(),
+            }),
+            Duration::from_millis(300),
+        )
+    });
+    run_on(cx, handle, &tab, |t, w, cx| {
+        t.run_op(noop_change_upstream(), w, cx)
+    });
+    for id in [
+        "upstream-remote-button",
+        "upstream-remote-option-0",
+        "upstream-branch-button",
+        "upstream-branch-option-0",
+        "dialog-primary",
+    ] {
+        frame(cx, handle, |window, cx| window.click(id, cx));
+    }
+    assert!(
+        !cx.update_window(handle, |_, window, cx| window.has_active_dialog(cx))
+            .unwrap_or(true),
+        "accepting closed the dialog"
+    );
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(
+        kinds(&tab, cx),
+        [OpKind::Pull, OpKind::ChangeUpstream],
+        "the refused accept left nothing waiting: the other change does not retry the pull"
+    );
+}
+
 #[gpui_kit::test]
 fn no_upstream_wait_ends_when_something_else_runs(cx: &mut TestAppContext) {
     let (handle, _app, tab) = mount_seeded(cx, RepoSeed::branchy(), DEFAULT_SIZE);

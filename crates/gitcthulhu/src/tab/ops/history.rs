@@ -109,10 +109,16 @@ impl RepoTab {
         })
     }
 
-    /// A Positive toast after success with the "Undo" action of a recorded operation.
+    /// A Positive toast after success with the "Undo" action of the entry the operation recorded (none when the
+    /// oplog recorded nothing: it changed nothing or recording failed).
     fn recorded_toast(&self, kind: OpKind, text: impl Into<SharedString>, cx: &mut App) {
-        let action =
-            crate::undo::toast_action(&self.ctx, crate::undo::ToastContext::Recorded { kind });
+        let action = self.last_entry.and_then(|entry| {
+            crate::undo::toast_action(
+                &self.ctx,
+                crate::undo::ToastContext::Recorded { kind },
+                entry,
+            )
+        });
         crate::app_view::show_toast(cx, Some(self.ctx.id), ToastKind::Positive, text, action);
     }
 

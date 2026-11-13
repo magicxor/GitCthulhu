@@ -505,6 +505,31 @@ fn is_merged_true_false() {
 }
 
 #[test]
+fn is_reachable_from_any_of_several_tips() {
+    let env = TestEnv::new();
+    let fixture = env.repo("repo");
+    let base = commit(&fixture, "a.txt", "base");
+    fixture.git(&["checkout", "-q", "-b", "topic"]);
+    let topic = commit(&fixture, "t.txt", "topic");
+    let topic2 = commit(&fixture, "t.txt", "topic 2");
+    fixture.git(&["checkout", "-q", "main"]);
+    let main = commit(&fixture, "m.txt", "main");
+    fixture.git(&["checkout", "-q", "--orphan", "island"]);
+    let island = commit(&fixture, "i.txt", "unrelated");
+    let repo = fixture.open();
+
+    let reachable = |id, tips: &[_]| refs::is_reachable_from(&repo, id, tips).expect("walk");
+    assert!(reachable(main, &[island, main]), "a tip itself");
+    assert!(reachable(base, &[island, main]), "an ancestor of one tip");
+    assert!(
+        reachable(topic, &[main, topic2]),
+        "an ancestor of the second tip"
+    );
+    assert!(!reachable(topic2, &[main, island, base]), "on no tip");
+    assert!(!reachable(main, &[]), "no tips");
+}
+
+#[test]
 fn resolve_commit_peels_and_reports_missing() {
     let env = TestEnv::new();
     let fixture = env.repo("repo");

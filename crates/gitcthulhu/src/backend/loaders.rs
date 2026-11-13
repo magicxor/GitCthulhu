@@ -116,6 +116,36 @@ pub fn refresh_index(
     gitcthulhu_git::status::refresh_index(&handle.repo, guard.write_permission(), cancel)
 }
 
+/// Whether `id` is reachable from a local branch, a remote-tracking branch or a tag: the question before a
+/// detached worktree is removed (Git drops its HEAD reflog with it, so an unreachable commit is lost for good).
+pub fn commit_on_a_ref(repo: &Repo, id: ObjectId) -> Result<bool, GitError> {
+    let list = gitcthulhu_git::refs::list(
+        repo,
+        RefListOptions {
+            remotes: true,
+            tags: true,
+            stashes: false,
+        },
+    )?;
+    let mut tips: Vec<ObjectId> = list.local.iter().map(|b| b.target).collect();
+    tips.extend(
+        list.remotes
+            .iter()
+            .flat_map(|r| r.branches.iter().map(|b| b.target)),
+    );
+    tips.extend(
+        list.tags
+            .iter()
+            .filter(|t| t.peeled_kind == gix::object::Kind::Commit)
+            .map(|t| t.target),
+    );
+    tips.sort();
+    tips.dedup();
+    // One walk for all tips: a merge base per tip would take minutes in a repository with thousands of tags, and
+    // the confirmation waits for this answer.
+    gitcthulhu_git::refs::is_reachable_from(repo, id, &tips)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -55,6 +55,12 @@ pub enum GitError {
         /// What is not supported.
         what: &'static str,
     },
+    /// `worktree::remove` was asked to remove the main worktree.
+    #[error("the main worktree cannot be removed")]
+    MainWorktree,
+    /// `worktree::remove` was asked to remove the worktree of the open repository itself.
+    #[error("the worktree of the open repository cannot be removed")]
+    CurrentWorktree,
     /// The operation was cancelled through its `CancelToken`.
     #[error("the operation was cancelled")]
     Cancelled,
@@ -454,6 +460,8 @@ pub enum GitErrorKind {
     BareRepository,
     UnbornHead,
     Unsupported,
+    MainWorktree,
+    CurrentWorktree,
     Cancelled,
     TooLarge,
     AuthFailed,
@@ -510,6 +518,8 @@ impl GitError {
             GitError::BareRepository => K::BareRepository,
             GitError::UnbornHead => K::UnbornHead,
             GitError::Unsupported { .. } => K::Unsupported,
+            GitError::MainWorktree => K::MainWorktree,
+            GitError::CurrentWorktree => K::CurrentWorktree,
             GitError::Cancelled => K::Cancelled,
             GitError::TooLarge { .. } => K::TooLarge,
             GitError::AuthFailed { .. } => K::AuthFailed,

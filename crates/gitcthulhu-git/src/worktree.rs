@@ -216,14 +216,10 @@ pub fn remove(
     ctx.cancel.check()?;
     let entry = find_entry(repo, path)?;
     let Some(id) = entry.id.clone() else {
-        return Err(GitError::Unsupported {
-            what: "removing the main worktree",
-        });
+        return Err(GitError::MainWorktree);
     };
     if entry.is_current {
-        return Err(GitError::Unsupported {
-            what: "removing the worktree of the open repository",
-        });
+        return Err(GitError::CurrentWorktree);
     }
     let mut cmd = GitCommand::new(repo, CommandKind::Mutation).args(["worktree", "remove"]);
     if force {

@@ -208,8 +208,35 @@ fn assert_worktree(_: &mut Window, cx: &mut App, args: &Args) -> StepResult {
     }
 }
 
+/// Background tab lookups of `tabs_showing` that have not finished (an idle condition of the runner).
+static LOOKUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one lookup in [`LOOKUPS`] while it lives: moved into the background closure, it is dropped when the
+/// lookup ends, also when the task is dropped before it ran (a bare decrement at the end would then never happen
+/// and the runner would wait forever).
+pub(super) struct LookupGuard(());
+
+impl LookupGuard {
+    pub(super) fn new() -> LookupGuard {
+        LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        LookupGuard(())
+    }
+}
+
+impl Drop for LookupGuard {
+    fn drop(&mut self) {
+        LOOKUPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn lookups_probe(_: &mut Window, _: &App) -> Option<String> {
+    (LOOKUPS.load(std::sync::atomic::Ordering::SeqCst) > 0)
+        .then(|| "looking for the tab of a worktree".to_owned())
+}
+
 /// Registers the verbs of the worktree feature.
 pub(super) fn register(cx: &mut App) {
+    crate::qa::register_idle_probe(cx, lookups_probe);
     register_verb(
         cx,
         Verb::new(

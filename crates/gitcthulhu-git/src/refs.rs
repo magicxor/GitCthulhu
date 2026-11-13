@@ -595,6 +595,29 @@ pub fn is_merged(repo: &Repo, branch: ObjectId, into: Option<ObjectId>) -> Resul
     Ok(base.is_some_and(|base| base.detach() == branch))
 }
 
+/// Is the commit `id` an ancestor of (or equal to) any of `tips`? One walk for all tips (`git rev-list id --not
+/// tips`), so a repository with thousands of tags costs one merge-base-style paint rather than one per tip.
+pub fn is_reachable_from(repo: &Repo, id: ObjectId, tips: &[ObjectId]) -> Result<bool> {
+    if tips.contains(&id) {
+        return Ok(true);
+    }
+    if tips.is_empty() {
+        return Ok(false);
+    }
+    let gix_repo = repo.local();
+    let mut walk = gix_repo
+        .rev_walk([id])
+        .with_hidden(tips.iter().copied())
+        .use_commit_graph(true)
+        .all()
+        .map_err(gix_error)?;
+    // A reachable `id` is hidden itself, so the walk yields nothing; otherwise `id` comes first.
+    match walk.next() {
+        None => Ok(true),
+        Some(info) => Ok(info.map_err(gix_error)?.id != id),
+    }
+}
+
 /// Labels per commit; pure, also filled into `RefList::decorations` by `list`.
 ///
 /// Tags of trees and blobs are not decorations: their ids never appear as graph rows.

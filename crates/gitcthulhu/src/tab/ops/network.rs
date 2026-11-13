@@ -502,10 +502,10 @@ impl RepoTab {
                 cx,
                 ctx,
                 branch,
-                // A cancelled dialog ends the wait: a later, unrelated upstream change must not retry the pull
-                // or push.
-                Box::new(move |accepted| {
-                    if !accepted {
+                // A cancelled dialog, or an accepted one whose operation was refused, ends the wait: a later,
+                // unrelated upstream change must not retry the pull or push.
+                Box::new(move |started| {
+                    if !started {
                         waiting_for_dialog.borrow_mut().take();
                     }
                 }),

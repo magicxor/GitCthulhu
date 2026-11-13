@@ -12,7 +12,7 @@ use super::{SNOOZE_DAY_HOURS, SNOOZE_WEEK_HOURS, ids, notice, snooze};
 use crate::backend::update::UpdateNotice;
 use crate::menus::{self, MenuItem};
 use crate::shell::platform;
-use crate::widgets::SecondaryButton;
+use crate::widgets::{BoundsCell, SecondaryButton, track_bounds};
 
 /// The button text.
 pub fn label(version: &str) -> String {
@@ -25,18 +25,32 @@ pub(super) fn slot(_window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     Some(button(&found))
 }
 
+thread_local! {
+    /// The layout bounds of the notice button as of the last frame (one window, one UI thread): the menu is
+    /// anchored to them.
+    static BOUNDS: BoundsCell = BoundsCell::default();
+}
+
 fn button(found: &UpdateNotice) -> AnyElement {
     let url = found.url.clone();
+    let bounds = BOUNDS.with(Clone::clone);
     div()
+        .relative()
         .flex_none()
-        .on_mouse_down(MouseButton::Right, |event, window, cx| {
-            menus::open_context_menu(window, cx, event.position, snooze_menu());
-        })
+        .on_mouse_down(MouseButton::Right, |_, window, cx| open_menu(window, cx))
+        .child(track_bounds(&bounds))
         .child(
             SecondaryButton::new(ids::NOTICE, label(&found.version))
                 .on_click(move |_, cx| open_download(cx, &url)),
         )
         .into_any_element()
+}
+
+/// Opens the snooze menu above the notice: its bottom-left corner is the notice's top-left corner, so the menu
+/// never covers the notice or the "Version" link next to it at the bottom of the window.
+pub(super) fn open_menu(window: &mut Window, cx: &mut App) {
+    let anchor = BOUNDS.with(|b| b.get().origin);
+    menus::open_menu_above(window, cx, anchor, snooze_menu());
 }
 
 /// The entries of the notice's context menu.

@@ -63,33 +63,64 @@ pub fn open_in_new_tab_action(path: PathBuf) -> Option<DialogAction> {
 }
 
 /// Opens the worktree at `path` in a new, selected tab; when a tab already shows it, that tab is selected instead.
+/// Which tab shows it is decided off the UI thread (see [`tabs_showing`]).
 pub fn open_in_new_tab(window: &mut Window, cx: &mut App, path: PathBuf) {
     let Some(view) = cx.try_global::<AppViewGlobal>().and_then(|g| g.0.upgrade()) else {
         return;
     };
-    view.update(cx, |app, cx| match tab_index_of(app, &path, cx) {
-        Some(ix) => app.select_tab(ix, window, cx),
-        None => app.open_repository(path, true, window, cx),
-    });
+    let shown = tabs_showing(cx, None, &path);
+    window
+        .spawn(cx, async move |cx| {
+            let shown = shown.await;
+            cx.update(|window, cx| {
+                view.update(cx, |app, cx| {
+                    let open = app
+                        .tabs()
+                        .iter()
+                        .position(|slot| slot.path(cx).is_some_and(|p| shown.contains(&p)));
+                    match open {
+                        Some(ix) => app.select_tab(ix, window, cx),
+                        None => app.open_repository(path, true, window, cx),
+                    }
+                });
+            })
+            .ok();
+        })
+        .detach();
 }
 
-/// The index of the tab (open or opening) that shows the worktree at `path`.
-pub(crate) fn tab_index_of(app: &crate::app_view::AppView, path: &Path, cx: &App) -> Option<usize> {
-    app.tabs()
-        .iter()
-        .position(|slot| slot.path(cx).is_some_and(|open| same_path(&open, path)))
-}
-
-/// Whether a tab other than the one of `current` shows the worktree at `path`.
-pub(crate) fn open_in_other_tab(cx: &App, current: &TabCtx, path: &Path) -> bool {
-    let Some(view) = cx.try_global::<AppViewGlobal>().and_then(|g| g.0.upgrade()) else {
-        return false;
-    };
-    let app = view.read(cx);
-    app.tabs().iter().any(|slot| {
-        slot.repo()
-            .is_none_or(|tab| tab.read(cx).ctx().id != current.id)
-            && slot.path(cx).is_some_and(|open| same_path(&open, path))
+/// The directories of the tabs (open or opening, except the one of `except`) that show the directory `path`,
+/// as the tabs know them. Comparing directories canonicalises paths, which can block on a slow or network drive,
+/// so it runs in the background.
+pub(crate) fn tabs_showing(
+    cx: &App,
+    except: Option<&TabCtx>,
+    path: &Path,
+) -> gpui_kit::Task<Vec<PathBuf>> {
+    let open: Vec<PathBuf> = cx
+        .try_global::<AppViewGlobal>()
+        .and_then(|g| g.0.upgrade())
+        .map(|view| {
+            let app = view.read(cx);
+            app.tabs()
+                .iter()
+                .filter(|slot| {
+                    slot.repo()
+                        .is_none_or(|tab| except.is_none_or(|e| tab.read(cx).ctx().id != e.id))
+                })
+                .filter_map(|slot| slot.path(cx))
+                .collect()
+        })
+        .unwrap_or_default();
+    let path = path.to_owned();
+    #[cfg(feature = "qa")]
+    let counted = qa::LookupGuard::new();
+    crate::backend::bg(cx, move || {
+        #[cfg(feature = "qa")]
+        let _counted = counted;
+        open.into_iter()
+            .filter(|open| same_path(open, &path))
+            .collect()
     })
 }
 

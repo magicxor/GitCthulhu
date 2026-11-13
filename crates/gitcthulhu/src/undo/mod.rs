@@ -6,10 +6,9 @@
 //!
 //! The per-tab [`UndoController`] is the view of the toolbar slot (the frame constructs it with the tab). It
 //! tracks whether an operation runs (events of the tab), owns the popover and keeps the small bookkeeping that
-//! makes the toast actions safe: a toast's "Undo" only acts while the operation it belongs to is still the newest
-//! one (see [`toast_action`]).
+//! makes the toast actions safe: a toast's "Undo" only acts while the entry it belongs to is still the one Undo
+//! would reverse (see [`toast_action`]).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -41,7 +40,10 @@ mod qa;
 #[cfg(test)]
 mod tests;
 
-use history::{ClosePopover, HistoryPopover, POPOVER_CONTEXT, PopoverEvent};
+use history::{
+    ClosePopover, FocusFirstRow, FocusLastRow, FocusNextRow, FocusPreviousRow, HistoryPopover,
+    OpenFocusedRowMenu, POPOVER_CONTEXT, PopoverEvent, RestoreFocusedRow,
+};
 use split::UndoSplit;
 use texts::{ButtonTip, Which};
 
@@ -100,40 +102,12 @@ struct Controllers(HashMap<TabId, WeakEntity<UndoController>>);
 
 impl Global for Controllers {}
 
-/// What the controller knows about the newest operation of a tab; read by the toast actions, which are built
-/// without access to the app.
-#[derive(Clone, Debug, Default)]
-struct OpTrack {
-    /// Number of operations started in the tab.
-    epoch: u64,
-    /// A recorded operation finished and the reload of the undo state has not arrived yet: `model.undo` is old.
-    stale_model: bool,
-    /// The two stack tops (`reverses` ids) when the newest operation started; `None` when `model.undo` was stale.
-    before: Option<Tops>,
-}
-
-/// The entries that Undo and Redo would reverse.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Tops {
-    undo: Option<EntryId>,
-    redo: Option<EntryId>,
-}
-
-thread_local! {
-    static TRACKS: RefCell<HashMap<TabId, OpTrack>> = RefCell::new(HashMap::new());
-}
-
-fn track<R>(id: TabId, f: impl FnOnce(&mut OpTrack) -> R) -> R {
-    TRACKS.with(|tracks| f(tracks.borrow_mut().entry(id).or_default()))
-}
-
-fn tops_of(ctx: &TabCtx, cx: &App) -> Tops {
+/// The oplog entry that Undo (or Redo) would reverse now, as of the last loaded undo state.
+fn top_of(ctx: &TabCtx, redo: bool, cx: &App) -> Option<EntryId> {
     let model = ctx.model.read(cx);
-    let state = model.undo.as_ref();
-    Tops {
-        undo: state.and_then(|s| s.undo.as_ref()).map(|i| i.reverses),
-        redo: state.and_then(|s| s.redo.as_ref()).map(|i| i.reverses),
-    }
+    let state = model.undo.as_ref()?;
+    let item = if redo { &state.redo } else { &state.undo };
+    item.as_ref().map(|i| i.reverses)
 }
 
 /// The per-tab undo controller: the view of the toolbar slot and the owner of the history popover.
@@ -154,19 +128,13 @@ impl UndoController {
     /// The controller of the tab of `ctx`.
     pub fn new(ctx: TabCtx, cx: &mut Context<UndoController>) -> UndoController {
         let subscriptions = vec![
-            cx.subscribe(&ctx.model, |this, _, ev: &RepoModelEvent, cx| {
+            cx.subscribe(&ctx.model, |_, _, ev: &RepoModelEvent, cx| {
                 if ev.0.intersects(RefreshSet::UNDO) {
-                    track(this.ctx.id, |t| t.stale_model = false);
                     cx.notify();
                 }
             }),
             cx.subscribe(&ctx.events, |this, _, ev: &RepoTabEvent, cx| match ev {
                 RepoTabEvent::OpStarted { .. } => {
-                    let tops = tops_of(&this.ctx, cx);
-                    track(this.ctx.id, |t| {
-                        t.epoch += 1;
-                        t.before = (!t.stale_model).then_some(tops);
-                    });
                     this.busy = true;
                     cx.notify();
                 }
@@ -190,7 +158,6 @@ impl UndoController {
             {
                 controllers.0.remove(&id);
             }
-            TRACKS.with(|tracks| tracks.borrow_mut().remove(&id));
         })
         .detach();
         UndoController {
@@ -467,27 +434,22 @@ pub const STALE_TOAST: &str = "Something else happened since. Use the Undo and R
 
 /// The action of a success toast: "Undo" after a recorded operation or a restore-to, "Redo" after an undo (17 §4.5).
 ///
-/// A toast stays for a few seconds, and a successful operation that changed nothing is still reported as
-/// recorded (the oplog drops its entry), so a plain `undo()` could reverse an older operation. The action
-/// therefore acts only while no newer operation started and the relevant stack top differs from the one before the
-/// toast's operation (the operation did push or pop an entry); otherwise it shows [`STALE_TOAST`].
-pub fn toast_action(ctx: &TabCtx, what: ToastContext) -> Option<ToastAction> {
+/// `entry` is the oplog entry the toast's operation recorded (for a restore: the entry the restore wrote). A toast
+/// stays for a few seconds, so the action acts only while that entry is still what Undo (for Redo: Redo) would
+/// reverse; otherwise something newer happened and it shows [`STALE_TOAST`]. The undo state is reloaded after the
+/// operation, so a click in the few milliseconds before the reload arrives also gets the warning.
+pub fn toast_action(ctx: &TabCtx, what: ToastContext, entry: EntryId) -> Option<ToastAction> {
     let redo = matches!(
         what,
         ToastContext::Restored {
             kind: RestoreKind::Undo
         }
     );
-    // The reload that follows this operation will tell whether it changed the stacks.
-    let epoch = track(ctx.id, |t| {
-        t.stale_model = true;
-        t.epoch
-    });
     let ctx = ctx.clone();
     Some(ToastAction {
         label: if redo { "Redo" } else { "Undo" }.into(),
         run: Rc::new(move |window, cx| {
-            if !toast_applies(&ctx, epoch, redo, cx) {
+            if top_of(&ctx, redo, cx) != Some(entry) {
                 show_toast(cx, Some(ctx.id), ToastKind::Warning, STALE_TOAST, None);
                 return;
             }
@@ -502,32 +464,18 @@ pub fn toast_action(ctx: &TabCtx, what: ToastContext) -> Option<ToastAction> {
     })
 }
 
-/// Whether the toast of the operation with `epoch` may still act (see [`toast_action`]).
-fn toast_applies(ctx: &TabCtx, epoch: u64, redo: bool, cx: &App) -> bool {
-    let now = tops_of(ctx, cx);
-    track(ctx.id, |t| {
-        if t.epoch != epoch || t.stale_model {
-            return false;
-        }
-        let Some(before) = t.before else {
-            return false;
-        };
-        let (before, now) = if redo {
-            (before.redo, now.redo)
-        } else {
-            (before.undo, now.undo)
-        };
-        now.is_some() && now != before
-    })
-}
-
 /// Registers the undo UI's bindings and hooks (X2).
 pub fn register(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "escape",
-        ClosePopover,
-        Some(POPOVER_CONTEXT),
-    )]);
+    let context = Some(POPOVER_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("escape", ClosePopover, context),
+        KeyBinding::new("down", FocusNextRow, context),
+        KeyBinding::new("up", FocusPreviousRow, context),
+        KeyBinding::new("home", FocusFirstRow, context),
+        KeyBinding::new("end", FocusLastRow, context),
+        KeyBinding::new("enter", RestoreFocusedRow, context),
+        KeyBinding::new("shift-f10", OpenFocusedRowMenu, context),
+    ]);
     #[cfg(feature = "qa")]
     qa::register(cx);
 }

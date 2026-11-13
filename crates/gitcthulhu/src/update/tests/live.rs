@@ -235,6 +235,33 @@ fn remind_later_snoozes(cx: &mut TestAppContext) {
     );
 }
 
+/// The remind-later menu opens above the notice, its bottom-left corner at the notice's top-left corner, so it never
+/// hides the notice or the "Version" link beside it.
+#[gpui_kit::test]
+fn remind_later_menu_opens_above_the_notice(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (handle, _app) = open_app(cx, DEFAULT_SIZE);
+    let env = Env::new("9.9.9");
+    install_services(cx, env.services("0.1.0"));
+    frame(cx, handle, |_, _| ());
+    cx.update_window(handle, |_, window, cx| window.right_click(ids::NOTICE, cx))
+        .expect("window");
+    frame(cx, handle, |window, _| {
+        let notice = bounds(window, ids::NOTICE);
+        let version = bounds(window, crate::shell::ids::BOTTOM_VERSION);
+        let menu = bounds(window, crate::ids::MENU);
+        assert!(
+            (menu.bottom().as_f32() - notice.top().as_f32()).abs() <= 1.
+                && (menu.left().as_f32() - notice.left().as_f32()).abs() <= 1.,
+            "the menu's bottom-left corner is the notice's top-left corner: {menu:?} {notice:?}"
+        );
+        assert!(
+            menu.bottom() <= notice.top() && menu.bottom() <= version.top(),
+            "the menu covers neither the notice nor the version link: {menu:?} {notice:?} {version:?}"
+        );
+    });
+}
+
 #[gpui_kit::test]
 fn check_now_toasts(cx: &mut TestAppContext) {
     init_app(cx);

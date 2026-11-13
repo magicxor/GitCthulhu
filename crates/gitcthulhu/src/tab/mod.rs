@@ -189,6 +189,9 @@ pub struct RepoTab {
     pub(crate) watcher_task: Option<Task<()>>,
     pub(crate) watch_failed: bool,
     pub(crate) closed: bool,
+    /// The undoable oplog entry that the operation which finished last recorded (`None`: it recorded none); read
+    /// by that operation's `then` hook for its toast's "Undo" action.
+    pub(crate) last_entry: Option<crate::backend::EntryId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -283,6 +286,7 @@ impl RepoTab {
             watcher_task: None,
             watch_failed: false,
             closed: false,
+            last_entry: None,
             _subscriptions: subscriptions,
         };
         if tab.options.watch {

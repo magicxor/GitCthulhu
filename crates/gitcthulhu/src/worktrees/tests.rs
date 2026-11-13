@@ -651,9 +651,9 @@ fn remove_of_this_tabs_worktree_explains(cx: &mut TestAppContext) {
     script_op(
         &tab,
         cx,
-        Err::<OpOutcome<String>, _>(OpFailure::Git(std::sync::Arc::new(GitError::Unsupported {
-            what: "removing the worktree of the open repository",
-        }))),
+        Err::<OpOutcome<String>, _>(OpFailure::Git(std::sync::Arc::new(
+            GitError::CurrentWorktree,
+        ))),
         std::time::Duration::ZERO,
     );
     run_on(cx, handle, &tab, |t, w, c| {
@@ -666,6 +666,159 @@ fn remove_of_this_tabs_worktree_explains(cx: &mut TestAppContext) {
             .iter()
             .any(|t| t.contains("Close the tab of this worktree first")),
         "{texts:?}"
+    );
+}
+
+/// The sentence comes from the kind of the error: a tab model that does not know the worktree (or knows it
+/// wrongly) cannot pick the wrong one.
+#[gpui_kit::test]
+fn remove_refusal_text_follows_the_error_not_the_model(cx: &mut TestAppContext) {
+    let (handle, app, tab) = mount_seeded(cx, worktree_seed(), DEFAULT_SIZE);
+    frame(cx, handle);
+    // The model flags `main-repo` as the current worktree; Git says the main worktree cannot be removed.
+    let main = scratch().join("main-repo");
+    script_op(
+        &tab,
+        cx,
+        Err::<OpOutcome<String>, _>(OpFailure::Git(std::sync::Arc::new(GitError::MainWorktree))),
+        std::time::Duration::ZERO,
+    );
+    run_on(cx, handle, &tab, |t, w, c| {
+        t.remove_worktree(main.clone(), false, w, c)
+    });
+    frame(cx, handle);
+    let texts = cx.update(|cx| app.read(cx).error_texts.clone());
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("The main worktree cannot be removed")),
+        "{texts:?}"
+    );
+    frame(cx, handle);
+    with_window(cx, handle, |window, cx| window.close_dialog(cx));
+    // `feature-a` is not current in the model; Git says it is this tab's worktree.
+    let feature = scratch().join("feature-a");
+    script_op(
+        &tab,
+        cx,
+        Err::<OpOutcome<String>, _>(OpFailure::Git(std::sync::Arc::new(
+            GitError::CurrentWorktree,
+        ))),
+        std::time::Duration::ZERO,
+    );
+    run_on(cx, handle, &tab, |t, w, c| {
+        t.remove_worktree(feature.clone(), false, w, c)
+    });
+    frame(cx, handle);
+    let texts = cx.update(|cx| app.read(cx).error_texts.clone());
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("Close the tab of this worktree first")),
+        "{texts:?}"
+    );
+}
+
+fn message_info(head: Option<HeadState>, locked: Option<&str>) -> WorktreeInfo {
+    let mut wt = info(Some("wt"), "wt", head);
+    wt.locked = locked.map(str::to_owned);
+    wt
+}
+
+#[test]
+fn removal_message_keeps_the_branch_claim_for_branches_only() {
+    use crate::menus::worktree::removal_message;
+    let branch = message_info(on_branch("feature/a"), None);
+    assert_eq!(
+        removal_message(&branch, None),
+        "Remove the worktree 'wt'? Its directory is deleted; its branch is kept."
+    );
+    let detached = message_info(Some(HeadState::Detached { target: oid(2) }), None);
+    let short = oid(2).to_hex_with_len(7).to_string();
+    let reachable = removal_message(&detached, Some(true));
+    assert_eq!(
+        reachable,
+        format!("Remove the worktree 'wt'? Its directory is deleted. HEAD is detached at {short}."),
+        "a detached HEAD on a ref says where it is and never claims a branch"
+    );
+    let lost = removal_message(&detached, Some(false));
+    assert_eq!(
+        lost,
+        format!(
+            "Remove the worktree 'wt'? Its directory is deleted. HEAD is detached at {short} and its commits are on no branch or tag; they will be lost."
+        )
+    );
+    assert!(
+        removal_message(&detached, None).contains("was not checked"),
+        "a failed check is not reported as safe"
+    );
+    let locked = message_info(Some(HeadState::Detached { target: oid(2) }), Some("usb"));
+    assert!(
+        removal_message(&locked, Some(false)).starts_with("The worktree 'wt' is locked (usb).")
+            && removal_message(&locked, Some(false)).contains("they will be lost."),
+        "a locked worktree warns as well"
+    );
+}
+
+/// The reachability check runs on the real repository off the UI thread: a commit made in a detached worktree is
+/// on no ref until a branch is created for it.
+#[gpui_kit::test]
+fn remove_of_a_detached_worktree_warns_when_its_commits_are_on_no_ref(cx: &mut TestAppContext) {
+    let (fx, _) = fixture_with_worktree();
+    let wt = fx.dir.path().join("wt-detached");
+    fx.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        wt.to_str().expect("utf-8 path"),
+    ]);
+    git_in(
+        &wt,
+        &fx,
+        &["commit", "-q", "--allow-empty", "-m", "only here"],
+    );
+    let on_ref = fx.dir.path().join("wt-on-ref");
+    fx.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        on_ref.to_str().expect("utf-8 path"),
+    ]);
+    let (handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let ctx = ctx_of(&tab, cx);
+    let listed = model_worktrees(&tab, &mut *cx);
+    let find = |dir: &Path| {
+        listed
+            .iter()
+            .find(|w| {
+                crate::tab::ops::worktree::display_name(&w.path)
+                    == dir.file_name().unwrap().to_string_lossy()
+            })
+            .cloned()
+            .expect("the worktree is listed")
+    };
+    crate::menus::worktree::tests_support::MESSAGES.with(|m| m.borrow_mut().clear());
+    for dir in [&wt, &on_ref] {
+        let info = find(dir);
+        with_window(cx, handle, |window, cx| {
+            crate::menus::worktree::remove_worktree(window, cx, &ctx, &info)
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        with_window(cx, handle, |window, cx| window.close_dialog(cx));
+    }
+    let messages = crate::menus::worktree::tests_support::MESSAGES.with(|m| m.borrow().clone());
+    assert_eq!(messages.len(), 2, "both confirmations opened: {messages:?}");
+    assert!(
+        messages[0].contains("on no branch or tag; they will be lost"),
+        "{messages:?}"
+    );
+    assert!(
+        !messages[1].contains("lost") && messages[1].contains("HEAD is detached at"),
+        "a detached HEAD on a branch tip is safe: {messages:?}"
     );
 }
 
@@ -1125,6 +1278,53 @@ fn open_in_new_tab(cx: &mut TestAppContext) {
             .any(|w| w.is_current && super::same_path(&w.path, &wt))
     );
     assert_eq!(list.len(), 2);
+}
+
+/// Which tab shows a directory is decided in the background (canonicalising can block on a slow drive): the call
+/// itself neither opens nor selects anything, and removing a worktree that a tab shows is still refused.
+#[gpui_kit::test]
+fn tab_lookup_of_a_worktree_runs_off_the_ui_thread(cx: &mut TestAppContext) {
+    let (fx, wt) = fixture_with_worktree();
+    let (handle, app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let during = with_window(cx, handle, |window, cx| {
+        super::open_in_new_tab(window, cx, wt.clone());
+        app.read(cx).tabs().len()
+    });
+    assert_eq!(during, 1, "nothing is decided inside the call itself");
+    assert_eq!(
+        tab_paths(&app, cx).len(),
+        2,
+        "opened once the lookup finished"
+    );
+    with_window(cx, handle, |window, cx| {
+        super::open_in_new_tab(window, cx, wt.clone());
+    });
+    for _ in 0..3 {
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        tab_paths(&app, cx).len(),
+        2,
+        "a tab that shows it is selected"
+    );
+
+    // The same directory spelled with a `.` segment is still recognised (canonical comparison), so removing the
+    // worktree the second tab shows is refused.
+    let ctx = ctx_of(&tab, cx);
+    let mut info = model_worktrees(&tab, cx)[1].clone();
+    info.path = info.path.join(".");
+    with_window(cx, handle, |window, cx| {
+        crate::menus::worktree::remove_worktree(window, cx, &ctx, &info)
+    });
+    for _ in 0..3 {
+        cx.run_until_parked();
+    }
+    frame(cx, handle);
+    let texts = cx.update(|cx| app.read(cx).error_texts.clone());
+    assert!(
+        texts.iter().any(|t| t.contains("is open in a tab")),
+        "{texts:?}"
+    );
 }
 
 #[gpui_kit::test]

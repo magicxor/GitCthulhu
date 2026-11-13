@@ -430,7 +430,7 @@ fn remove_main_or_current_is_unsupported() {
     .expect_err("main worktree");
     assert_eq!(
         err.kind(),
-        GitErrorKind::Unsupported,
+        GitErrorKind::MainWorktree,
         "the main worktree cannot be removed"
     );
 
@@ -440,7 +440,7 @@ fn remove_main_or_current_is_unsupported() {
         .expect_err("current worktree");
     assert_eq!(
         err.kind(),
-        GitErrorKind::Unsupported,
+        GitErrorKind::CurrentWorktree,
         "the worktree of the open repository"
     );
     let err = worktree::remove(

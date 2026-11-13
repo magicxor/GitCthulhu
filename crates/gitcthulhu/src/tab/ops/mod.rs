@@ -25,9 +25,9 @@ use crate::backend::oplog::{OplogErrorInfo, PrepareResult};
 use crate::backend::present::{self, ErrorDialogData, ErrorPresentation, OpFailure, RecoveryFlow};
 use crate::backend::prompt::{Asker, ConfirmRequest, ProgressPump, op_context, progress_text};
 use crate::backend::{
-    CancelToken, GitError, GitErrorKind, NetworkMarker, OpContext, OpOutcome, OperationDescriptor,
-    OperationResult, OplogRecovery, RefreshSet, Repo, RepoExclusive, RestoreOptions, UndoOutcome,
-    UntrackedCapture,
+    CancelToken, EntryId, GitError, GitErrorKind, NetworkMarker, OpContext, OpOutcome,
+    OperationDescriptor, OperationResult, OplogRecovery, RefreshSet, Repo, RepoExclusive,
+    RestoreOptions, UndoOutcome, UntrackedCapture,
 };
 use crate::notifications::{ToastAction, ToastKind};
 
@@ -360,6 +360,8 @@ pub struct BgResult<T> {
     pub warning: Option<String>,
     /// The oplog recorded an entry or marker.
     pub recorded: bool,
+    /// The undoable entry the operation recorded (the toast's "Undo" acts on exactly this one).
+    pub entry: Option<EntryId>,
 }
 
 impl<T> BgResult<T> {
@@ -369,6 +371,7 @@ impl<T> BgResult<T> {
             refresh,
             warning: None,
             recorded: false,
+            entry: None,
         }
     }
 }
@@ -414,7 +417,7 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
             Err(failure) => return BgResult::failed(failure, RefreshSet::empty()),
         }
     }
-    let (mut warning, mut recorded) = (None, false);
+    let (mut warning, mut recorded, mut entry) = (None, false, None);
     let result = match p.guard {
         Guard::Exclusive => {
             let (mut guard, _suppress, pending) = loop {
@@ -496,7 +499,10 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
                 };
                 match h.oplog_finish(pending, outcome, guard.write_permission()) {
                     // A dropped no-op entry is not "recorded": no Undo action, no UNDO reload.
-                    Ok(written) => recorded = written,
+                    Ok(written) => {
+                        entry = written;
+                        recorded = written.is_some();
+                    }
                     Err(err) => warning = Some(format!("{title} can't be undone: {err}")),
                 }
             }
@@ -538,6 +544,7 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
         refresh,
         warning,
         recorded,
+        entry,
     }
 }
 
@@ -597,8 +604,12 @@ fn execute_restore(
 }
 
 /// Toast-action hook of the undo UI (X2): the action of a success toast, if any.
-fn undo_toast_action(tab: &RepoTab, what: crate::undo::ToastContext) -> Option<ToastAction> {
-    crate::undo::toast_action(&tab.ctx, what)
+fn undo_toast_action(
+    tab: &RepoTab,
+    what: crate::undo::ToastContext,
+    entry: crate::backend::EntryId,
+) -> Option<ToastAction> {
+    crate::undo::toast_action(&tab.ctx, what, entry)
 }
 
 impl RepoTab {
@@ -716,6 +727,7 @@ impl RepoTab {
                         refresh,
                         warning: None,
                         recorded: false,
+                        entry: None,
                     };
                     this.update_in(cx, |tab, window, cx| {
                         tab.finish_op(result, completion, window, cx)
@@ -850,8 +862,10 @@ impl RepoTab {
             result,
             mut refresh,
             warning,
-            recorded,
+            recorded: _,
+            entry,
         } = bg;
+        self.last_entry = entry;
         let stale_diff = matches!(&result, Err(f) if f.git_kind() == Some(GitErrorKind::StaleDiff));
         if stale_diff {
             refresh |= RefreshSet::STATUS;
@@ -894,11 +908,13 @@ impl RepoTab {
                         ),
                     };
                     if let Some(text) = text.filter(|t| !t.is_empty()) {
-                        let action = if recorded {
-                            undo_toast_action(self, crate::undo::ToastContext::Recorded { kind })
-                        } else {
-                            None
-                        };
+                        let action = entry.and_then(|entry| {
+                            undo_toast_action(
+                                self,
+                                crate::undo::ToastContext::Recorded { kind },
+                                entry,
+                            )
+                        });
                         crate::app_view::show_toast(cx, tab_id, toast_kind, text, action);
                     }
                 }
@@ -1194,7 +1210,11 @@ impl RepoTab {
                     RestoreKind::Redo => format!("Redone: {}", report.title),
                     RestoreKind::RestoreTo(_) => "Repository restored".to_owned(),
                 };
-                let action = undo_toast_action(self, crate::undo::ToastContext::Restored { kind });
+                let action = undo_toast_action(
+                    self,
+                    crate::undo::ToastContext::Restored { kind },
+                    report.entry,
+                );
                 crate::app_view::show_toast(cx, tab_id, ToastKind::Positive, text, action);
                 for warning in &report.warnings {
                     crate::app_view::show_toast(

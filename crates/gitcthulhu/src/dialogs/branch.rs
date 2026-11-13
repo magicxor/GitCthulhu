@@ -181,13 +181,14 @@ struct UpstreamDialog {
     branch_sel: Option<usize>,
     /// The current tracking remote and branch (indices), restored when its remote is chosen again.
     tracking: (Option<usize>, Option<usize>),
-    /// The caller's completion callback; taken by Accept (`true`) or by the drop of the dialog (`false`: Cancel,
-    /// Escape, any other way of closing it).
+    /// The caller's completion callback; taken by Accept (`true` when the operation started) or by the drop of the
+    /// dialog (`false`: Cancel, Escape, any other way of closing it).
     on_done: Option<OnDone>,
     _subscriptions: [Subscription; 2],
 }
 
-/// Receives whether the dialog was accepted. Runs without a window: it only records the answer.
+/// Receives whether the dialog was accepted and the upstream operation started. Runs without a window: it only
+/// records the answer.
 pub type OnDone = Box<dyn FnOnce(bool)>;
 
 impl Drop for UpstreamDialog {
@@ -219,13 +220,16 @@ impl UpstreamDialog {
             return;
         };
         window.close_dialog(cx);
-        if let Some(done) = self.on_done.take() {
-            done(true);
-        }
         let branch = self.branch.clone();
+        let started = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = started.clone();
         self.tab.with_tab(window, cx, move |t, window, cx| {
-            t.set_upstream(branch, Some(upstream), window, cx);
+            flag.set(t.set_upstream(branch, Some(upstream), window, cx));
         });
+        // An operation that was refused (the tab is busy) or a tab that is gone starts nothing to wait for.
+        if let Some(done) = self.on_done.take() {
+            done(started.get());
+        }
     }
 }
 
@@ -266,8 +270,8 @@ pub fn open_change_upstream(window: &mut Window, cx: &mut App, tab: TabCtx, bran
     open_change_upstream_then(window, cx, tab, branch, Box::new(|_| {}));
 }
 
-/// Opens the Change upstream dialog of `branch`; `on_done` learns exactly once whether it was accepted (the
-/// upstream operation is then started) or closed without a choice (Cancel, Escape).
+/// Opens the Change upstream dialog of `branch`; `on_done` learns exactly once whether it was accepted and the
+/// upstream operation started, or not (closed without a choice: Cancel, Escape; or the operation was refused).
 pub fn open_change_upstream_then(
     window: &mut Window,
     cx: &mut App,

@@ -8,8 +8,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, BoxShadow, Context, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, TestSupportExt as _, UniformListScrollHandle, Window,
-    div, point, px, uniform_list,
+    ScrollStrategy, SharedString, Styled as _, Subscription, TestSupportExt as _,
+    UniformListScrollHandle, WeakEntity, Window, div, point, px, uniform_list,
 };
 
 use super::dims;
@@ -34,7 +34,7 @@ use crate::widgets::{ObservedExt as _, TextLink, observed};
 pub const PAGE_SIZE: usize = 50;
 /// The next page is requested when the last visible row is this close to the end of the loaded rows.
 const PAGE_AHEAD: usize = 10;
-/// Key context of the popover (Escape closes it).
+/// Key context of the popover (Escape closes it; the arrow keys, Home, End, Enter and Shift+F10 work its rows).
 pub const POPOVER_CONTEXT: &str = "UndoHistory";
 /// Footer note (21 §5.1).
 pub const FOOTER_NOTE: &str = "Undo history is stored in the repository under refs/gitcthulhu and is copied by git push --mirror";
@@ -43,7 +43,19 @@ gpui_kit::actions!(
     gitcthulhu_undo,
     [
         /// Closes the undo history popover (Escape).
-        ClosePopover
+        ClosePopover,
+        /// Moves the focused row down (Down).
+        FocusNextRow,
+        /// Moves the focused row up (Up).
+        FocusPreviousRow,
+        /// Focuses the newest row (Home).
+        FocusFirstRow,
+        /// Focuses the oldest loaded row (End).
+        FocusLastRow,
+        /// Restores to before the focused operation, after the confirmation (Enter).
+        RestoreFocusedRow,
+        /// Opens the context menu of the focused row (Shift+F10).
+        OpenFocusedRowMenu
     ]
 );
 
@@ -77,6 +89,8 @@ pub struct HistoryPopover {
     slot: ReadSlot,
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
+    /// The row the keyboard acts on (`None` until the first arrow key).
+    focused: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -116,6 +130,7 @@ impl HistoryPopover {
             slot: ReadSlot::default(),
             scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
+            focused: None,
             _subscriptions: subscriptions,
         };
         popover.reload(cx);
@@ -135,6 +150,11 @@ impl HistoryPopover {
     /// The loaded entries, newest first.
     pub fn entries(&self) -> &[OplogEntry] {
         &self.entries
+    }
+
+    /// The row the keyboard acts on.
+    pub fn focused_row(&self) -> Option<usize> {
+        self.focused
     }
 
     /// Whether more entries can be read.
@@ -196,6 +216,8 @@ impl HistoryPopover {
                             this.entries = Arc::new(page.entries);
                         }
                         this.load = Load::Ready;
+                        let rows = this.entries.len();
+                        this.focused = this.focused.filter(|&ix| ix < rows);
                     }
                     // A later page failed: keep the rows already shown, stop paging and say so.
                     Err(text) if before.is_some() => {
@@ -228,10 +250,7 @@ impl HistoryPopover {
                 SnapshotSide::Before
             };
             MenuItem::action(key, label, move |window, cx| {
-                popover.update(cx, |p, cx| p.dismiss(cx)).ok();
-                ctx.with_tab(window, cx, |tab, window, cx| {
-                    tab.restore_to(RestoreTarget { entry: id, side }, window, cx);
-                });
+                restore(&popover, &ctx, id, side, window, cx);
             })
             .enabled(texts::can_restore(entry, after))
         };
@@ -247,6 +266,78 @@ impl HistoryPopover {
                 true,
             ),
         ]
+    }
+
+    /// Focuses row `ix` (clamped to the loaded rows), scrolls it into view and reads on when it is near the end.
+    fn focus_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let rows = self.entries.len();
+        if rows == 0 {
+            return;
+        }
+        let ix = ix.min(rows - 1);
+        self.focused = Some(ix);
+        self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        if self.next.is_some() && ix + PAGE_AHEAD >= rows {
+            self.load_more(cx);
+        }
+        cx.notify();
+    }
+
+    fn focus_next_row(&mut self, cx: &mut Context<Self>) {
+        let next = self.focused.map_or(0, |ix| ix + 1);
+        self.focus_row(next, cx);
+    }
+
+    fn focus_previous_row(&mut self, cx: &mut Context<Self>) {
+        let previous = self.focused.map_or(0, |ix| ix.saturating_sub(1));
+        self.focus_row(previous, cx);
+    }
+
+    /// The focused entry, when it has a snapshot to restore.
+    fn focused_entry(&self) -> Option<&OplogEntry> {
+        self.entries
+            .get(self.focused?)
+            .filter(|entry| texts::has_snapshot(entry))
+    }
+
+    /// Enter: restores to before the focused operation (the confirmation follows).
+    fn restore_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .focused_entry()
+            .filter(|e| texts::can_restore(e, false))
+        else {
+            return;
+        };
+        let (id, ctx) = (entry.id, self.ctx.clone());
+        self.dismiss(cx);
+        // The restore asks and may move the focus: not from inside this popover's own update.
+        window.defer(cx, move |window, cx| {
+            restore_in_tab(&ctx, id, SnapshotSide::Before, window, cx);
+        });
+    }
+
+    /// Shift+F10: the context menu of the focused row, at the row's lower left corner.
+    fn open_focused_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.focused else {
+            return;
+        };
+        let Some(entry) = self.focused_entry().cloned() else {
+            return;
+        };
+        let items = self.menu_items(&entry, cx);
+        let (bounds, offset) = {
+            let state = self.scroll.0.borrow();
+            (state.base_handle.bounds(), state.base_handle.offset())
+        };
+        let rem = window.rem_size();
+        let at = point(
+            bounds.origin.x + dp(dims::ROW_PAD_H).to_pixels(rem),
+            bounds.origin.y + offset.y + dp(dims::ROW_H).to_pixels(rem) * (ix + 1) as f32,
+        );
+        // Moving the focus to the menu updates this popover (focus-out): not from inside its own update.
+        window.defer(cx, move |window, cx| {
+            menus::open_context_menu(window, cx, at, items);
+        });
     }
 
     fn row(&self, ix: usize, entry: &OplogEntry, cx: &mut Context<Self>) -> AnyElement {
@@ -282,6 +373,7 @@ impl HistoryPopover {
             .gap(dp(dims::ROW_GAP))
             .px(dp(dims::ROW_PAD_H))
             .hover(move |s| s.bg(tokens.hover_layer()))
+            .when(self.focused == Some(ix), |row| row.bg(tokens.press_layer()))
             .child(div().flex_none().child(icon(
                 texts::kind_icon(entry.kind),
                 dims::ROW_ICON,
@@ -413,6 +505,31 @@ impl HistoryPopover {
     }
 }
 
+/// Closes the popover and restores `entry` to its before- or after-state (the tab confirms first).
+fn restore(
+    popover: &WeakEntity<HistoryPopover>,
+    ctx: &TabCtx,
+    entry: EntryId,
+    side: SnapshotSide,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    popover.update(cx, |p, cx| p.dismiss(cx)).ok();
+    restore_in_tab(ctx, entry, side, window, cx);
+}
+
+fn restore_in_tab(
+    ctx: &TabCtx,
+    entry: EntryId,
+    side: SnapshotSide,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    ctx.with_tab(window, cx, |tab, window, cx| {
+        tab.restore_to(RestoreTarget { entry, side }, window, cx);
+    });
+}
+
 impl Focusable for HistoryPopover {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -437,6 +554,16 @@ impl Render for HistoryPopover {
                     cx.stop_propagation();
                 }),
             )
+            .on_action(cx.listener(|this, _: &FocusNextRow, _, cx| this.focus_next_row(cx)))
+            .on_action(cx.listener(|this, _: &FocusPreviousRow, _, cx| this.focus_previous_row(cx)))
+            .on_action(cx.listener(|this, _: &FocusFirstRow, _, cx| this.focus_row(0, cx)))
+            .on_action(cx.listener(|this, _: &FocusLastRow, _, cx| this.focus_row(usize::MAX, cx)))
+            .on_action(cx.listener(|this, _: &RestoreFocusedRow, window, cx| {
+                this.restore_focused(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenFocusedRowMenu, window, cx| {
+                this.open_focused_menu(window, cx);
+            }))
             // Presses inside the popover must not reach the dismissing backdrop behind it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())

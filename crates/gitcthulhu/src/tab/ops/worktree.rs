@@ -29,7 +29,8 @@ pub(crate) fn display_name(path: &Path) -> String {
 impl RepoTab {
     /// ★ `git worktree remove` (`force` = remove with uncommitted changes); afterwards, still under the guard, the
     /// removed worktree's undo history is cleared. A worktree with uncommitted changes asks "Remove it anyway?" and
-    /// retries with `force`; the worktree of this very tab (or the main one) is explained instead (21 §2.9).
+    /// retries with `force`; the worktree of this very tab (`CurrentWorktree`) or the main one (`MainWorktree`) is explained instead, by the
+    /// kind of the error and not by the (possibly stale) tab model (21 §2.9).
     /// Refresh: WORKTREES | BRANCHES.
     pub fn remove_worktree(
         &mut self,
@@ -38,7 +39,6 @@ impl RepoTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let unsupported = self.unsupported_removal_text(&path, cx);
         let (retry_path, shown) = (path.clone(), display_name(&path));
         let spec = OpSpec::new(OpKind::RemoveWorktree, move |env| {
             let (repo, ctx) = (env.repo, env.ctx);
@@ -74,31 +74,19 @@ impl RepoTab {
                 );
                 Handled::Yes
             }
-            Some(GitErrorKind::Unsupported) => {
-                let data =
-                    ErrorDialogData::new(OpKind::RemoveWorktree.error_title(), unsupported.clone());
+            Some(kind @ (GitErrorKind::MainWorktree | GitErrorKind::CurrentWorktree)) => {
+                let text = if kind == GitErrorKind::CurrentWorktree {
+                    "Close the tab of this worktree first."
+                } else {
+                    "The main worktree cannot be removed."
+                };
+                let data = ErrorDialogData::new(OpKind::RemoveWorktree.error_title(), text);
                 crate::app_view::show_error(cx, data);
                 Handled::Yes
             }
             _ => Handled::No,
         });
         self.run_op(spec, window, cx)
-    }
-
-    /// Why `git worktree remove` refuses `path` with `Unsupported`: it is this tab's worktree or the main one.
-    fn unsupported_removal_text(&self, path: &Path, cx: &Context<Self>) -> String {
-        let model = self.ctx.model.read(cx);
-        let current = model
-            .worktrees
-            .value
-            .as_ref()
-            .and_then(|list| list.iter().find(|w| w.path == path))
-            .is_some_and(|w| w.is_current);
-        if current {
-            "Close the tab of this worktree first.".to_owned()
-        } else {
-            "The main worktree cannot be removed.".to_owned()
-        }
     }
 
     /// `git worktree add` (from an existing branch, with a new branch or detached at a commit). Afterwards a toast

@@ -12,11 +12,10 @@
 //! | `assert update notice <version>\|none` | the bottom bar's notice shows `<version>` (or nothing) |
 //! | `open update menu` | opens the notice's right-click menu |
 
-use gpui_kit::{App, Global, Point, point, px};
+use gpui_kit::{App, Global};
 
 use super::loopback::{Loopback, Response, manifest};
 use super::{CheckKind, UpdateState, check_now, notice, snapshot, snooze};
-use crate::menus;
 use crate::qa::{Verb, register_idle_probe, register_verb};
 
 /// The manifest server of the run (kept alive for the whole process).
@@ -107,11 +106,7 @@ pub(super) fn register(cx: &mut App) {
                 if notice(cx).is_none() {
                     return Err("there is no update notice".to_owned());
                 }
-                // Where a right-click on the notice lands: the right end of the bottom bar, before the version
-                // link (QA has no element bounds; the menu host keeps the menu inside the window).
-                let viewport = window.viewport_size();
-                let at: Point<_> = point(viewport.width - px(200.), viewport.height - px(16.));
-                menus::open_context_menu(window, cx, at, super::notice::snooze_menu());
+                super::notice::open_menu(window, cx);
                 Ok(String::new())
             },
         ),

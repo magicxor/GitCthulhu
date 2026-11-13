@@ -618,11 +618,15 @@ fn toast_action_does_nothing_after_a_newer_operation(cx: &mut TestAppContext) {
         t.commit(opts("Add b"), w, cx);
     });
     let ctx = cx.update(|cx| tab.read(cx).ctx().clone());
+    let entry = cx
+        .update(|cx| top_of(&ctx, false, cx))
+        .expect("the commit is on the undo stack");
     let action = toast_action(
         &ctx,
         ToastContext::Recorded {
             kind: OpKind::Commit,
         },
+        entry,
     )
     .expect("a recorded operation has an action");
     cx.run_until_parked();
@@ -647,9 +651,12 @@ fn toast_action_does_nothing_after_a_newer_operation(cx: &mut TestAppContext) {
     assert!(texts.iter().any(|t| t == STALE_TOAST), "{texts:?}");
 }
 
+/// The action belongs to one oplog entry: an operation that changed nothing records no entry, so it neither takes
+/// the older toast's action away nor makes it act on anything else.
 #[gpui_kit::test]
-fn toast_action_of_a_no_op_does_not_undo_an_older_operation(cx: &mut TestAppContext) {
-    let (fx, handle, app, tab) = real_tab(cx, true);
+fn toast_action_follows_its_entry_across_a_no_op(cx: &mut TestAppContext) {
+    let (fx, handle, _app, tab) = real_tab(cx, true);
+    let before = branches(&fx);
     run(cx, handle, &tab, |t, w, cx| {
         t.create_branch("topic".to_owned(), StartPoint::Head, false, w, cx);
     });
@@ -664,18 +671,13 @@ fn toast_action_of_a_no_op_does_not_undo_an_older_operation(cx: &mut TestAppCont
         1,
         "only the branch creation is on the undo stack"
     );
-    // The newest action left is the older toast's "Undo"; a newer operation ran since, so it does nothing.
+    // The newest action left is the branch toast's "Undo": its entry is still the one Undo reverses.
     assert!(
         click_toast_action(cx, handle),
         "the branch toast still shows its action"
     );
-    assert_eq!(
-        branches(&fx),
-        with_topic,
-        "the older operation was not undone"
-    );
-    let texts = cx.update(|cx| toast_texts(&app, cx));
-    assert!(texts.iter().any(|t| t == STALE_TOAST), "{texts:?}");
+    assert_ne!(branches(&fx), with_topic, "the branch creation was undone");
+    assert_eq!(branches(&fx), before);
 }
 
 #[gpui_kit::test]
@@ -811,6 +813,107 @@ fn history_popover_list_paging_and_restore(cx: &mut TestAppContext) {
     assert!(
         !tags.lines().any(|t| t == "t9") && tags.lines().any(|t| t == "t8"),
         "the repository is back to just before t9 was created: {tags}"
+    );
+    frame(cx, handle, |window, _| {
+        assert!(
+            window.try_find(ids::UNDO_HISTORY).is_none(),
+            "the popover closed"
+        );
+    });
+}
+
+/// Presses `key` in the window and lets the frame settle.
+fn press(cx: &mut TestAppContext, handle: AnyWindowHandle, key: &str) {
+    cx.update_window(handle, |_, window, cx| window.press(key, cx))
+        .expect("window");
+    cx.run_until_parked();
+    frame(cx, handle, |_, _| {});
+}
+
+fn focused_row(cx: &mut TestAppContext, c: &Entity<UndoController>) -> Option<usize> {
+    cx.update(|cx| c.read(cx).history().and_then(|p| p.read(cx).focused_row()))
+}
+
+#[gpui_kit::test]
+fn history_popover_keyboard_navigation(cx: &mut TestAppContext) {
+    let (fx, handle, _app, tab) = real_tab(cx, true);
+    let first = head(&fx);
+    let tip = ObjectId::from_hex(first.as_bytes()).expect("a commit id");
+    for n in 0..12 {
+        run(cx, handle, &tab, |t, w, cx| {
+            t.create_tag(format!("t{n}"), tip, None, w, cx);
+        });
+    }
+    let c = controller(&tab, cx);
+    open_history(cx, handle, &tab);
+    assert_eq!(
+        focused_row(cx, &c),
+        None,
+        "no row is focused before the first key"
+    );
+    frame(cx, handle, |window, _| {
+        assert!(
+            window.try_find((ids::UNDO_HISTORY_ROW, 11usize)).is_none(),
+            "the oldest row is below the fold"
+        );
+    });
+
+    // Down starts at the newest row, Up stops at the first one.
+    press(cx, handle, "down");
+    assert_eq!(focused_row(cx, &c), Some(0));
+    press(cx, handle, "down");
+    press(cx, handle, "down");
+    assert_eq!(focused_row(cx, &c), Some(2));
+    press(cx, handle, "up");
+    assert_eq!(focused_row(cx, &c), Some(1));
+    press(cx, handle, "home");
+    press(cx, handle, "up");
+    assert_eq!(focused_row(cx, &c), Some(0), "Up does not leave the list");
+
+    // End goes to the oldest row and scrolls it into view; Down stops there.
+    press(cx, handle, "end");
+    assert_eq!(focused_row(cx, &c), Some(11));
+    press(cx, handle, "down");
+    assert_eq!(
+        focused_row(cx, &c),
+        Some(11),
+        "Down does not leave the list"
+    );
+    frame(cx, handle, |window, _| {
+        assert!(
+            window.try_find((ids::UNDO_HISTORY_ROW, 11usize)).is_some(),
+            "the focused row was scrolled into view"
+        );
+    });
+
+    // Shift+F10 opens the row menu, Escape closes it again.
+    press(cx, handle, "home");
+    press(cx, handle, "shift-f10");
+    frame(cx, handle, |window, _| {
+        assert!(window.try_find("menu-item-undo-restore-before").is_some());
+        assert!(window.try_find("menu-item-undo-restore-after").is_some());
+    });
+    press(cx, handle, "escape");
+    frame(cx, handle, |window, _| {
+        assert!(window.try_find("menu-item-undo-restore-before").is_none());
+        assert!(
+            window.try_find(ids::UNDO_HISTORY).is_some(),
+            "Escape closed the menu only"
+        );
+    });
+
+    // Enter restores to before the focused operation (here confirmed by the test's asker): row 2 is `t9`.
+    press(cx, handle, "home");
+    press(cx, handle, "down");
+    press(cx, handle, "down");
+    assert_eq!(focused_row(cx, &c), Some(2));
+    press(cx, handle, "enter");
+    cx.run_until_parked();
+    cx.run_until_parked();
+    let tags = fx.git(&["tag", "--list"]);
+    assert!(
+        !tags.lines().any(|t| t == "t9") && tags.lines().any(|t| t == "t8"),
+        "Enter restored the repository to just before t9 was created: {tags}"
     );
     frame(cx, handle, |window, _| {
         assert!(

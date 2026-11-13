@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use gpui_kit::{App, Window};
 
 use super::{MenuItem, MenuKind, MenuSlot, MenuTarget, extend};
-use crate::backend::WorktreeInfo;
 use crate::backend::present::ErrorDialogData;
 use crate::backend::prompt::ConfirmRequest;
+use crate::backend::{HeadState, WorktreeInfo, loaders};
 use crate::commit_changes::platform::{RevealTarget, open_target};
 use crate::dialogs::{SingleFieldConfig, SingleTextFieldDialog};
 use crate::icons::AppIcon;
@@ -166,33 +166,67 @@ fn open_lock_dialog(window: &mut Window, cx: &mut App, tab: TabCtx, path: PathBu
 }
 
 /// "Remove worktree": refuses a worktree that another tab shows, otherwise confirms and removes it. A locked
-/// worktree needs `force` (Git asks for the flag twice); the confirmation says so.
-fn remove_worktree(window: &mut Window, cx: &mut App, tab: &TabCtx, info: &WorktreeInfo) {
-    let name = worktrees::display_name(&info.path);
-    if worktrees::open_in_other_tab(cx, tab, &info.path) {
-        crate::app_view::show_error(
-            cx,
-            ErrorDialogData::new(
-                "Removing worktree failed",
-                format!(
-                    "The worktree '{name}' is open in a tab. Close the tab of this worktree first."
-                ),
-            ),
-        );
-        return;
-    }
-    let locked = info.locked.clone();
-    let message = match &locked {
-        Some(reason) if !reason.is_empty() => format!(
-            "The worktree '{name}' is locked ({reason}). Removing it deletes its directory, including any uncommitted changes."
-        ),
-        Some(_) => format!(
-            "The worktree '{name}' is locked. Removing it deletes its directory, including any uncommitted changes."
-        ),
-        None => {
-            format!("Remove the worktree '{name}'? Its directory is deleted; its branch is kept.")
+/// worktree needs `force` (Git asks for the flag twice); the confirmation says so. For a detached HEAD the commits
+/// may be on no ref at all (Git deletes the worktree's HEAD reflog with it): that is looked up off the UI thread
+/// first and the confirmation warns when they would be lost.
+pub(crate) fn remove_worktree(
+    window: &mut Window,
+    cx: &mut App,
+    tab: &TabCtx,
+    info: &WorktreeInfo,
+) {
+    // Both questions touch the disk or the object database: they run in the background, side by side.
+    let shown = worktrees::tabs_showing(cx, Some(tab), &info.path);
+    let check = match (info.head.as_ref(), tab.backend.repo()) {
+        (Some(HeadState::Detached { target }), Some(repo)) => {
+            let (repo, target) = (repo.clone(), *target);
+            Some(crate::backend::bg(cx, move || {
+                loaders::commit_on_a_ref(&repo, target)
+            }))
         }
+        _ => None,
     };
+    let (tab, info) = (tab.clone(), info.clone());
+    window
+        .spawn(cx, async move |cx| {
+            let shown = shown.await;
+            let on_a_ref = match check {
+                Some(check) => check.await.ok(),
+                None => None,
+            };
+            cx.update(|window, cx| {
+                if shown.is_empty() {
+                    confirm_removal(window, cx, &tab, &info, on_a_ref);
+                } else {
+                    let name = worktrees::display_name(&info.path);
+                    crate::app_view::show_error(
+                        cx,
+                        ErrorDialogData::new(
+                            "Removing worktree failed",
+                            format!(
+                                "The worktree '{name}' is open in a tab. Close the tab of this worktree first."
+                            ),
+                        ),
+                    );
+                }
+            })
+            .ok();
+        })
+        .detach();
+}
+
+/// The question of [`remove_worktree`]. `commit_on_a_ref` is the answer for a detached HEAD (`None`: not checked).
+fn confirm_removal(
+    window: &mut Window,
+    cx: &mut App,
+    tab: &TabCtx,
+    info: &WorktreeInfo,
+    commit_on_a_ref: Option<bool>,
+) {
+    let message = removal_message(info, commit_on_a_ref);
+    #[cfg(test)]
+    tests_support::MESSAGES.with(|m| m.borrow_mut().push(message.clone()));
+    let locked = info.locked.clone();
     let mut request = ConfirmRequest::new("Remove worktree", message);
     request.details = vec![worktrees::shown(&info.path).into()];
     request.confirm_label = "Remove".into();
@@ -210,4 +244,55 @@ fn remove_worktree(window: &mut Window, cx: &mut App, tab: &TabCtx, info: &Workt
             }
         }),
     );
+}
+
+/// The text of the removal confirmation. "Its branch is kept" is only true for a worktree on a branch; a detached
+/// HEAD says where it is and whether its commits would be lost (`commit_on_a_ref`: `None` = not checked).
+pub(crate) fn removal_message(info: &WorktreeInfo, commit_on_a_ref: Option<bool>) -> String {
+    let name = worktrees::display_name(&info.path);
+    let detached = match &info.head {
+        Some(HeadState::Detached { target }) => {
+            let short = target.to_hex_with_len(7);
+            Some(match commit_on_a_ref {
+                Some(true) => format!("HEAD is detached at {short}."),
+                Some(false) => format!(
+                    "HEAD is detached at {short} and its commits are on no branch or tag; they will be lost."
+                ),
+                None => format!(
+                    "HEAD is detached at {short}; whether its commits are on a branch or tag was not checked."
+                ),
+            })
+        }
+        _ => None,
+    };
+    let with_tail = |head: String| match &detached {
+        Some(tail) => format!("{head} {tail}"),
+        None => head,
+    };
+    match &info.locked {
+        Some(reason) if !reason.is_empty() => with_tail(format!(
+            "The worktree '{name}' is locked ({reason}). Removing it deletes its directory, including any uncommitted changes."
+        )),
+        Some(_) => with_tail(format!(
+            "The worktree '{name}' is locked. Removing it deletes its directory, including any uncommitted changes."
+        )),
+        None => match &info.head {
+            Some(HeadState::Branch { .. }) => format!(
+                "Remove the worktree '{name}'? Its directory is deleted; its branch is kept."
+            ),
+            _ => with_tail(format!(
+                "Remove the worktree '{name}'? Its directory is deleted."
+            )),
+        },
+    }
+}
+
+/// Test hook: the confirmation texts of [`confirm_removal`].
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub static MESSAGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
 }

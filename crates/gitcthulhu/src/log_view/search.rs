@@ -8,13 +8,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, ScrollStrategy, SharedString, Styled as _,
-    Subscription, TestSupportExt as _, Window, div,
+    Subscription, Task, TestSupportExt as _, Window, div,
 };
 
 use super::{LogView, ids};
@@ -37,6 +38,10 @@ pub const LOG_SEARCH_CONTEXT: &str = "LogSearch";
 /// The hint / floating label of the search field (08 §2.3).
 pub const SEARCH_LABEL: &str = "Search by message, author name or commit ID";
 
+/// The pause after the last keystroke before the loaded rows are scanned: the scan runs on the UI thread and
+/// takes tens of milliseconds on a log of 100k rows, so it must not run per character.
+pub const QUERY_DEBOUNCE: Duration = Duration::from_millis(50);
+
 /// Search state of a log view.
 #[derive(Default)]
 pub struct SearchState {
@@ -48,6 +53,10 @@ pub struct SearchState {
     /// Lowercased "author, author e-mail, committer, committer e-mail, full message" per commit.
     cache: HashMap<ObjectId, Box<str>>,
     fetch: ReadSlot,
+    /// The scan of the typed query, waiting for [`QUERY_DEBOUNCE`] to pass without another keystroke.
+    debounce: Option<Task<()>>,
+    /// Counts the typed queries: a pending scan applies only while it is still the latest one.
+    generation: u64,
     _input: Option<Subscription>,
 }
 
@@ -157,6 +166,7 @@ impl LogView {
                 ui.push_view(CloseableView::LogSearch, cx);
             });
         }
+        self.search.debounce = None;
         self.apply_query(query, true, cx);
         self.ensure_messages(cx);
         cx.notify();
@@ -168,6 +178,7 @@ impl LogView {
             return;
         }
         self.search.open = false;
+        self.search.debounce = None;
         self.search.fetch.cancel();
         self.ctx.ui.update(cx, |ui, cx| {
             ui.views.remove(CloseableView::LogSearch);
@@ -184,6 +195,7 @@ impl LogView {
     pub(super) fn on_view_stack_changed(&mut self, cx: &mut Context<Self>) {
         if self.search.open && self.ctx.ui.read(cx).log_search.is_none() {
             self.search.open = false;
+            self.search.debounce = None;
             self.search.fetch.cancel();
             cx.notify();
         }
@@ -206,8 +218,40 @@ impl LogView {
             return;
         }
         self.search.last_query = query.clone();
+        self.search.generation += 1;
+        if query.trim().is_empty() {
+            // Clearing the matches is cheap: no pause.
+            self.search.debounce = None;
+            self.apply_query(query, true, cx);
+            self.ensure_messages(cx);
+            return;
+        }
+        let generation = self.search.generation;
+        // Replacing the task drops (cancels) the scan of the previous keystroke.
+        self.search.debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(QUERY_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                if this.search.generation != generation || !this.search.open {
+                    return;
+                }
+                this.search.debounce = None;
+                let query = this.search.last_query.clone();
+                this.apply_query(query, true, cx);
+                this.ensure_messages(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Runs the pending (debounced) scan of the typed query now; `false` when none is pending.
+    fn flush_query(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.search.debounce.take().is_none() {
+            return false;
+        }
+        let query = self.search.last_query.clone();
         self.apply_query(query, true, cx);
         self.ensure_messages(cx);
+        true
     }
 
     /// Recomputes the matches of `query`; `jump` selects the first match and scrolls to it (a new query, 08 §2.3).
@@ -243,6 +287,8 @@ impl LogView {
 
     /// Moves to the previous (`-1`) or next (`1`) match and scrolls to it; the selection is unchanged.
     pub fn navigate(&mut self, delta: isize, cx: &mut Context<Self>) {
+        // Enter right after typing steps through the typed query's matches, not the previous query's.
+        self.flush_query(cx);
         let target = self.ctx.ui.update(cx, |ui, cx| {
             let search = ui.log_search.as_mut()?;
             let index = step(search.index, search.matches.len(), delta);
@@ -269,6 +315,10 @@ impl LogView {
     /// New rows (paging, reload) while the search is open: match them too and fetch their messages.
     pub(super) fn refresh_search_after_log(&mut self, cx: &mut Context<Self>) {
         if !self.search.open {
+            return;
+        }
+        if self.search.debounce.is_some() {
+            // The pending scan of the typed query covers the new rows (and jumps to its first match).
             return;
         }
         let query = self.search.last_query.clone();
@@ -332,8 +382,11 @@ impl LogView {
                     tracing::warn!("reading commit messages for the log search failed: {error}");
                 }
                 if view.search.open {
-                    let query = view.search.last_query.clone();
-                    view.apply_query(query, false, cx);
+                    // While a typed query waits for its scan, that scan uses the new messages.
+                    if view.search.debounce.is_none() {
+                        let query = view.search.last_query.clone();
+                        view.apply_query(query, false, cx);
+                    }
                     if error.is_none() {
                         view.ensure_messages(cx);
                     }

@@ -15,8 +15,8 @@ use super::other::{fit, image_size, too_large_text};
 use super::recorder::{self, Recorded};
 use super::{DiffView, SelectionOp, ids};
 use crate::backend::{
-    CancelToken, ChangeKind, DiffContent, DiffTarget, FileDiff, HunkHeader, LineRef, LineSelection,
-    ObjectId, RelaPath, SizeUnit,
+    CancelToken, ChangeKind, DiffContent, DiffTarget, FileDiff, HunkHeader, LineKind, LineRef,
+    LineSelection, ObjectId, RelaPath, SizeUnit,
 };
 use crate::metrics::{self, diff as m};
 use crate::settings::{self, DiffViewMode};
@@ -1441,6 +1441,84 @@ fn highlighting_runs_in_two_passes_on_one_document() {
         !doc.highlight_full(&CancelToken::new()),
         "nothing is left to do"
     );
+}
+
+/// A renamed file's removed lines are highlighted with the OLD path's grammar (`old.rs` -> `new.txt`).
+#[test]
+fn renamed_file_old_side_uses_the_old_paths_syntax() {
+    let fx = Fixture::new();
+    fx.write(
+        "old.rs",
+        "fn keep() {}
+fn old() {}
+fn tail() {}
+",
+    );
+    fx.commit_all("init");
+    fx.git(&["mv", "old.rs", "new.txt"]);
+    fx.write(
+        "new.txt",
+        "fn keep() {}
+fn new() {}
+fn tail() {}
+",
+    );
+    fx.git(&["add", "new.txt"]);
+    let diff = Arc::new(file_diff(
+        &fx,
+        DiffTarget::Staged {
+            path: RelaPath::from("new.txt"),
+            previous_path: Some(RelaPath::from("old.rs")),
+        },
+    ));
+    assert_eq!(
+        diff.previous_path.as_ref().map(|p| p.to_string()),
+        Some("old.rs".into())
+    );
+    let doc = build_doc(diff, DiffMode::Unified, 1, &CancelToken::new());
+    let text = doc.text().expect("a text diff");
+    let tokens = doc.syntax.tokens();
+    let of = |kind: LineKind| {
+        text.lines
+            .iter()
+            .position(|l| l.kind == kind)
+            .expect("a line of that kind")
+    };
+    assert!(
+        !tokens[of(LineKind::Removed)].is_empty(),
+        "the removed line has Rust tokens"
+    );
+    assert!(
+        tokens[of(LineKind::Added)].is_empty(),
+        "the added line of a .txt file stays plain"
+    );
+}
+
+/// The second highlighting pass writes into the document's shared cell only: the text selection survives it.
+#[gpui_kit::test]
+fn second_highlight_pass_keeps_a_text_selection(cx: &mut TestAppContext) {
+    let fx = many_changes_fixture();
+    let diff = Arc::new(file_diff(&fx, unstaged("big.rs")));
+    let doc = Arc::new(build_doc(diff, DiffMode::Unified, 1, &CancelToken::new()));
+    assert!(!doc.syntax.is_complete(), "only the first pass has run");
+    let mut selection = cx.update(super::DiffSelection::new);
+    cx.update(|cx| {
+        selection.reset(&doc, cx);
+        selection.select_all(cx);
+        assert!(
+            selection.has_selection(cx),
+            "selected before the second pass"
+        );
+    });
+    let before = cx.update(|cx| selection.selected_text(cx));
+    assert!(doc.highlight_full(&CancelToken::new()));
+    cx.update(|cx| {
+        assert!(
+            selection.has_selection(cx),
+            "the second pass keeps the selection"
+        );
+        assert_eq!(selection.selected_text(cx), before);
+    });
 }
 
 #[gpui_kit::test]

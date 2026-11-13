@@ -15,6 +15,7 @@ use gpui_kit::{
 
 use crate::backend::forge::{CiState, PrState, ReviewBadge};
 use crate::backend::{ByteSlice as _, FullName};
+use crate::log_view::chips::{ChipEnd, round_chip_end};
 use crate::metrics::dp;
 use crate::tab::TabCtx;
 use crate::theme::{ActiveTokens as _, TextStyleExt as _, Tokens};
@@ -248,6 +249,18 @@ pub fn branch_row_badge(ctx: &TabCtx, branch: &FullName, cx: &App) -> Option<Any
     )
 }
 
+/// The box of the PR segment. It is always the last one of its chip, so it rounds the chip's right end itself.
+pub(super) fn segment_shell(bg: Hsla) -> gpui_kit::Div {
+    round_chip_end(div(), ChipEnd::Right)
+        .flex_none()
+        .h(dp(metrics::SEGMENT_H))
+        .px(dp(metrics::SEGMENT_PAD_H))
+        .flex()
+        .flex_row()
+        .items_center()
+        .bg(bg)
+}
+
 /// The PR segment at the end of a local-branch chip in the log: state colour background, an optional CI dot with a
 /// 1 dp `on_primary` border, and "#123" in `on_primary`. `None` when the branch has no pull request.
 pub fn chip_segment(ctx: &TabCtx, branch: &FullName, cx: &App) -> Option<AnyElement> {
@@ -256,15 +269,8 @@ pub fn chip_segment(ctx: &TabCtx, branch: &FullName, cx: &App) -> Option<AnyElem
     let name = branch.as_bstr().to_str_lossy().into_owned();
     let ci = ci_state_of(&badge);
     Some(
-        div()
+        segment_shell(state_color(badge.state, &tokens))
             .id(ids::segment(&name))
-            .flex_none()
-            .h(dp(metrics::SEGMENT_H))
-            .px(dp(metrics::SEGMENT_PAD_H))
-            .flex()
-            .flex_row()
-            .items_center()
-            .bg(state_color(badge.state, &tokens))
             .cursor_pointer()
             .delayed_tooltip(tooltip_text(&badge, offline))
             .on_click(open_in_browser(badge.url.clone()))

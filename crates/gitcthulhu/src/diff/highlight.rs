@@ -322,23 +322,34 @@ impl Highlighter {
     /// a removed line opens does not run on into the added lines; context lines take the new side's tokens. Only
     /// added and removed lines count against the pass's limit ([`Pass::First`]: 500, [`Pass::Full`]: 4,000); the
     /// lines from the first changed line beyond it on stay empty. Every parsed line counts against the pass's byte
-    /// budget ([`FIRST_PASS_BYTES`], [`MAX_PASS_BYTES`]), which bounds full-file views of large files.
+    /// budget ([`FIRST_PASS_BYTES`], [`MAX_PASS_BYTES`]), which bounds full-file views of large files. `path` picks the
+    /// new side's syntax; the old side follows `old_path` (the pre-rename path) when there is one, so a rename from
+    /// `a.js` to `a.ts` colours each side with its own grammar.
     pub fn highlight_diff(
         &self,
         path: &str,
+        old_path: Option<&str>,
         lines: &[(&str, LineKind)],
         pass: Pass,
         cancel: &CancelToken,
     ) -> Highlighted {
         let mut tokens = vec![LineTokens::new(); lines.len()];
         let first_line = lines.first().map(|(text, _)| *text);
-        let Some(syntax) = syntax_for(path, first_line) else {
+        let new_syntax = syntax_for(path, first_line);
+        let old_syntax = match old_path {
+            Some(old_path) if old_path != path => syntax_for(old_path, first_line),
+            _ => new_syntax,
+        };
+        if new_syntax.is_none() && old_syntax.is_none() {
             return Highlighted {
                 tokens,
                 complete: true,
             };
-        };
-        let (mut old, mut new) = (LineState::new(syntax), LineState::new(syntax));
+        }
+        let (mut old, mut new) = (
+            old_syntax.map(LineState::new),
+            new_syntax.map(LineState::new),
+        );
         let budget = pass.budget();
         let mut changed = 0usize;
         let mut bytes = 0usize;
@@ -369,14 +380,18 @@ impl Highlighter {
                     complete: pass == Pass::Full,
                 };
             }
+            // A side without a syntax stays plain.
+            let old_tokens = |old: &mut Option<LineState>| old.as_mut().map(|s| s.line(text));
+            let new_tokens = |new: &mut Option<LineState>| new.as_mut().map(|s| s.line(text));
             tokens[ix] = match kind {
-                LineKind::Removed => old.line(text),
-                LineKind::Added => new.line(text),
+                LineKind::Removed => old_tokens(&mut old),
+                LineKind::Added => new_tokens(&mut new),
                 LineKind::Context => {
-                    old.line(text);
-                    new.line(text)
+                    old_tokens(&mut old);
+                    new_tokens(&mut new)
                 }
-            };
+            }
+            .unwrap_or_default();
         }
         Highlighted {
             tokens,

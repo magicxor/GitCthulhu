@@ -405,6 +405,24 @@ fn chip_segment_is_a_chip_high_with_an_on_primary_border_dot(cx: &mut TestAppCon
     .expect("window");
 }
 
+/// 21 §5.5 / 08 §2.12: the PR segment is the right cap of its chip: its background rounds the right end with the
+/// 16 dp chip radius (the chip's clip is rectangular).
+#[test]
+fn chip_segment_rounds_the_right_end() {
+    let mut shell = badges::segment_shell(gpui_kit::Hsla::default());
+    let r = gpui_kit::Styled::style(&mut shell).corner_radii.clone();
+    let dp = |c: Option<gpui_kit::AbsoluteLength>| match c {
+        Some(gpui_kit::AbsoluteLength::Rems(rems)) => Some(rems.0 * crate::metrics::BASE_REM),
+        other => panic!("unexpected corner {other:?}"),
+    };
+    assert!((dp(r.top_right).unwrap() - 16.).abs() < 1e-3);
+    assert!((dp(r.bottom_right).unwrap() - 16.).abs() < 1e-3);
+    assert!(
+        r.top_left.is_none() && r.bottom_left.is_none(),
+        "the left end stays square"
+    );
+}
+
 // ---- the whole path against the fake forge -------------------------------------------------------------------
 
 struct World {

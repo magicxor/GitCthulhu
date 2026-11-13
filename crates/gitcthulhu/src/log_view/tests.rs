@@ -508,6 +508,51 @@ fn decoration_mask_is_viewport_after_scroll(cx: &mut TestAppContext) {
     });
 }
 
+/// 08 §2.1 LOG_BOTTOM_PADDING: the 80 dp after the last row belong to the scrolled content, not to the list's
+/// bounds. At the top of a long log rows are drawn down to the list's bottom edge (the padding must not hide the
+/// bottom 80 dp), and after scrolling to the end the last row stops 80 dp (rounded up to whole 38 dp rows: 114)
+/// above the bottom edge.
+#[gpui_kit::test]
+fn bottom_padding_is_scroll_content_not_list_padding(cx: &mut TestAppContext) {
+    assert_eq!(bottom_padding_rows(500, 38.), 3, "80 dp = 3 rows of 38 dp");
+    assert_eq!(bottom_padding_rows(500, 34.), 3, "80 dp = 3 rows of 34 dp");
+    assert_eq!(bottom_padding_rows(0, 38.), 0, "no padding without rows");
+    let (handle, _app, _tab) = mount_seeded(cx, RepoSeed::linear(200), DEFAULT_SIZE);
+    let last_rendered = |window: &mut Window| {
+        (0..201usize)
+            .filter(|ix| window.try_find((ids::LOG_ROW, *ix)).is_some())
+            .map(|ix| (ix, bounds(window, (ids::LOG_ROW, ix))))
+            .next_back()
+            .expect("rows are rendered")
+    };
+    frame(cx, handle, |window, _| {
+        let area = bounds(window, ids::LIST_AREA);
+        let (_, row) = last_rendered(window);
+        assert!(
+            (row.origin.y + row.size.height).as_f32() >= area.bottom().as_f32() - 0.5,
+            "rows reach the bottom edge of the list at scroll 0 (no 80 dp dead zone)"
+        );
+    });
+    frame(cx, handle, |window, cx| {
+        window.scroll(
+            ids::LIST_AREA,
+            ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+            cx,
+        );
+    });
+    frame(cx, handle, |_, _| {});
+    frame(cx, handle, |window, _| {
+        let area = bounds(window, ids::LIST_AREA);
+        let (ix, row) = last_rendered(window);
+        assert_eq!(ix, 200, "the last commit row is reachable");
+        let gap = area.bottom().as_f32() - (row.origin.y + row.size.height).as_f32();
+        assert!(
+            (80. - 0.5..80. + 38.).contains(&gap),
+            "at least 80 dp of blank padding after the last row, got {gap}"
+        );
+    });
+}
+
 // ── chips (08 §2.12) ────────────────────────────────────────────────────────────────────────────────
 
 fn local(name: &str, target: u64, head: bool, upstream: Option<&str>) -> LocalBranch {
@@ -870,7 +915,7 @@ fn search_navigation_scrolls_without_select(cx: &mut TestAppContext) {
         );
         window.input("Commit 1", cx);
     });
-    cx.run_until_parked();
+    settle_search(cx);
     let (index, total) = cx.update(|cx| {
         let s = ui.read(cx).log_search.clone().expect("searching");
         (s.index, s.matches.len())
@@ -925,7 +970,7 @@ fn search_enter_steps_one_match(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     frame(cx, handle, |window, cx| window.input("Commit 1", cx));
-    cx.run_until_parked();
+    settle_search(cx);
     let index =
         |cx: &mut TestAppContext| cx.update(|cx| ui.read(cx).log_search.as_ref().map(|s| s.index));
     assert_eq!(index(cx), Some(1));
@@ -942,6 +987,87 @@ fn search_enter_steps_one_match(cx: &mut TestAppContext) {
         Some(2),
         "Shift+Enter moves to the previous match once"
     );
+}
+
+/// Enter right after typing (before the debounce pause ends) steps through the typed query's matches, and the
+/// pending scan does not later reset the index to the first match.
+#[gpui_kit::test]
+fn search_enter_before_the_pause_uses_the_typed_query(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::linear(30), DEFAULT_SIZE);
+    let ui = ui_of(&tab, cx);
+    frame(cx, handle, |window, cx| {
+        window.click(ids::SEARCH_BUTTON, cx)
+    });
+    cx.run_until_parked();
+    frame(cx, handle, |window, cx| window.input("Commit 1", cx));
+    cx.run_until_parked();
+    let state = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = ui.read(cx).log_search.clone().expect("searching");
+            (s.index, s.matches.len(), s.query.to_string())
+        })
+    };
+    assert_eq!(state(cx).1, 0, "the scan is still pending");
+    frame(cx, handle, |window, cx| window.press("enter", cx));
+    cx.run_until_parked();
+    let (index, total, query) = state(cx);
+    assert!(total > 1, "several matches of 'Commit 1'");
+    assert_eq!(query, "Commit 1");
+    assert_eq!(
+        index, 2,
+        "Enter scanned the typed query and moved one match"
+    );
+    settle_search(cx);
+    assert_eq!(state(cx).0, 2, "no late scan resets the index");
+}
+
+/// Lets the debounced scan of the typed query run.
+fn settle_search(cx: &mut TestAppContext) {
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(search::QUERY_DEBOUNCE + Duration::from_millis(1));
+    cx.run_until_parked();
+}
+
+/// The typed query is scanned once the user pauses (50 ms), never per keystroke: right after typing the matches
+/// are not computed yet, a second keystroke restarts the pause, and clearing the field is immediate.
+#[gpui_kit::test]
+fn search_scan_is_debounced(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::linear(30), DEFAULT_SIZE);
+    let ui = ui_of(&tab, cx);
+    frame(cx, handle, |window, cx| {
+        window.click(ids::SEARCH_BUTTON, cx)
+    });
+    cx.run_until_parked();
+    let matches = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            ui.read(cx)
+                .log_search
+                .clone()
+                .expect("searching")
+                .matches
+                .len()
+        })
+    };
+    frame(cx, handle, |window, cx| window.input("Commit 1", cx));
+    cx.run_until_parked();
+    assert_eq!(matches(cx), 0, "no scan before the pause");
+    cx.executor().advance_clock(Duration::from_millis(30));
+    frame(cx, handle, |window, cx| window.input("1", cx));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(30));
+    cx.run_until_parked();
+    assert_eq!(matches(cx), 0, "the second keystroke restarted the pause");
+    cx.executor().advance_clock(Duration::from_millis(30));
+    cx.run_until_parked();
+    assert_eq!(matches(cx), 1, "'Commit 11' matches after the pause");
+    frame(cx, handle, |window, cx| {
+        for _ in 0..9 {
+            window.press("backspace", cx);
+        }
+    });
+    cx.run_until_parked();
+    assert_eq!(matches(cx), 0, "clearing the query needs no pause");
 }
 
 #[gpui_kit::test]
@@ -963,7 +1089,7 @@ fn fixture_search_matches_full_message(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     frame(cx, handle, |window, cx| window.input("NEEDLE", cx));
-    cx.run_until_parked();
+    settle_search(cx);
     let matches = cx.update(|cx| ui.read(cx).log_search.clone().expect("searching").matches);
     assert_eq!(*matches, vec![2], "'Second' matches through its body");
 }
@@ -1709,4 +1835,56 @@ fn wide_graphs_open_with_a_column_that_fits_their_lanes(cx: &mut TestAppContext)
         );
         assert_width(window, ids::HEADER_GRAPH, wanted);
     });
+}
+
+/// The corner radii (in dp) of an element's style: top-left, top-right, bottom-right, bottom-left.
+fn corner_dp(mut el: impl gpui_kit::Styled) -> [Option<f32>; 4] {
+    use gpui_kit::AbsoluteLength;
+    let r = el.style().corner_radii.clone();
+    [r.top_left, r.top_right, r.bottom_right, r.bottom_left].map(|c| {
+        c.map(|c| match c {
+            AbsoluteLength::Rems(rems) => rems.0 * crate::metrics::BASE_REM,
+            AbsoluteLength::Pixels(_) => panic!("chip corners are dp (rems)"),
+        })
+    })
+}
+
+/// 08 §2.12: the 16 dp chip radius makes the icon box the rounded left cap and the last coloured segment (cloud, or
+/// the PR segment) the rounded right cap. The chip's `overflow_hidden` clips to a rectangle only, so the segments
+/// round their own backgrounds.
+#[gpui_kit::test]
+fn chip_caps_are_rounded_16(cx: &mut TestAppContext) {
+    crate::test_support::init_app(cx);
+    let tokens = cx.update(|cx| *crate::theme::ActiveTokens::tokens(cx));
+    let colors = chips::ChipColors {
+        lane: tokens.primary,
+        remote: tokens.primary_variant,
+        tokens,
+    };
+    let left = [Some(16.), None, None, Some(16.)];
+    let right = [None, Some(16.), Some(16.), None];
+    let eps = |a: [Option<f32>; 4], b: [Option<f32>; 4]| {
+        a.iter().zip(&b).all(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => (x - y).abs() < 1e-3,
+            (None, None) => true,
+            _ => false,
+        })
+    };
+    let icon_box = chips::icon_box(crate::icons::AppIcon::Tag, colors.lane, tokens.background);
+    assert!(eps(corner_dp(icon_box), left), "icon box: left cap");
+    assert!(
+        eps(corner_dp(chips::cloud_cell(true, colors)), right),
+        "a cloud without a PR segment is the right cap"
+    );
+    assert!(
+        eps(corner_dp(chips::cloud_cell(false, colors)), [None; 4]),
+        "a cloud followed by the PR segment stays square"
+    );
+    assert!(eps(
+        corner_dp(chips::round_chip_end(
+            gpui_kit::div(),
+            chips::ChipEnd::Right
+        )),
+        right
+    ));
 }

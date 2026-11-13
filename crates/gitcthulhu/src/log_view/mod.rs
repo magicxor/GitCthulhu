@@ -483,7 +483,8 @@ impl LogView {
             let row = frame.snapshot.rows.get(ix)?;
             row.commit.as_ref().map(|c| (c.id, ix))
         });
-        let last_layout = range.end + frame.offset;
+        // The blank padding rows after the last commit are not loaded rows.
+        let last_layout = (range.end + frame.offset).min(frame.snapshot.rows.len());
         if paging::needs_page(
             frame.snapshot.rows.len(),
             last_layout,
@@ -583,6 +584,16 @@ impl LogView {
             )
             .into_any_element()
     }
+}
+
+/// The number of blank rows that make up LOG_BOTTOM_PADDING (80 dp, 08 §2.1) after the last of `count` rows of
+/// `row_h` dp. A `uniform_list` has equal-height items only, so the padding is whole rows; it also keeps the
+/// padding out of the list's own bounds, where it would hide the bottom 80 dp of rows and of the graph.
+pub fn bottom_padding_rows(count: usize, row_h: f32) -> usize {
+    if count == 0 || row_h <= 0. {
+        return 0;
+    }
+    (m::BOTTOM_PADDING / row_h).ceil() as usize
 }
 
 /// The uncommitted row's label for the operation in progress (08 §2.8).
@@ -688,6 +699,7 @@ impl Render for LogView {
         let count = snapshot
             .as_ref()
             .map_or(0, |s| s.rows.len().saturating_sub(offset));
+        let pad_rows = bottom_padding_rows(count, row_h);
         self.frame = snapshot.clone().map(|snapshot| {
             Rc::new(Frame {
                 snapshot,
@@ -717,14 +729,21 @@ impl Render for LogView {
         let list = snapshot.map(|snapshot| {
             let mut list = uniform_list(
                 ids::LIST,
-                count,
-                cx.processor(|this, range: Range<usize>, window, cx| {
+                count + pad_rows,
+                cx.processor(move |this, range: Range<usize>, window, cx| {
                     let Some(frame) = this.frame.clone() else {
                         return Vec::new();
                     };
                     let items = range
                         .clone()
-                        .map(|v| this.render_row(v + frame.offset, &frame, window, cx))
+                        .map(|v| {
+                            if v >= count {
+                                // LOG_BOTTOM_PADDING (08 §2.1): blank rows after the last commit.
+                                div().h(dp(frame.row_h)).into_any_element()
+                            } else {
+                                this.render_row(v + frame.offset, &frame, window, cx)
+                            }
+                        })
                         .collect::<Vec<_>>();
                     this.after_visible(range, &frame, window, cx);
                     items
@@ -740,8 +759,7 @@ impl Render for LogView {
                 lanes,
                 recorder: None,
             })
-            .size_full()
-            .pb(dp(m::BOTTOM_PADDING));
+            .size_full();
             // A horizontal wheel moves the graph, never the list (`UniformList` has no builder method for this).
             list.style().restrict_scroll_to_axis = Some(true);
             list

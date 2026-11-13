@@ -420,8 +420,9 @@ pub fn build_doc(
 
 /// Syntax tokens per `DiffLine` for one highlighting pass (spec 21 §4.1): the lines go to
 /// [`Highlighter::highlight_diff`] in file order with their kinds, which keeps one state per side (old: context and
-/// removed lines, new: context and added lines; context lines take the new side's tokens). The syntax follows the
-/// new path. Entries beyond the pass's limits, and those of a cancelled run, stay empty.
+/// removed lines, new: context and added lines; context lines take the new side's tokens). The new side's syntax
+/// follows the path, the old side's the pre-rename path of a rename. Entries beyond the pass's limits, and those of
+/// a cancelled run, stay empty.
 fn highlight_pass(
     diff: &FileDiff,
     text: &TextDiff,
@@ -430,13 +431,14 @@ fn highlight_pass(
     cancel: &CancelToken,
 ) -> Highlighted {
     let path = diff.path.to_str_lossy();
+    let old_path = diff.previous_path.as_ref().map(|p| p.to_str_lossy());
     let lines: Vec<(&str, LineKind)> = text
         .lines
         .iter()
         .enumerate()
         .map(|(i, l)| (texts.get(i).map_or("", |t| t.as_ref()), l.kind))
         .collect();
-    Highlighter::global().highlight_diff(&path, &lines, pass, cancel)
+    Highlighter::global().highlight_diff(&path, old_path.as_deref(), &lines, pass, cancel)
 }
 
 /// The same document in another mode: only the rows are rebuilt; texts, tokens and number strings are shared.

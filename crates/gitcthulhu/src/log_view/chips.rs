@@ -26,6 +26,55 @@ use crate::metrics::log as m;
 use crate::theme::{TextStyleExt as _, Tokens};
 use crate::widgets::InstantTooltip;
 
+/// An end of a chip (08 §2.12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipEnd {
+    Left,
+    Right,
+}
+
+/// Rounds the outer corners of the chip segment at `end` with the chip radius. The chip's own `overflow_hidden`
+/// clips to a rectangle only, so every segment with a background rounds its outer end itself.
+pub fn round_chip_end<E: gpui_kit::Styled>(segment: E, end: ChipEnd) -> E {
+    let radius = dp(m::CHIP_RADIUS);
+    match end {
+        ChipEnd::Left => segment.rounded_l(radius),
+        ChipEnd::Right => segment.rounded_r(radius),
+    }
+}
+
+/// The left cap of a chip: the icon box.
+pub(super) fn icon_box(role: AppIcon, bg: Hsla, icon_color: Hsla) -> gpui_kit::Div {
+    round_chip_end(
+        div()
+            .flex_none()
+            .size(dp(m::CHIP_H))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(bg),
+        ChipEnd::Left,
+    )
+    .child(icon(role, m::CHIP_ICON, icon_color))
+}
+
+/// The tracking-remote cell; the right cap of the chip unless a PR segment follows.
+pub(super) fn cloud_cell(last: bool, colors: ChipColors) -> gpui_kit::Div {
+    let cell = div()
+        .flex_none()
+        .size(dp(m::CHIP_H))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(colors.remote)
+        .child(icon(AppIcon::Cloud, m::CHIP_ICON, colors.tokens.background));
+    if last {
+        round_chip_end(cell, ChipEnd::Right)
+    } else {
+        cell
+    }
+}
+
 /// What a chip stands for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChipKind {
@@ -224,14 +273,7 @@ impl LogView {
             ChipKind::LocalBranch | ChipKind::DetachedHead => (AppIcon::Branch, colors.lane),
             ChipKind::RemoteBranch => (AppIcon::Cloud, colors.remote),
         };
-        let icon_box = div()
-            .flex_none()
-            .size(dp(m::CHIP_H))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(icon_bg)
-            .child(icon(role, m::CHIP_ICON, t.background));
+        let icon_box = icon_box(role, icon_bg, t.background);
         let current = chip.is_current.then(|| {
             div()
                 .flex_none()
@@ -253,10 +295,10 @@ impl LogView {
             }
             _ => None,
         };
-        let cloud = chip
-            .tracking
-            .as_ref()
-            .map(|tracking| self.render_cloud(row, k, chip, tracking, colors, cx));
+        let cloud = chip.tracking.as_ref().map(|tracking| {
+            let cell = cloud_cell(badge.is_none(), colors);
+            self.render_cloud(row, k, chip, tracking, cell, cx)
+        });
         let id = ids::chip(row, k);
         let menu_chip = chip.clone();
         let click_chip = chip.clone();
@@ -323,22 +365,14 @@ impl LogView {
         k: usize,
         chip: &Chip,
         tracking: &TrackingSegment,
-        colors: ChipColors,
+        cell: gpui_kit::Div,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // The tooltip text is built only when it shows (21 §4.2: no per-frame strings).
         let (local, upstream) = (chip.name.clone(), tracking.name.clone());
         let menu_chip = chip.clone();
         let remote = tracking.clone();
-        div()
-            .id(ids::chip_cloud(row, k))
-            .flex_none()
-            .size(dp(m::CHIP_H))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(colors.remote)
-            .child(icon(AppIcon::Cloud, m::CHIP_ICON, colors.tokens.background))
+        cell.id(ids::chip_cloud(row, k))
             .tooltip(move |_, cx| {
                 let tip = tracking_tooltip(&local, &upstream);
                 AnyView::from(cx.new(|_| InstantTooltip::new(tip, None)))

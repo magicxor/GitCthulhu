@@ -146,7 +146,7 @@ fn highlight_state_carries_across_lines() {
         ("fn context() {}", LineKind::Context),
     ];
     let result =
-        Highlighter::global().highlight_diff("a.rs", &diff, Pass::Full, &CancelToken::new());
+        Highlighter::global().highlight_diff("a.rs", None, &diff, Pass::Full, &CancelToken::new());
     assert!(result.complete);
     assert_eq!(
         text_of(diff[0].0, &result.tokens[0], SyntaxToken::Comment),
@@ -200,7 +200,7 @@ fn highlight_limits_500_then_4000_and_1000_bytes() {
     let highlighter = Highlighter::global();
     let cancel = CancelToken::new();
 
-    let first = highlighter.highlight_diff("a.rs", &input, Pass::First, &cancel);
+    let first = highlighter.highlight_diff("a.rs", None, &input, Pass::First, &cancel);
     assert_eq!(first.tokens.len(), input.len());
     assert!(!first.complete, "the first pass stops at 500 changed lines");
     assert!(!first.tokens[changed_ix(0)].is_empty());
@@ -216,7 +216,7 @@ fn highlight_limits_500_then_4000_and_1000_bytes() {
         "nothing after the 500th changed line"
     );
 
-    let full = highlighter.highlight_diff("a.rs", &input, Pass::Full, &cancel);
+    let full = highlighter.highlight_diff("a.rs", None, &input, Pass::Full, &cancel);
     assert!(full.complete, "the second pass is final");
     assert!(full.tokens[changed_ix(3)].is_empty());
     assert!(!full.tokens[changed_ix(FIRST_PASS_CHANGED_LINES)].is_empty());
@@ -229,7 +229,7 @@ fn highlight_limits_500_then_4000_and_1000_bytes() {
     );
 
     // A small diff is complete after the first pass.
-    let small = highlighter.highlight_diff("a.rs", &input[..20], Pass::First, &cancel);
+    let small = highlighter.highlight_diff("a.rs", None, &input[..20], Pass::First, &cancel);
     assert!(small.complete);
 
     // The single-side entry point: 4,000 lines at most, one entry per line.
@@ -253,7 +253,7 @@ fn highlight_cancel_returns_early() {
     );
 
     let diff: Vec<(&str, LineKind)> = lines.iter().map(|l| (*l, LineKind::Added)).collect();
-    let result = Highlighter::global().highlight_diff("a.rs", &diff, Pass::Full, &cancel);
+    let result = Highlighter::global().highlight_diff("a.rs", None, &diff, Pass::Full, &cancel);
     assert_eq!(result.tokens.len(), diff.len());
     assert!(!result.complete, "a cancelled pass is not complete");
     assert!(result.tokens.iter().all(|t| t.is_empty()));
@@ -272,7 +272,7 @@ fn highlight_first_pass_is_bounded_by_bytes_in_full_file_views() {
     let last = input.len() - 1;
     let cancel = CancelToken::new();
 
-    let first = Highlighter::global().highlight_diff("a.rs", &input, Pass::First, &cancel);
+    let first = Highlighter::global().highlight_diff("a.rs", None, &input, Pass::First, &cancel);
     assert!(!first.complete, "the first pass stopped at its byte budget");
     assert!(!first.tokens[0].is_empty());
     let parsed = first.tokens.iter().take_while(|t| !t.is_empty()).count();
@@ -282,10 +282,41 @@ fn highlight_first_pass_is_bounded_by_bytes_in_full_file_views() {
     );
     assert!(first.tokens[last].is_empty());
 
-    let full = Highlighter::global().highlight_diff("a.rs", &input, Pass::Full, &cancel);
+    let full = Highlighter::global().highlight_diff("a.rs", None, &input, Pass::Full, &cancel);
     assert!(full.complete);
     assert!(
         !full.tokens[last].is_empty(),
         "the second pass reaches the change"
     );
+}
+
+/// A rename colours the old side (context and removed lines) with the old path's grammar and the new side with the
+/// new path's: `a.rs` -> `a.py` and `a.rs` -> `a.txt` (no grammar).
+#[test]
+fn rename_highlights_each_side_with_its_own_grammar() {
+    let cancel = CancelToken::new();
+    let h = Highlighter::global();
+    let line = "fn main() { let x = 1; }";
+    let diff = [(line, LineKind::Removed), (line, LineKind::Added)];
+
+    let rust = h.highlight("a.rs", &[line], &cancel);
+    let python = h.highlight("a.py", &[line], &cancel);
+    assert_ne!(rust[0], python[0], "the probe line differs per grammar");
+    let renamed = h.highlight_diff("a.py", Some("a.rs"), &diff, Pass::Full, &cancel);
+    assert_eq!(
+        renamed.tokens[0], rust[0],
+        "removed: the old path's grammar"
+    );
+    assert_eq!(
+        renamed.tokens[1], python[0],
+        "added: the new path's grammar"
+    );
+
+    let to_plain = h.highlight_diff("a.txt", Some("a.rs"), &diff, Pass::Full, &cancel);
+    assert_eq!(to_plain.tokens[0], rust[0], "removed: still Rust");
+    assert!(to_plain.tokens[1].is_empty(), "added: no grammar, plain");
+    assert!(to_plain.complete);
+
+    let same = h.highlight_diff("a.py", None, &diff, Pass::Full, &cancel);
+    assert_eq!(same.tokens[0], python[0], "no old path: one grammar");
 }

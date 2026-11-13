@@ -468,6 +468,70 @@ fn no_refs_yield_empty_sections() {
     assert_eq!(rows.len(), 5, "five headers and nothing else");
 }
 
+/// The Worktrees section follows the filter like the others: on the directory name and the checked-out branch.
+#[test]
+fn filter_applies_to_worktrees() {
+    let worktree = |dir: &str, branch: Option<&str>| crate::backend::WorktreeInfo {
+        id: Some(dir.to_owned()),
+        path: std::env::temp_dir().join(dir),
+        git_dir: std::env::temp_dir().join(dir).join(".git"),
+        head: Some(match branch {
+            Some(name) => HeadState::Branch {
+                name: full(&format!("refs/heads/{name}")),
+                target: oid(1),
+            },
+            None => HeadState::Detached { target: oid(2) },
+        }),
+        is_current: false,
+        locked: None,
+        prunable: false,
+        bare: false,
+    };
+    let worktrees = [
+        worktree("app-hotfix", Some("release/1.0")),
+        worktree("Scratch", None),
+        worktree("docs", Some("feature/Search")),
+    ];
+    let collapsed = HashSet::new();
+    let rows_for = |filter: &str| {
+        build_rows(&RowInputs {
+            refs: None,
+            submodules: &[],
+            worktrees: Some(&worktrees),
+            filter,
+            expanded: &all_expanded(),
+            remotes_collapsed: &collapsed,
+        })
+    };
+    let shown = |rows: &[SideRow]| -> Vec<usize> {
+        rows.iter()
+            .filter_map(|r| match r {
+                SideRow::Worktree { ix } => Some(*ix),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let rows = rows_for("");
+    assert_eq!(shown(&rows), [0, 1, 2], "no filter: every worktree");
+    let rows = rows_for("scr");
+    assert_eq!(
+        shown(&rows),
+        [1],
+        "the directory name matches, case-insensitively"
+    );
+    assert_eq!(
+        header_count(&rows, Section::Worktrees),
+        1,
+        "the count is filtered"
+    );
+    let rows = rows_for("search");
+    assert_eq!(shown(&rows), [2], "the checked-out branch matches too");
+    let rows = rows_for("nothing-like-this");
+    assert!(shown(&rows).is_empty(), "no match: only the header stays");
+    assert_eq!(header_count(&rows, Section::Worktrees), 0);
+}
+
 #[test]
 fn submodule_letters_and_names() {
     assert_eq!(submodule_state(SubmoduleState::Missing), ("M", "MISSING"));

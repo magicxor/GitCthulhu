@@ -112,6 +112,15 @@ pub fn init_app(cx: &mut TestAppContext) {
 
 /// Opens the main window (AppView with one welcome tab).
 pub fn open_app(cx: &mut TestAppContext, size: Size<Pixels>) -> (AnyWindowHandle, Entity<AppView>) {
+    open_app_with_cli(cx, size, None)
+}
+
+/// Opens the main window as if `cli` had been given on the command line.
+pub fn open_app_with_cli(
+    cx: &mut TestAppContext,
+    size: Size<Pixels>,
+    cli: Option<std::path::PathBuf>,
+) -> (AnyWindowHandle, Entity<AppView>) {
     cx.update(|cx| {
         let receiver = cx
             .has_global::<PendingRequests>()
@@ -123,7 +132,7 @@ pub fn open_app(cx: &mut TestAppContext, size: Size<Pixels>) -> (AnyWindowHandle
         gpui_kit::open_window(
             geometry::window_options(size.width.as_f32(), size.height.as_f32()),
             cx,
-            move |window, cx| cx.new(|cx| AppView::new(receiver, None, window, cx)),
+            move |window, cx| cx.new(|cx| AppView::new(receiver, cli, window, cx)),
         )
         .expect("open the test window")
     })

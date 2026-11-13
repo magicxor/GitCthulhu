@@ -1345,9 +1345,9 @@ fn commit_menu_end_slot_extended(cx: &mut TestAppContext) {
     let target = commit_target(&tab, oid(2), cx);
     let ids = menu_ids(&cx.update(|cx| crate::menus::log::commit(&target, cx)));
     assert_eq!(
-        &ids[ids.len() - 3..],
-        ["log-reset", "x-ext", "-"],
-        "extenders come at the end"
+        &ids[ids.len() - 2..],
+        ["log-reset", "x-ext"],
+        "extenders come at the end, and the menu does not end in a separator"
     );
 }
 

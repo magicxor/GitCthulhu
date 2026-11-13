@@ -117,12 +117,39 @@ pub fn save_draft_message(repo: &Repo, message: Option<&str>) -> Result<()> {
     };
     match message {
         Some(text) if !text.trim().is_empty() => {
-            if let Some(dir) = path.parent() {
-                fs::create_dir_all(dir).map_err(|err| GitError::io(dir, err))?;
+            let dir = path.parent().unwrap_or(repo.git_dir());
+            // Only the draft's own folder is created: a repository deleted from disk must not come back as an
+            // empty `.git/gitcthulhu` (the git dir missing means NotFound, and the commit box stops saving).
+            match fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(GitError::io(dir, err)),
             }
-            fs::write(&path, text).map_err(|err| GitError::io(&path, err))
+            write_replacing(dir, &path, text.as_bytes())
         }
         _ => remove_file_if_exists(&path),
+    }
+}
+
+/// Writes `bytes` to `path` through a temporary file in `dir` and a rename, so a crash mid-write leaves the old
+/// message rather than a truncated one. When the rename is refused (Windows: another program holds `path` open
+/// without delete sharing) it falls back to writing in place.
+fn write_replacing(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|err| GitError::io(dir, err))?;
+    temp.write_all(bytes)
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|err| GitError::io(temp.path(), err))?;
+    match temp.persist(path) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            tracing::debug!(
+                "replacing {} failed ({}), writing in place",
+                path.display(),
+                err.error
+            );
+            fs::write(path, bytes).map_err(|err| GitError::io(path, err))
+        }
     }
 }
 

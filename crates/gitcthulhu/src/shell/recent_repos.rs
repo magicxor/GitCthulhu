@@ -385,7 +385,7 @@ impl RecentRepos {
                                     })
                                     .child(icon(
                                         AppIcon::Close,
-                                        metrics::ICON_MD,
+                                        dims::RECENT_REMOVE,
                                         tokens.on_background_secondary,
                                     ))
                                     .test_support(),

@@ -65,8 +65,8 @@ fn menu_extender_inserted_at_slot_with_separator(cx: &mut TestAppContext) {
         extend(cx, MenuSlot::End, &target, &mut items);
         assert_eq!(
             labels(&items).last().map(String::as_str),
-            Some("---"),
-            "the End slot extender of the same kind was applied"
+            Some("nope"),
+            "the End slot extender of the same kind was applied, with no trailing separator"
         );
     });
 }

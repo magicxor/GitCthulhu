@@ -394,6 +394,36 @@ fn draft_roundtrip_and_cleared_after_commit() {
     commit::save_draft_message(&repo, None).expect("deleting a missing draft is fine");
 }
 
+/// Saving replaces the draft (a second save overwrites the first, no temporary files stay behind), and a
+/// repository whose `.git` was deleted from disk is not re-created by a save.
+#[test]
+fn draft_save_replaces_and_does_not_recreate_a_deleted_git_dir() {
+    let env = TestEnv::new();
+    let fixture = with_staged_change(&env);
+    let repo = fixture.open();
+    commit::save_draft_message(&repo, Some("a long first draft message")).expect("save works");
+    commit::save_draft_message(&repo, Some("short")).expect("save works");
+    assert_eq!(
+        commit::load_draft_message(&repo).expect("load works"),
+        Some("short".to_owned()),
+        "the second save replaced the first completely"
+    );
+    let draft_dir = fixture.path.join(".git").join("gitcthulhu");
+    let names: Vec<_> = std::fs::read_dir(&draft_dir)
+        .expect("the draft folder exists")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, ["commit-draft"], "no temporary file is left behind");
+
+    let git_dir = fixture.path.join(".git");
+    std::fs::remove_dir_all(&git_dir).expect("the git dir can be deleted");
+    assert!(
+        commit::save_draft_message(&repo, Some("typed after the deletion")).is_err(),
+        "saving into a deleted repository fails"
+    );
+    assert!(!git_dir.exists(), "the save did not re-create .git");
+}
+
 #[test]
 fn draft_in_merge_state_writes_merge_msg() {
     let env = TestEnv::new();

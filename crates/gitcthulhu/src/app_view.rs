@@ -228,7 +228,16 @@ impl AppView {
             view.restoring.push(view.tabs[ix].id);
             view.start_open(ix, path, OpenKind::Open, None, window, cx);
         }
-        if let Some(path) = cli {
+        // A repository given on the command line that is already among the restored tabs selects that tab.
+        let restored_cli = cli.as_ref().and_then(|path| {
+            view.tabs.iter().position(|slot| {
+                slot.path(cx)
+                    .is_some_and(|open| crate::worktrees::same_path(&open, path))
+            })
+        });
+        if let Some(ix) = restored_cli {
+            view.active = ix;
+        } else if let Some(path) = cli {
             view.open_repository(path, true, window, cx);
         } else if !view.tabs.is_empty() {
             view.active = restore.1.min(view.tabs.len() - 1);
@@ -282,6 +291,15 @@ impl AppView {
             Some(TabContent::Opening { path, .. }) => handle::display_name_of(path).into(),
             _ => "New tab".into(),
         }
+    }
+
+    /// The window title (07 §1): "GitCthulhu - " and the selected tab's title ("New tab" for a welcome tab),
+    /// truncated to 250 characters.
+    pub fn window_title(&self, cx: &App) -> String {
+        format!("GitCthulhu - {}", self.tab_title(self.active, cx))
+            .chars()
+            .take(250)
+            .collect()
     }
 
     /// The tooltip of a tab: the repository's full path (none for "New tab").
@@ -805,11 +823,7 @@ impl AppView {
         let active_tab = self.tabs.get(self.active);
         let tab_id = active_tab.filter(|s| s.repo().is_some()).map(|s| s.id);
         self.toasts.update(cx, |t, cx| t.set_active_tab(tab_id, cx));
-        let title = match active_tab.map(|s| &s.content) {
-            Some(TabContent::Welcome(_)) | None => "GitCthulhu".to_owned(),
-            Some(_) => format!("GitCthulhu - {}", self.tab_title(self.active, cx)),
-        };
-        window.set_window_title(&title);
+        window.set_window_title(&self.window_title(cx));
         self.persist_tabs(cx);
         cx.notify();
     }

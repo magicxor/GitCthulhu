@@ -752,3 +752,47 @@ fn checkout_post_checkout_failure_is_warning() {
         outcome.warnings
     );
 }
+
+/// A branch whose short name starts with '-' (possible through `git update-ref`) is refused before git runs:
+/// `git switch -x` / `git branch -d -x` would read it as an option.
+#[test]
+fn a_branch_name_starting_with_a_dash_is_refused() {
+    let env = TestEnv::new();
+    let fixture = two_branches(&env);
+    fixture.git(&["update-ref", "refs/heads/-x", "HEAD"]);
+    let repo = fixture.open();
+    let dashed = full("refs/heads/-x");
+    assert_kind(
+        with_perm(&fixture, &repo, |perm, ctx| {
+            branch::checkout_branch(&repo, perm, ctx, &dashed, CheckoutOptions::default())
+        }),
+        GitErrorKind::InvalidName,
+        "checkout",
+    );
+    assert_kind(
+        with_perm(&fixture, &repo, |perm, ctx| {
+            branch::delete_branch(&repo, perm, ctx, &dashed, true)
+        }),
+        GitErrorKind::InvalidName,
+        "delete",
+    );
+    assert_kind(
+        with_perm(&fixture, &repo, |perm, ctx| {
+            branch::rename_branch(&repo, perm, ctx, &dashed, "renamed")
+        }),
+        GitErrorKind::InvalidName,
+        "rename",
+    );
+    assert_kind(
+        with_perm(&fixture, &repo, |perm, ctx| {
+            branch::set_upstream(&repo, perm, ctx, &dashed, None)
+        }),
+        GitErrorKind::InvalidName,
+        "unset upstream",
+    );
+    assert_eq!(
+        fixture.git(&["rev-parse", "--verify", "-q", "refs/heads/-x"]),
+        fixture.git(&["rev-parse", "HEAD"]),
+        "the branch is untouched"
+    );
+}

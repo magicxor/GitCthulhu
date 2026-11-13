@@ -224,8 +224,8 @@ fn consent_from_bool_or_text<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-/// The scale factors offered in Appearance.
-pub const SCALE_CHOICES: [f32; 8] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+/// The scale factors offered in Appearance: 75 % to 300 % in steps of 25 (09 §3.18).
+pub const SCALE_CHOICES: [f32; 10] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0];
 
 impl Settings {
     /// Loads settings from `path`: defaults when missing, defaults plus a backup when corrupt, the defaults of the

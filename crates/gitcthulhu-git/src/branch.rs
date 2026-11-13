@@ -307,11 +307,14 @@ pub fn validate_branch_name(repo: &Repo, name: &str) -> Result<FullName> {
 }
 
 /// `refs/heads/<short>` -> `<short>`; anything else is `InvalidName`.
+/// The short name passed to `git switch` / `git branch`. A short name starting with '-' (a ref such as
+/// `refs/heads/-x` made with `git update-ref`) is refused: git would read it as an option.
 fn short_branch_name(branch: &FullName) -> Result<String> {
     branch
         .as_bstr()
         .strip_prefix(HEADS.as_bytes())
         .and_then(|short| short.to_str().ok())
+        .filter(|short| !short.starts_with('-'))
         .map(str::to_owned)
         .ok_or_else(|| invalid_branch_name(branch.as_bstr()))
 }

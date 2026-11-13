@@ -619,8 +619,8 @@ fn a_non_standard_scale_is_listed_too(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, window, _| {
         window.find(ids::select_option("scale", 2));
         assert!(
-            window.try_find(ids::select_option("scale", 8)).is_some(),
-            "nine options: the eight standard scales and 110%"
+            window.try_find(ids::select_option("scale", 10)).is_some(),
+            "eleven options: the ten standard scales and 110%"
         );
     })
     .expect("window");

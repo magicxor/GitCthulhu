@@ -242,15 +242,19 @@ pub fn build_rows(inputs: &RowInputs<'_>) -> Vec<SideRow> {
         rows.extend(submodules.into_iter().map(|ix| SideRow::Submodule { ix }));
     }
 
+    // Worktrees: filtered on the directory name and the checked-out branch (the two texts of the row).
     if let Some(worktrees) = inputs.worktrees {
-        header(
-            &mut rows,
-            Section::Worktrees,
-            worktrees.len(),
-            inputs.expanded,
-        );
+        let shown: Vec<usize> = (0..worktrees.len())
+            .filter(|&ix| {
+                let info = &worktrees[ix];
+                needle.is_empty()
+                    || matches_filter(&needle, &crate::worktrees::display_name(&info.path))
+                    || matches_filter(&needle, &crate::worktrees::branch_label(info))
+            })
+            .collect();
+        header(&mut rows, Section::Worktrees, shown.len(), inputs.expanded);
         if inputs.expanded.worktrees {
-            rows.extend((0..worktrees.len()).map(|ix| SideRow::Worktree { ix }));
+            rows.extend(shown.into_iter().map(|ix| SideRow::Worktree { ix }));
         }
     }
     rows

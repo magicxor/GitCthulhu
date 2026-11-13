@@ -26,7 +26,8 @@ use crate::tab::{BusyState, PrompterMode, RepoTab, TabId, TabOptions};
 use crate::test_support::geometry::{assert_rect, bounds, open_probe};
 use crate::test_support::input::click_with;
 use crate::test_support::{
-    DEFAULT_SIZE, Fixture, InertBackend, RepoSeed, init_app, mount_seeded, open_app, toast_texts,
+    DEFAULT_SIZE, Fixture, InertBackend, RepoSeed, init_app, mount_seeded, open_app,
+    open_app_with_cli, toast_texts,
 };
 use crate::theme::ActiveTokens as _;
 use crate::widgets::observed;
@@ -285,6 +286,63 @@ fn tabs_restore_and_select(cx: &mut TestAppContext) {
         assert_eq!(view.tabs()[0].path(cx).as_deref(), Some(one.path()));
         assert_eq!(view.tabs()[1].path(cx).as_deref(), Some(two.path()));
     });
+}
+
+/// A repository given on the command line that is already among the restored tabs selects that tab instead of
+/// opening a second one; the window title names the selected tab.
+#[gpui_kit::test]
+fn cli_repository_already_restored_selects_its_tab(cx: &mut TestAppContext) {
+    let (one, two) = (Fixture::new(), Fixture::new());
+    for (fx, text) in [
+        (
+            &one, "1
+",
+        ),
+        (
+            &two, "2
+",
+        ),
+    ] {
+        fx.write("a.txt", text);
+        fx.commit_all("init");
+    }
+    init_app(cx);
+    git_ready(cx, &one);
+    cx.update(|cx| {
+        state::update(cx, |s| {
+            s.tabs_open = vec![one.path().to_owned(), two.path().to_owned()];
+            s.selected_tab = 1;
+        })
+    });
+    let (_handle, app) = open_app_with_cli(cx, DEFAULT_SIZE, Some(one.path().to_owned()));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = app.read(cx);
+        assert_eq!(
+            view.tabs().len(),
+            2,
+            "no second tab for the same repository"
+        );
+        assert_eq!(
+            view.active(),
+            0,
+            "the command-line repository's tab is selected"
+        );
+        assert_eq!(
+            view.window_title(cx),
+            format!("GitCthulhu - {}", view.tab_title(0, cx)),
+            "the title names the selected tab"
+        );
+    });
+}
+
+/// 07 §1: a welcome tab's window title is "GitCthulhu - New tab".
+#[gpui_kit::test]
+fn welcome_tab_window_title(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (_handle, app) = open_app(cx, DEFAULT_SIZE);
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(app.read(cx).window_title(cx), "GitCthulhu - New tab"));
 }
 
 #[gpui_kit::test]

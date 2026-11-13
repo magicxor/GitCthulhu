@@ -138,7 +138,8 @@ pub fn register_extender(cx: &mut App, kind: MenuKind, slot: MenuSlot, f: MenuEx
 }
 
 /// Builders call this at each slot: appends the items of the extenders registered for `target.kind` at `slot`
-/// (in registration order) followed by a separator, if any item was added.
+/// (in registration order) followed by a separator, if any item was added. The `End` slot is the last group of
+/// its menu, so it gets no trailing separator.
 pub fn extend(cx: &App, slot: MenuSlot, target: &MenuTarget, items: &mut Vec<MenuItem>) {
     let Some(extensions) = cx.try_global::<MenuExtensions>() else {
         return;
@@ -151,7 +152,9 @@ pub fn extend(cx: &App, slot: MenuSlot, target: &MenuTarget, items: &mut Vec<Men
     }
     if !added.is_empty() {
         items.append(&mut added);
-        items.push(MenuItem::Separator);
+        if slot != MenuSlot::End {
+            items.push(MenuItem::Separator);
+        }
     }
 }
 

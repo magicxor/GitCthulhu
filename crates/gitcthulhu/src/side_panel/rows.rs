@@ -266,6 +266,7 @@ impl SidePanelView {
             .items_center()
             .cursor_pointer()
             .hover(move |s| s.bg(tokens.hover_layer()))
+            .active(move |s| s.bg(tokens.press_layer()))
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_section(section, cx)),
             )

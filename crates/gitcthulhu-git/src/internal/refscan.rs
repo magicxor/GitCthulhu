@@ -79,6 +79,9 @@ const MAX_THREADS: usize = 8;
 
 /// Every reference of `namespace`, sorted by name.
 ///
+/// With a ref namespace or precomposed unicode (the default on macOS) the listing goes through gix, which
+/// unlike the walk here and unlike Git does not follow symbolic links to loose reference files.
+///
 /// An item is an error for a reference that cannot be read or parsed (the caller decides whether to skip it); an
 /// error of the whole result means the namespace could not be enumerated or `packed-refs` could not be read.
 pub(crate) fn scan(
@@ -446,6 +449,9 @@ mod tests {
         std::os::unix::fs::symlink(elsewhere.join("missing"), heads.join("dangling"))
             .expect("symlink");
 
+        // On macOS `git init` turns precomposed unicode on, and `scan` then lists through gix, which
+        // does not follow links. This test is about the scan's own walk.
+        repo.git(&["config", "core.precomposeunicode", "false"]);
         let gix_repo = gix::open(&repo.path).expect("the repository opens");
         let names: Vec<String> = with_scan(&gix_repo, RefNamespace::LocalBranches)
             .into_iter()

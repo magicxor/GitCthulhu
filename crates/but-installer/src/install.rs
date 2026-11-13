@@ -15,6 +15,9 @@ use crate::ui;
 pub(crate) const APP_BINARY_NAME: &str = "gitcthulhu";
 
 /// Returns the path to the application binary for the given home directory.
+///
+/// Only the Linux install flow puts a bare binary there; macOS installs an app bundle.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn app_binary_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".local/bin").join(APP_BINARY_NAME)
 }

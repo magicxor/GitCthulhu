@@ -45,7 +45,7 @@ jobs:
           shared-key: ci-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Zig
-        uses: ./.github/actions/setup-zig
+        uses: $/.github/actions/setup-zig
       - name: Linux dependencies
         if: ${{ runner.os == 'Linux' }}
         run: |

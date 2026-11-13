@@ -20,7 +20,6 @@ serde.workspace = true
 bstr.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-unicode-segmentation.workspace = true
 gix = { workspace = true, features = [
     "dirwalk",
     "credentials",
@@ -39,9 +38,6 @@ boolean-enums.workspace = true
 
 # for staging checkout files before moving them into the worktree
 tempfile.workspace = true
-
-# for parallel changeset-similarity computation
-flume = "0.11.1"
 
 # for `sync`
 fslock = "0.2.1"

@@ -8,59 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::IgnoredWorktreeChange;
 
-/// Represents the pushable status of a branch.
-#[derive(Debug, Clone, PartialEq, Eq, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PushStatus {
-    /// Can push, but there are no changes to be pushed
-    NothingToPush,
-    /// Can push. This is the case when there are local changes that can be pushed to the remote.
-    UnpushedCommits,
-    /// Can push, but requires a force push to the remote because commits were rewritten.
-    UnpushedCommitsRequiringForce,
-    /// Completely unpushed - there is no remote tracking branch so Git never interacted with the remote.
-    CompletelyUnpushed,
-    /// Fully integrated, no changes to push.
-    Integrated,
-}
-
-/// Represents the state a commit could be in.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", content = "subject")]
-pub enum CommitState {
-    /// The commit is only local
-    LocalOnly,
-    /// The commit is also present at the remote tracking branch.
-    /// This is the commit state if:
-    ///  - The commit has been pushed to the remote
-    ///  - The commit has been copied from a remote commit (when applying a remote branch)
-    ///
-    /// This variant carries the remote commit id.
-    /// The `remote_commit_id` may be the same as the `id` or it may be different if the local commit has been rebased or updated in another way.
-    #[serde(with = "but_serde::object_id")]
-    LocalAndRemote(gix::ObjectId),
-    /// The commit is considered integrated.
-    /// This should happen when this commit or the contents of this commit is already part of the base.
-    Integrated,
-}
-
-impl CommitState {
-    /// A short human-readable label for this state, given the owning commit `id`.
-    pub fn display(&self, id: gix::ObjectId) -> &'static str {
-        match self {
-            CommitState::LocalOnly => "local",
-            CommitState::LocalAndRemote(remote_id) => {
-                if *remote_id == id {
-                    "local/remote(identity)"
-                } else {
-                    "local/remote(similarity)"
-                }
-            }
-            CommitState::Integrated => "integrated",
-        }
-    }
-}
-
 /// The type returned by [`crate::diff::worktree_changes()`].
 ///
 /// Not registered as a frontend type library because it is flattened into a

@@ -13,67 +13,6 @@ pub mod git {
     const GPG_PROGRAM: &str = "gpg.program";
     const GPG_SSH_PROGRAM: &str = "gpg.ssh.program";
 
-    /// UI types
-    pub mod ui {
-        use but_serde::BStringForFrontend;
-
-        /// See [`GitConfigSettings`](crate::GitConfigSettings) for the docs.
-        #[derive(Debug, PartialEq, Clone, Default, serde::Serialize, serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        #[expect(missing_docs)]
-        pub struct GitConfigSettings {
-            pub sign_commits: Option<bool>,
-            pub signing_key: Option<BStringForFrontend>,
-            pub signing_format: Option<BStringForFrontend>,
-            pub gpg_program: Option<BStringForFrontend>,
-            pub gpg_ssh_program: Option<BStringForFrontend>,
-        }
-
-        impl From<crate::GitConfigSettings> for GitConfigSettings {
-            fn from(
-                crate::GitConfigSettings {
-                    sign_commits,
-                    signing_key,
-                    signing_format,
-                    gpg_program,
-                    gpg_ssh_program,
-                }: crate::GitConfigSettings,
-            ) -> Self {
-                GitConfigSettings {
-                    sign_commits,
-                    signing_key: signing_key.map(Into::into),
-                    signing_format: signing_format.map(Into::into),
-                    gpg_program: gpg_program
-                        .and_then(|v| gix::path::os_string_into_bstring(v).ok().map(Into::into)),
-                    gpg_ssh_program: gpg_ssh_program
-                        .and_then(|v| gix::path::os_string_into_bstring(v).ok().map(Into::into)),
-                }
-            }
-        }
-
-        impl TryFrom<GitConfigSettings> for crate::GitConfigSettings {
-            type Error = gix::Error;
-
-            fn try_from(
-                GitConfigSettings {
-                    sign_commits,
-                    signing_key,
-                    signing_format,
-                    gpg_program,
-                    gpg_ssh_program,
-                }: GitConfigSettings,
-            ) -> Result<Self, Self::Error> {
-                Ok(crate::GitConfigSettings {
-                    sign_commits,
-                    signing_key: signing_key.map(Into::into),
-                    signing_format: signing_format.map(Into::into),
-                    gpg_program: gpg_program.map(TryInto::try_into).transpose()?,
-                    gpg_ssh_program: gpg_ssh_program.map(TryInto::try_into).transpose()?,
-                })
-            }
-        }
-    }
-
     pub(crate) mod types {
         use std::ffi::OsString;
 

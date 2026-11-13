@@ -12,10 +12,7 @@ mod tracking;
 pub use tracking::{LocalRefName, LocalTrackingBranchMatch, find_local_tracking_branch};
 
 mod generate;
-pub use generate::{
-    canned_refname, find_unique_refname, find_unique_refname_excluding, refuse_colliding_refname,
-    unique_canned_refname,
-};
+pub use generate::{find_unique_refname, find_unique_refname_excluding, refuse_colliding_refname};
 
 /// Resolve the remote-tracking ref that corresponds to a local branch ref.
 ///

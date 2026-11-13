@@ -63,9 +63,6 @@ pub use hunks::{
 /// Commit related utility types.
 pub mod commit;
 
-/// The generic changeset-similarity engine, used to detect when two commits represent the same change.
-pub mod changeset;
-
 /// Utilities related to branches
 pub mod branch;
 
@@ -84,9 +81,6 @@ pub mod unified_diff;
 
 /// utilities for command-invocation.
 pub mod cmd;
-
-/// Utilities for running Git hooks.
-pub mod hooks;
 
 /// Various settings
 pub mod settings;

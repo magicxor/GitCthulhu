@@ -135,7 +135,6 @@ regex = { version = "1.11.3", default-features = false, features = [
 ] }
 sysinfo = { version = "0.37.2", default-features = false }
 nonempty = "0.12.0"
-unicode-segmentation = "1.13.2"
 urlencoding = "2.1"
 smallvec = "1.15.1"
 bitflags = "2.13"

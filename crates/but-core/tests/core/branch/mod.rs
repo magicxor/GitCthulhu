@@ -1,4 +1,3 @@
-mod canned_refname;
 mod find_unique_refname;
 mod normalize_short_name;
 mod refuse_colliding_refname;

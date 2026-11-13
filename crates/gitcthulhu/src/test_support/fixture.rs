@@ -49,10 +49,14 @@ impl Default for Fixture {
 
 impl Fixture {
     /// `git init -b main` in a fresh temporary directory.
+    ///
+    /// The directory lies in the canonical form of the temp directory, the form the app stores and shows
+    /// repository paths in: `TEMP` may be an 8.3 short path on Windows (`C:\Users\RUNNER~1\...`), and macOS's
+    /// `/var/folders/...` is a symlink into `/private/var`.
     pub fn new() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("gcg")
-            .tempdir()
+            .tempdir_in(crate::settings::state::canonical(&std::env::temp_dir()))
             .expect("a temporary directory can be created");
         std::fs::create_dir_all(dir.path().join("home")).expect("home can be created");
         std::fs::create_dir_all(dir.path().join("repo")).expect("the repository can be created");

@@ -368,7 +368,8 @@ impl LogView {
                     AvatarShape::Circle
                 };
                 let (name, email) = (commit.author_name.clone(), commit.author_email.clone());
-                let avatar = Avatar::new(name.clone(), email.clone(), m::NODE)
+                // Half a stroke smaller on each side, so the avatar's edge lies under the ring.
+                let avatar = Avatar::new(name.clone(), email.clone(), m::NODE - m::STROKE)
                     .shape(shape)
                     .fallback_color(lane);
                 let node = if merge {
@@ -377,7 +378,11 @@ impl LogView {
                     base.rounded_full()
                 };
                 lazy_tooltip(
-                    node.overflow_hidden().child(avatar).child(ring(merge)),
+                    node.flex()
+                        .items_center()
+                        .justify_center()
+                        .child(avatar)
+                        .child(ring(merge)),
                     move || format!("{name} <{email}>"),
                 )
                 .test_support()

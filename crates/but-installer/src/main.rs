@@ -1,6 +1,6 @@
-//! GitButler installer binary
+//! GitCthulhu installer binary
 //!
-//! This binary provides a command-line interface for installing GitButler.
+//! This binary provides a command-line interface for installing GitCthulhu.
 //! The actual installation logic is in the library.
 
 fn main() {

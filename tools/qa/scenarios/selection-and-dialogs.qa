@@ -1,0 +1,21 @@
+# Selections, the diff, a rebase in progress and a few dialogs. Verbs the regions do not support yet fail their
+# step. The full verb list of a build is written to verbs.txt in the output directory.
+open repository rich
+select log row 1
+shot rich-commit-selected
+select uncommitted row
+select file unstaged src/app.txt
+shot rich-unstaged-diff
+set diff split
+shot rich-unstaged-diff-split
+set diff unified
+clear file selection
+open dialog about
+shot dialog-about
+close dialog
+open settings page appearance
+shot settings-appearance
+close dialog
+open repository rebase
+shot rebase-in-progress
+assert no error

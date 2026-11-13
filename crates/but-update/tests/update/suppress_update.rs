@@ -1,68 +1,70 @@
-use but_db::{
-    AppCacheHandle,
-    cache::{CachedCheckResult, CheckUpdateStatus},
-};
-use chrono::DateTime;
+use but_update::CheckError;
+
+use crate::support::{SCOPE, cached_result, in_memory_cache, save, version};
 
 #[test]
 fn suppress_too_many_hours_fails() -> anyhow::Result<()> {
     let mut cache = in_memory_cache();
-
-    // Save a result first
-    cache.update_check_mut()?.save(&sample_cached_result())?;
-    // Try to suppress for more than 720 hours (30 days)
-    let result = but_update::suppress_update(&mut cache, 721);
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Suppression duration cannot exceed 720 hours")
+    save(
+        &mut cache,
+        &cached_result(false, "1.2.3", Some(SCOPE), None),
     );
 
+    let err = but_update::suppress_update(&mut cache, 721).expect_err("721 hours is too long");
+    assert!(
+        matches!(&err, CheckError::Cache(msg) if msg.contains("cannot exceed 720 hours")),
+        "an out-of-range snooze is rejected, got {err:?}"
+    );
     Ok(())
 }
 
 #[test]
 fn suppress_zero_hours_fails() -> anyhow::Result<()> {
     let mut cache = in_memory_cache();
-
-    // Save a result first
-    cache.update_check_mut()?.save(&sample_cached_result())?;
-
-    // Try to suppress for 0 hours
-    let result = but_update::suppress_update(&mut cache, 0);
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Suppression duration must be at least 1 hour")
+    save(
+        &mut cache,
+        &cached_result(false, "1.2.3", Some(SCOPE), None),
     );
 
+    let err = but_update::suppress_update(&mut cache, 0).expect_err("0 hours is not a snooze");
+    assert!(
+        matches!(&err, CheckError::Cache(msg) if msg.contains("at least 1 hour")),
+        "a zero snooze is rejected, got {err:?}"
+    );
     Ok(())
 }
 
-fn in_memory_cache() -> AppCacheHandle {
-    AppCacheHandle::new_at_path(":memory:")
+#[test]
+fn suppress_without_a_check_fails() {
+    let mut cache = in_memory_cache();
+    let err = but_update::suppress_update(&mut cache, 24)
+        .expect_err("nothing to snooze before the first check");
+    assert!(
+        matches!(err, CheckError::Cache(_)),
+        "the missing check is a cache error, got {err:?}"
+    );
 }
 
-fn sample_status(up_to_date: bool) -> CheckUpdateStatus {
-    CheckUpdateStatus {
-        // Note: The default for VERSION in `available_update` is 0.0.0. The test relies on this
-        // for correctness. This is fragile but not easily circumvented at this time.
-        valid_for_version: Some("0.0.0".to_string()),
-        up_to_date,
-        latest_version: "1.2.3".to_string(),
-        release_notes: Some("Bug fixes and improvements".to_string()),
-        url: Some("https://example.com/download".to_string()),
-        signature: Some("signature123".to_string()),
-    }
-}
+#[test]
+fn suppress_hides_the_update_now() -> anyhow::Result<()> {
+    let mut cache = in_memory_cache();
+    save(
+        &mut cache,
+        &cached_result(false, "1.2.3", Some(SCOPE), None),
+    );
+    let current = version("0.1.0");
+    assert!(
+        but_update::available_update(&cache, &current, SCOPE)?.is_some(),
+        "visible before the snooze"
+    );
 
-fn sample_cached_result() -> CachedCheckResult {
-    CachedCheckResult {
-        checked_at: DateTime::from_timestamp(1000000, 0).unwrap(),
-        status: sample_status(false),
-        suppressed_at: None,
-        suppress_duration_hours: None,
+    but_update::suppress_update(&mut cache, 1)?;
+    assert!(
+        but_update::available_update(&cache, &current, SCOPE)?.is_none(),
+        "hidden right after snoozing for one hour"
+    );
+    for hours in [1, 720] {
+        but_update::suppress_update(&mut cache, hours)?;
     }
+    Ok(())
 }

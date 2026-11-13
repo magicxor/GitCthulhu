@@ -1,0 +1,7 @@
+# Milestone 1 (G12): the welcome page of an empty window, dark theme, 1280x720.
+resize 1280x720
+set theme dark
+wait idle
+shot m1-01-welcome
+assert tab count 1
+assert no error

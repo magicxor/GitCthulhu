@@ -2705,6 +2705,7 @@ pub fn repo(fixture_name: &str) -> anyhow::Result<gix::Repository> {
     repo_in("worktree-changes", fixture_name)
 }
 
+#[cfg(unix)]
 pub fn repo_unix(fixture_name: &str) -> anyhow::Result<gix::Repository> {
     repo_in("worktree-changes-unix", fixture_name)
 }

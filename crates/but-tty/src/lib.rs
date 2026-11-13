@@ -26,8 +26,8 @@ pub use ghostty::{Colors, Ghostty};
 pub use handoff::{hand_over, handed};
 #[cfg(unix)]
 use pty::Kept;
-pub use pty::Size;
 use pty::{Output, Pty};
+pub use pty::{ShellKind, ShellSpec, Size};
 pub use vt::{Cursor, Frame, Row, Run, Status, Style};
 
 pub use libghostty_vt::key::{Key, Mods};
@@ -47,6 +47,18 @@ impl Shell {
     /// when there is one.
     pub fn spawn(cwd: &Path, size: Size, command: Option<&str>) -> anyhow::Result<Self> {
         let (pty, output) = Pty::spawn(cwd, size, command)?;
+        Ok(Self { pty, output, size })
+    }
+
+    /// Starts `spec`'s shell in `cwd`, sized `size`, running `command` in place of a prompt when
+    /// there is one, as the shell's kind takes it (an error for [`ShellKind::Other`]).
+    pub fn spawn_with(
+        spec: &ShellSpec,
+        cwd: &Path,
+        size: Size,
+        command: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let (pty, output) = Pty::spawn_with(spec, cwd, size, command)?;
         Ok(Self { pty, output, size })
     }
 }
@@ -164,6 +176,19 @@ impl Terminal {
 
     pub fn status(&self) -> Status {
         self.shown.lock().status.clone()
+    }
+
+    /// Whether a program the shell started is running, whether or not it reports a status (a build, an editor
+    /// with unsaved work): closing the terminal would end it. Asks the emulator's thread (a silent program
+    /// changes nothing it reads), waiting at most 200 ms, else the answer as of the last output it read.
+    pub fn program_running(&self) -> bool {
+        let (answer, answered) = std::sync::mpsc::channel();
+        self.run(move |emulator| {
+            answer.send(emulator.program_running()).ok();
+        });
+        answered
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap_or_else(|_| self.shown.lock().program_running)
     }
 
     /// The status, if it changed since this was last asked: what the program running reported,
@@ -436,6 +461,29 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_program_counts_as_running_until_it_ends() {
+        let mut terminal = started();
+        until(&mut terminal, "the shell should start", |terminal| {
+            (terminal.frame().rows.iter()).any(|row| !row.text.trim().is_empty())
+        });
+        assert!(
+            !terminal.program_running(),
+            "at its prompt nothing the shell started runs"
+        );
+        terminal.input(b"sleep 2; printf 'slept-%s\\n' 1\n");
+        until(
+            &mut terminal,
+            "a program that reports nothing should count as running",
+            |terminal| terminal.program_running(),
+        );
+        until(
+            &mut terminal,
+            "once it ended, the shell is back",
+            |terminal| !terminal.program_running() && shows(terminal, "slept-1"),
+        );
+    }
+
+    #[test]
     fn a_command_keeps_the_status_it_reports_while_it_runs() {
         // `exec` puts it in the shell's place, in its process group, as a shell does a simple
         // command like `claude` on its own.
@@ -612,6 +660,164 @@ mod tests {
             &mut terminal,
             "the next should be heard working by its progress",
             |terminal| terminal.status() == Status::Working,
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{Colors, RgbColor, Shell, ShellKind, ShellSpec, Size, Terminal, Updates};
+
+    const SIZE: Size = Size {
+        cols: 80,
+        rows: 24,
+        cell_width: 8,
+        cell_height: 16,
+    };
+
+    const BLACK: RgbColor = RgbColor { r: 0, g: 0, b: 0 };
+
+    /// Waits for `done` to hold of `terminal`, which the emulator gets to on its own thread.
+    fn until(terminal: &mut Terminal, what: &str, mut done: impl FnMut(&mut Terminal) -> bool) {
+        let started = Instant::now();
+        while !done(terminal) {
+            assert!(started.elapsed() < Duration::from_secs(30), "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn shows_line(terminal: &Terminal, line: &str) -> bool {
+        (terminal.frame().rows.iter()).any(|row| row.text.trim() == line)
+    }
+
+    fn shows(terminal: &Terminal, text: &str) -> bool {
+        (terminal.frame().rows.iter()).any(|row| row.text.contains(text))
+    }
+
+    /// Tells once `updates` end, as they do when the UI is to close the terminal.
+    fn on_end(updates: Updates) -> std::sync::mpsc::Receiver<()> {
+        let (ended, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            futures::executor::block_on(futures::StreamExt::for_each(updates, |()| async {}));
+            ended.send(()).ok();
+        });
+        done
+    }
+
+    #[test]
+    fn conpty_smoke_spawn_echo_resize_drop() {
+        let shell = Shell::spawn(&std::env::temp_dir(), SIZE, None).expect("cmd.exe starts");
+        let (mut terminal, updates) =
+            Terminal::new(shell, &Colors::default(), BLACK, BLACK).expect("the emulator starts");
+        let ended = on_end(updates);
+        terminal.input(b"echo conpty-smoke-42\r");
+        until(
+            &mut terminal,
+            "what the shell printed should be drawn",
+            |terminal| shows_line(terminal, "conpty-smoke-42"),
+        );
+
+        let bigger = Size {
+            cols: 100,
+            rows: 30,
+            ..SIZE
+        };
+        terminal.resize(bigger);
+        assert_eq!(
+            terminal.size(),
+            bigger,
+            "the size asked for is kept at once"
+        );
+        until(
+            &mut terminal,
+            "the frame should follow the new size",
+            |terminal| terminal.frame().rows.len() == 30,
+        );
+        terminal.input(b"echo after-resize\r");
+        until(
+            &mut terminal,
+            "the shell should still answer after the pseudoconsole was resized",
+            |terminal| shows_line(terminal, "after-resize"),
+        );
+
+        drop(terminal);
+        assert!(
+            ended.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "letting go of the terminal ends its updates, as its thread hangs up the shell"
+        );
+    }
+
+    #[test]
+    fn a_failed_command_shows_how_it_exited_until_a_key_is_pressed() {
+        let shell = Shell::spawn(
+            &std::env::temp_dir(),
+            SIZE,
+            Some("echo went-wrong & exit 3"),
+        )
+        .expect("cmd.exe starts");
+        let (mut terminal, updates) =
+            Terminal::new(shell, &Colors::default(), BLACK, BLACK).expect("the emulator starts");
+        let ended = on_end(updates);
+        until(
+            &mut terminal,
+            "it should say how the command exited",
+            |terminal| shows(terminal, "exited with code 3"),
+        );
+        assert!(
+            shows(&terminal, "went-wrong"),
+            "what it printed stays to read"
+        );
+        assert!(
+            ended.recv_timeout(Duration::from_millis(300)).is_err(),
+            "it stays open to be read"
+        );
+        terminal.input(b"x");
+        assert!(
+            ended.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "a key closes it"
+        );
+    }
+
+    #[test]
+    fn a_powershell_spec_runs_its_command_with_its_own_variables() {
+        let system_root = std::env::var_os("SystemRoot").expect("Windows sets SystemRoot");
+        let program = std::path::Path::new(&system_root)
+            .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let spec = ShellSpec {
+            program: program.into_os_string(),
+            args: vec!["-NoLogo".into(), "-NoProfile".into()],
+            kind: ShellKind::PowerShell,
+            env: vec![("BUT_TTY_PROBE".into(), "from the spec".into())],
+        };
+        let command = r#"Write-Output ("psk" + "42 " + $env:BUT_TTY_PROBE); exit 4"#;
+        let shell = Shell::spawn_with(&spec, &std::env::temp_dir(), SIZE, Some(command))
+            .expect("Windows PowerShell starts");
+        let (mut terminal, _updates) =
+            Terminal::new(shell, &Colors::default(), BLACK, BLACK).expect("the emulator starts");
+        until(
+            &mut terminal,
+            "PowerShell should run the command, quoted for it, and say how it exited",
+            |terminal| shows(terminal, "exited with code 4"),
+        );
+        assert!(
+            shows(&terminal, "psk42 from the spec"),
+            "the command ran as written, with the spec's variable set"
+        );
+    }
+
+    #[test]
+    fn a_shell_that_takes_no_command_refuses_one() {
+        let spec = ShellSpec {
+            program: "cmd.exe".into(),
+            args: Vec::new(),
+            kind: ShellKind::Other,
+            env: Vec::new(),
+        };
+        assert!(
+            Shell::spawn_with(&spec, &std::env::temp_dir(), SIZE, Some("echo no")).is_err(),
+            "a command can't be given to a shell of no known kind"
         );
     }
 }

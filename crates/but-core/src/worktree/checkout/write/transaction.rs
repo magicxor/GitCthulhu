@@ -427,13 +427,12 @@ impl Journal {
             anyhow::bail!("Checkout was interrupted");
         }
         if !outcome.collisions.is_empty() {
-            let mut paths: Vec<String> = outcome
+            let paths: Vec<bstr::BString> = outcome
                 .collisions
                 .iter()
-                .map(|collision| format!("{:?}", collision.path.to_string()))
+                .map(|collision| collision.path.clone())
                 .collect();
-            paths.sort();
-            return Err(crate::worktree::checkout::UncommittedChangesInTheWay::refusal(&paths));
+            return Err(crate::worktree::checkout::UncommittedChangesInTheWay::refusal(paths));
         }
         if let Some(failed) = outcome.errors.first() {
             return Err(anyhow::anyhow!("{:#}", failed.error))
@@ -554,13 +553,15 @@ impl Journal {
 
     fn appeared_after_the_check(&self, path: &Path) -> anyhow::Error {
         let rela_path = path.strip_prefix(&self.workdir).unwrap_or(path);
-        anyhow::anyhow!(
-            but_error::Context::new(format!(
-                "Uncommitted files would be overwritten by checkout: {:?}",
-                rela_path.display().to_string()
+        // Like all other refusals, report a repository-relative path with `/` separators, also on Windows.
+        let rela_path = match gix::path::os_str_into_bstr(rela_path.as_os_str()) {
+            Ok(rela_path) => gix::path::to_unix_separators_on_windows(rela_path).into_owned(),
+            Err(_) => gix::path::to_unix_separators_on_windows(bstr::BString::from(
+                rela_path.display().to_string(),
             ))
-            .with_code(but_error::Code::PreconditionFailed)
-        )
+            .into_owned(),
+        };
+        crate::worktree::checkout::UncommittedChangesInTheWay::refusal(vec![rela_path])
     }
 
     /// Like Git, remove the directories leading to the deleted `path` that it left empty, as far as
@@ -663,7 +664,7 @@ fn private_file_next_to(dest: &Path, executable: bool) -> std::io::Result<tempfi
 /// A builder of checkout's private files and directories, which are named alike.
 fn private_builder() -> tempfile::Builder<'static, 'static> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".gitbutler-checkout-");
+    builder.prefix(".gitcthulhu-checkout-");
     builder
 }
 
@@ -786,7 +787,7 @@ fn checkout_index(
 
 /// A new staging directory in the Git directory.
 fn staging_dir(repo: &gix::Repository) -> anyhow::Result<tempfile::TempDir> {
-    let in_git_dir = repo.git_dir().join("gitbutler");
+    let in_git_dir = repo.git_dir().join("gitcthulhu");
     std::fs::create_dir_all(&in_git_dir)?;
     Ok(private_builder().tempdir_in(in_git_dir)?)
 }
@@ -951,7 +952,7 @@ mod tests {
             format!(
                 "Checkout failed and was undone, but these paths changed meanwhile, so their \
                  previous versions were kept elsewhere: \"a\" at \"{}\": Uncommitted files \
-                 would be overwritten by checkout: \"a\"",
+                 would be overwritten by checkout: \"a\": uncommitted changes are in the way",
                 backup.display()
             )
         );

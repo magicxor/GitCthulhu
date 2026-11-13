@@ -160,31 +160,37 @@ pub fn delete(handle: &str, namespace: Namespace) -> Result<()> {
 pub fn set_application_namespace(identifier: impl Into<String>) {
     *NAMESPACE.lock().unwrap() = identifier.into();
 
-    // In debug builds, use a git-credential based implementation when platform keychains are
-    // either noisy (macOS rebuild prompts) or unavailable (headless e2e Linux containers).
-    // Release builds keep using the platform keychain.
+    // In debug builds on macOS, use a git-credential based implementation as the platform keychain
+    // prompts again after every rebuild. Release builds keep using the platform keychain.
     // HACK: we do this here because it's always called by client binaries, and we want it to work
     //       equally there and automatically.
-    if cfg!(debug_assertions)
-        && (cfg!(target_os = "macos") || std::env::var_os("E2E_TEST_APP_DATA_DIR").is_some())
-    {
+    if cfg!(debug_assertions) && cfg!(target_os = "macos") {
         git_credentials::setup().ok();
     }
+}
+
+/// The namespace set with [`set_application_namespace()`], empty if none was set.
+pub fn application_namespace() -> String {
+    NAMESPACE.lock().unwrap().clone()
 }
 
 fn entry_for(handle: &str, namespace: Namespace) -> Result<keyring::Entry> {
     let ns = match namespace {
         Namespace::BuildKind => NAMESPACE.lock().unwrap().clone(),
-        Namespace::Global => "gitbutler".into(),
+        Namespace::Global => "gitcthulhu".into(),
     };
     Ok(keyring::Entry::new(
         &format!(
             "{prefix}-{handle}",
             prefix = if ns.is_empty() { "development" } else { &ns }
         ),
-        "GitButler",
+        KEYRING_USER,
     )?)
 }
+
+/// The user name of every keyring entry. Together with the `<namespace>-<handle>` service name it keeps
+/// GitCthulhu's entries apart from every other application's, GitButler's included.
+const KEYRING_USER: &str = "GitCthulhu";
 
 /// How to further specialize secrets to avoid name clashes in the globally shared keystore.
 static NAMESPACE: Mutex<String> = Mutex::new(String::new());
@@ -354,9 +360,9 @@ pub mod git_credentials {
         )> {
             let url = gix::Url::from_parts(
                 gix::url::Scheme::Https,
-                Some("gitbutler-secrets".into()),
+                Some("gitcthulhu-secrets".into()),
                 password.map(ToOwned::to_owned),
-                Some("gitbutler.com".into()),
+                Some("gitcthulhu.invalid".into()),
                 None,
                 format!("/{handle}").into(),
                 false,

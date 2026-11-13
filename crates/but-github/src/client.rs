@@ -11,6 +11,9 @@ use crate::graphql::{
 
 const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 
+/// How long one request may take, like the GitLab and Bitbucket clients.
+const GITHUB_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// An HTTP error with a status code, returned when the API responds with a non-success status.
 ///
 /// This can be downcasted from `anyhow::Error` to distinguish auth failures (401/403) from other errors.
@@ -65,7 +68,7 @@ impl GitHubClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("gb-github-integration"),
+            HeaderValue::from_static("gitcthulhu-github-integration"),
         );
         headers.insert(
             ACCEPT,
@@ -82,6 +85,7 @@ impl GitHubClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(GITHUB_REQUEST_TIMEOUT)
             .build()?;
 
         Ok(Self {
@@ -100,7 +104,7 @@ impl GitHubClient {
             account_id.client(&access_token)
         } else {
             Err(anyhow::anyhow!(
-                "No GitHub access token found for account '{account_id}'.\nRun 'but config forge auth' to re-authenticate."
+                "No GitHub access token found for account '{account_id}'.\nSign in again under Settings > Accounts."
             )
             .context(NOT_AUTHENTICATED))
         }
@@ -113,7 +117,7 @@ impl GitHubClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("gb-github-integration"),
+            HeaderValue::from_static("gitcthulhu-github-integration"),
         );
         headers.insert(
             ACCEPT,
@@ -130,6 +134,7 @@ impl GitHubClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(GITHUB_REQUEST_TIMEOUT)
             .build()?;
 
         Ok(Self {
@@ -797,9 +802,7 @@ impl GitHubClient {
         Ok(comment.into())
     }
 
-    /// Update the information of a given PR.
-    ///
-    /// This is used e.g. to update the description footers for stacked reviews.
+    /// Update the title, body, state or base branch of a given PR.
     pub async fn update_pull_request(
         &self,
         params: &UpdatePullRequestParams<'_>,
@@ -2301,7 +2304,7 @@ pub(crate) fn resolve_account(
     let known_accounts = crate::token::list_known_github_accounts(storage)?;
     let Some(default_account) = known_accounts.first() else {
         return Err(anyhow::anyhow!(
-            "No authenticated GitHub users found.\nRun 'but config forge auth' to authenticate with GitHub."
+            "No authenticated GitHub users found.\nAdd a GitHub account under Settings > Accounts."
         )
         .context(NOT_AUTHENTICATED));
     };
@@ -2310,7 +2313,7 @@ pub(crate) fn resolve_account(
             account
         } else {
             return Err(anyhow::anyhow!(
-                "Preferred GitHub account '{account}' has not authenticated yet.\nRun 'but config forge auth' to authenticate, or choose another account."
+                "Preferred GitHub account '{account}' has not authenticated yet.\nSign in under Settings > Accounts, or choose another account."
             )
             .context(NOT_AUTHENTICATED));
         }

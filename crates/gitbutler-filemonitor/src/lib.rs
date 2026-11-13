@@ -10,5 +10,5 @@ pub use events::{Checkout, InternalEvent, LinkedWorktree};
 mod file_monitor;
 pub use file_monitor::{
     FETCH_HEAD, FileMonitorHandle, HEAD, HEAD_ACTIVITY, INDEX, LINKED_WORKTREE_GITDIR,
-    LINKED_WORKTREES_DIR, LOCAL_REFS_DIR, REMOTE_REFS_DIR, WatchMode, spawn,
+    LINKED_WORKTREES_DIR, MODULES_DIR, REFS_DIR, STASH_ACTIVITY, WatchMode, spawn,
 };

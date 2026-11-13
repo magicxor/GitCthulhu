@@ -2,11 +2,10 @@ use chrono::{DateTime, Utc};
 
 use crate::{AppCacheHandle, M, SchemaVersion, Transaction};
 
-pub(crate) const M: &[M<'static>] = &[
-    M::up(
-        2026_01_19__15_00_00,
-        SchemaVersion::Zero,
-        "CREATE TABLE `update-check`(
+pub(crate) const M: &[M<'static>] = &[M::up(
+    2026_11_12__00_00_00,
+    SchemaVersion::Zero,
+    "CREATE TABLE `update-check`(
     `id` INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
     `checked_at` TIMESTAMP NOT NULL,
     `up_to_date` BOOLEAN NOT NULL,
@@ -15,15 +14,10 @@ pub(crate) const M: &[M<'static>] = &[
     `url` TEXT,
     `signature` TEXT,
     `suppressed_at` TIMESTAMP,
-    `suppress_duration_hours` INTEGER
+    `suppress_duration_hours` INTEGER,
+    `valid_for_version` TEXT NULL
 );",
-    ),
-    M::up(
-        2026_05_18__08_00_00,
-        SchemaVersion::Zero,
-        "ALTER TABLE `update-check` ADD COLUMN `valid_for_version` TEXT NULL;",
-    ),
-];
+)];
 
 // This table currently only has a single row representing the latest update check.
 const SINGLETON_RECORD_ID: u8 = 1;

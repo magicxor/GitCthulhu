@@ -1,5 +1,0 @@
-error: `refreshes` needs a context parameter to find the project's storage directory
- --> tests/ui/fail/base_refreshes_without_context.rs:9:11
-  |
-9 | #[but_api(refreshes)]
-  |           ^^^^^^^^^

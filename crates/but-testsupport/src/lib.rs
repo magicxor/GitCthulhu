@@ -10,13 +10,10 @@ use gix::{
 pub use gix_testtools;
 use gix_testtools::{Creation, FixtureState, PostResult, tempfile};
 
-mod in_memory_meta;
-pub use in_memory_meta::{InMemoryRefMetadata, InMemoryRefMetadataHandle, StackState};
-
-#[cfg(feature = "sandbox")]
-mod sandbox;
-#[cfg(feature = "sandbox")]
-pub use sandbox::Sandbox;
+mod bash;
+pub use bash::{
+    BASH_OVERRIDE_ENV_VAR, bash_program, path_with_bash_dir, prepare_fixture_environment,
+};
 
 /// Choose a slightly more obvious, yet easy to type syntax than a function with 4 parameters.
 /// i.e. `hunk_header("-1,10", "+1,10")`.
@@ -72,11 +69,13 @@ pub fn invoke_bash(script: &str, repo: &gix::Repository) {
     invoke_bash_at_dir(script, repo.workdir().unwrap_or(repo.git_dir()))
 }
 /// Run the given `script` in bash, with the `cwd` set to `dir`.
+/// The bash is [`bash_program()`], with its directory first on `PATH` for nested `bash` calls.
 /// Panic if the script fails.
 pub fn invoke_bash_at_dir(script: &str, dir: &Path) {
-    let mut cmd = std::process::Command::new("bash");
+    let mut cmd = std::process::Command::new(bash_program());
     cmd.current_dir(dir);
     isolate_env_std_cmd(&mut cmd);
+    cmd.env("PATH", path_with_bash_dir());
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -107,24 +106,6 @@ pub fn open_repo(path: &Path) -> anyhow::Result<gix::Repository> {
     Ok(repo)
 }
 
-/// An empty in-memory database standing in for the repository's own project database.
-///
-/// Only for repositories from *shared read-only* fixtures: writing a real database
-/// into the shared extraction would leak state across tests and runs. Fixtures the
-/// test owns should use [`project_db()`] instead.
-pub fn in_memory_db() -> but_db::DbHandle {
-    but_db::DbHandle::new_at_path(":memory:").expect("in-memory database always opens")
-}
-
-/// The project database of `repo`, at the same location GitButler itself stores it.
-///
-/// Only for writable fixtures, whose storage lives and dies with the fixture's
-/// temporary directory; shared read-only fixtures use [`in_memory_db()`].
-pub fn project_db(repo: &gix::Repository) -> anyhow::Result<but_db::DbHandle> {
-    use but_core::RepositoryExt as _;
-    but_db::DbHandle::new_in_directory(repo.gitbutler_storage_path()?)
-}
-
 /// Return isolated configuration with a basic setup to run read-only and read-write tests.
 /// This includes the author configuration in particular.
 pub fn open_repo_config() -> anyhow::Result<gix::open::Options> {
@@ -142,7 +123,6 @@ pub fn open_repo_config() -> anyhow::Result<gix::open::Options> {
                 .validated_assignment("2000-01-01 00:00:00 +0000".into())?,
             gix::config::tree::gitoxide::Commit::COMMITTER_DATE
                 .validated_assignment("2000-01-02 00:00:00 +0000".into())?,
-            "gitbutler.testing.changeId=content-hash".to_owned().into(),
         ]);
     Ok(config)
 }
@@ -150,41 +130,6 @@ pub fn open_repo_config() -> anyhow::Result<gix::open::Options> {
 /// turn a 40 byte hex-id into an object ID or panic.
 pub fn hex_to_id(hex: &str) -> gix::ObjectId {
     gix::ObjectId::from_hex(hex.as_bytes()).expect("statically known to be valid")
-}
-
-/// Sets up an environment that assures commits are reproducible. This is particularly
-/// needed for `GITBUTLER_CHANGE_ID`.
-/// This needs the `testing` feature enabled in `but-core` as well to work.
-/// **This changes the process environment, be aware.**
-///
-/// ### DEPRECATION WARNING
-///
-/// Do not use this function unless it's interfacing with old code. Prefer [`open_repo()`] for instance.
-pub fn deprecated_stable_env_vars() {
-    let env = gix_testtools::Env::new()
-        // TODO(gix): once everything is ported, all these can be configured on `gix::Repository`.
-        //            CHANGE_ID now works with a single value.
-        //            Call `but_testsupport::open_repo()` for basic settings.
-        .set("GIT_AUTHOR_DATE", "2000-01-01 00:00:00 +0000")
-        .set("GIT_AUTHOR_EMAIL", "author@example.com")
-        .set("GIT_AUTHOR_NAME", "author (From Env)")
-        .set("GIT_COMMITTER_DATE", "2000-01-02 00:00:00 +0000")
-        .set("GIT_COMMITTER_EMAIL", "committer@example.com")
-        .set("GIT_COMMITTER_NAME", "committer (From Env)")
-        .set("GITBUTLER_CHANGE_ID", "change-id");
-    // assure it doesn't get racy.
-    _ = std::mem::ManuallyDrop::new(env);
-}
-
-/// Run `f` with `E2E_TEST_APP_DATA_DIR` pointing at a temporary directory, so code that
-/// resolves application-wide directories via `but_path` cannot read or write user-level files.
-///
-/// Use this when testing code that loads `AppSettings` from the default location.
-/// Calls are serialized process-wide via `temp_env`'s global mutex, so concurrent
-/// use from parallel tests is safe.
-pub fn isolated_app_data_dir<R>(f: impl FnOnce() -> R) -> R {
-    let tmp = gix_testtools::tempfile::TempDir::new().unwrap();
-    temp_env::with_var("E2E_TEST_APP_DATA_DIR", Some(tmp.path()), f)
 }
 
 /// Utilities for the [`git()`] command.
@@ -591,6 +536,7 @@ pub fn read_only_in_memory_scenario_named(
     script_name: &str,
     dirname: &str,
 ) -> anyhow::Result<gix::Repository> {
+    prepare_fixture_environment();
     let root = gix_testtools::scripted_fixture_read_only(format!("scenario/{script_name}.sh"))
         .map_err(anyhow::Error::from_boxed)?;
     let repo = open_repo(&root.join(dirname))?.with_object_memory();
@@ -621,6 +567,7 @@ fn read_only_in_memory_scenario_named_with_post_inner<T>(
     dirname: &str,
     post_fn: Option<(u32, impl FnMut(FixtureState<'_>) -> PostResult<T>)>,
 ) -> anyhow::Result<(gix::Repository, Option<T>)> {
+    prepare_fixture_environment();
     let path = format!("scenario/{script_name}.sh");
     let (root, value) = match post_fn {
         Some((v, f)) => gix_testtools::scripted_fixture_read_only_with_post(path, v, f)
@@ -638,6 +585,7 @@ fn writable_scenario_inner<T>(
     args: impl IntoIterator<Item = impl Into<String>>,
     post_fn: Option<(u32, impl FnMut(FixtureState<'_>) -> PostResult<T>)>,
 ) -> anyhow::Result<(gix::Repository, tempfile::TempDir, Option<T>)> {
+    prepare_fixture_environment();
     let script_name = format!("scenario/{name}.sh");
     let (tmp, post) = match post_fn {
         Some((v, f)) => gix_testtools::scripted_fixture_writable_with_args_with_post(
@@ -737,9 +685,6 @@ pub fn sanitize_uuids_and_timestamps(input: String) -> String {
 pub fn debug_str(input: &dyn std::fmt::Debug) -> String {
     format!("{input:#?}")
 }
-
-mod graph;
-pub use graph::{graph_tree, graph_workspace, graph_workspace_determinisitcally};
 
 mod prepare_cmd_env;
 pub use prepare_cmd_env::{isolate_env_std_cmd, isolate_env_std_cmd_with_additional_removals};

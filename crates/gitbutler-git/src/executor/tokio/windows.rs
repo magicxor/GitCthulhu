@@ -10,7 +10,7 @@ use windows::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeClientProces
 use crate::executor::{AskpassServer, FileStat, Pid, Socket};
 
 // Slashes instead of backslashes to prevent any issues with escaping.
-const ASKPASS_PIPE_PREFIX: &str = r"//./pipe/gitbutler-askpass-";
+const ASKPASS_PIPE_PREFIX: &str = r"//./pipe/gitcthulhu-askpass-";
 
 impl Socket for BufStream<NamedPipeServer> {
     type Error = std::io::Error;

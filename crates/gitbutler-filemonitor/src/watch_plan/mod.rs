@@ -104,35 +104,44 @@ pub(crate) fn compute_watch_plan_for_repo(
     Ok(())
 }
 
-fn emit_git_dir_watches(
+/// Emit the watches of a git dir: the non-recursive git dir itself (`HEAD`, `index`, `packed-refs`, `config`,
+/// `FETCH_HEAD` and the `*_HEAD` files of running operations, and the creation of `rebase-merge/`, `rebase-apply/`,
+/// `sequencer/`), the reflogs we care about, all refs recursively, the directories of running operations if they
+/// exist, linked worktree registrations and the repositories of submodules (never their objects).
+pub(crate) fn emit_git_dir_watches(
     git_dir: &Path,
     visit_dir: &mut impl FnMut(&Path, RecursiveMode) -> anyhow::Result<ControlFlow<()>>,
 ) -> anyhow::Result<ControlFlow<()>> {
-    // Non-recursive to not pick up objects, while this will pick up changes to `HEAD`, `FETCH_HEAD`,
-    // and other root-refs, as well as `.git/config`.
+    // Non-recursive to not pick up objects.
     if visit_dir(git_dir, RecursiveMode::NonRecursive)?.is_break() {
         return Ok(ControlFlow::Break(()));
     }
+    // Non-recursive: `logs/HEAD` changes whenever the checked-out branch moves, and `logs/refs/stash` is the reflog
+    // of the stash.
     let logs_dir = git_dir.join("logs");
-    // This is non-recursive because we are only interested in `.git/logs/HEAD` which is changed when
-    // `refs/heads/main` (or whatever `.git/HEAD` points to) is changed, affecting `HEAD`.
-    if logs_dir.is_dir() && visit_dir(&logs_dir, RecursiveMode::NonRecursive)?.is_break() {
+    if logs_dir.is_dir() {
+        if visit_dir(&logs_dir, RecursiveMode::NonRecursive)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        let logs_refs_dir = logs_dir.join("refs");
+        if logs_refs_dir.is_dir()
+            && visit_dir(&logs_refs_dir, RecursiveMode::NonRecursive)?.is_break()
+        {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    // Branches, remote-tracking branches, tags, the stash and our own `refs/gitcthulhu/*`. Recursive, which also
+    // covers directories created later.
+    let refs_dir = git_dir.join("refs");
+    if refs_dir.is_dir() && visit_dir(&refs_dir, RecursiveMode::Recursive)?.is_break() {
         return Ok(ControlFlow::Break(()));
     }
-    let refs_heads_dir = git_dir.join("refs").join("heads");
-    // For `.git/refs/heads`, the built-in watch mode is working well enough, and we have no facility
-    // to auto-track newly added directories here. But if that would change, we could non-recursively
-    // watch everything.
-    if refs_heads_dir.is_dir() && visit_dir(&refs_heads_dir, RecursiveMode::Recursive)?.is_break() {
-        return Ok(ControlFlow::Break(()));
-    }
-    let refs_remotes_dir = git_dir.join("refs").join("remotes");
-    // Watch remote tracking refs so that pushes (which update `refs/remotes/<remote>/<branch>`)
-    // are detected and can trigger a UI refresh.
-    if refs_remotes_dir.is_dir()
-        && visit_dir(&refs_remotes_dir, RecursiveMode::Recursive)?.is_break()
-    {
-        return Ok(ControlFlow::Break(()));
+    // Directories that exist while an operation runs. If they are created later, the dynamic watch path adds them.
+    for name in crate::file_monitor::STATE_DIRS {
+        let dir = git_dir.join(name);
+        if dir.is_dir() && visit_dir(&dir, RecursiveMode::NonRecursive)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
     }
     // Watch where linked worktrees are registered so their addition and removal is detected.
     let linked_worktrees_dir = git_dir.join(crate::LINKED_WORKTREES_DIR);
@@ -141,15 +150,65 @@ fn emit_git_dir_watches(
     {
         return Ok(ControlFlow::Break(()));
     }
-    // Watch the default GitButler storage dir so external sentinel writes (e.g.
-    // the `but` CLI) reach the UI. A custom `gitbutler.storagePath` isn't watched:
-    // the override relocates storage off the git dir (e.g. onto local disk when
-    // the repo's on NFS), so a configured path would typically sit outside any
-    // git-dir watch anyway — such setups fall back to other refresh signals.
-    let gitbutler_dir = git_dir.join(but_project_handle::DEFAULT_STORAGE_DIR_NAME);
-    if gitbutler_dir.is_dir() && visit_dir(&gitbutler_dir, RecursiveMode::NonRecursive)?.is_break()
-    {
-        return Ok(ControlFlow::Break(()));
+    // Submodule repositories: `modules/`, each `modules/<name>/` (its `HEAD` and `index`) and its refs. Their
+    // object databases are deliberately not watched: a fetch in a submodule would flood the debouncer.
+    let modules_dir = git_dir.join(crate::MODULES_DIR);
+    if modules_dir.is_dir() {
+        if visit_dir(&modules_dir, RecursiveMode::NonRecursive)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        return emit_module_watches(&modules_dir, 0, visit_dir);
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// How deep submodule names with slashes (`modules/libs/foo`) and nested submodules (`modules/a/modules/b`) are
+/// followed.
+const MAX_MODULE_DEPTH: usize = 8;
+
+/// Watch the directories below `dir` (a `modules/` directory, or a directory on the way to a submodule repository
+/// when the submodule name contains slashes). A directory with a `HEAD` is a submodule repository: it is watched
+/// non-recursively, its `refs/` recursively and its own `modules/` like this one. Nothing else in it, in particular
+/// not its `objects/`.
+fn emit_module_watches(
+    dir: &Path,
+    depth: usize,
+    visit_dir: &mut impl FnMut(&Path, RecursiveMode) -> anyhow::Result<ControlFlow<()>>,
+) -> anyhow::Result<ControlFlow<()>> {
+    if depth >= MAX_MODULE_DEPTH {
+        return Ok(ControlFlow::Continue(()));
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(ControlFlow::Continue(()));
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(is_watchable_directory) {
+            names.insert(entry.file_name());
+        }
+    }
+    for name in names {
+        let sub = dir.join(name);
+        if visit_dir(&sub, RecursiveMode::NonRecursive)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        if sub.join("HEAD").is_file() {
+            let refs = sub.join("refs");
+            if refs.is_dir() && visit_dir(&refs, RecursiveMode::Recursive)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            let nested = sub.join(crate::MODULES_DIR);
+            if nested.is_dir() {
+                if visit_dir(&nested, RecursiveMode::NonRecursive)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                if emit_module_watches(&nested, depth + 1, visit_dir)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        } else if emit_module_watches(&sub, depth + 1, visit_dir)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
     }
     Ok(ControlFlow::Continue(()))
 }

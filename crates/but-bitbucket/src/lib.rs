@@ -13,7 +13,7 @@ pub use client::{
 pub use repo::fetch_repo;
 mod token;
 use serde::Serialize;
-pub use token::BitbucketAccountIdentifier;
+pub use token::{BitbucketAccountIdentifier, get_bb_access_token};
 
 #[derive(Debug, Clone)]
 pub struct AuthStatusResponse {
@@ -249,7 +249,6 @@ pub mod json {
     /// The credential is stored by the backend as part of the call, so the caller is told
     /// who authenticated and nothing more. Field names are camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct BitbucketAuthStatusResponse {
         pub username: String,
@@ -274,12 +273,8 @@ pub mod json {
         }
     }
 
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(BitbucketAuthStatusResponse);
-
     /// Serializable version of [`AuthenticatedUser`] with exposed access token.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct BitbucketAuthenticatedUserSensitive {
         /// The Bitbucket access token as a plain string (sensitive data).
@@ -313,9 +308,6 @@ pub mod json {
             }
         }
     }
-
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(BitbucketAuthenticatedUserSensitive);
 }
 
 #[cfg(test)]

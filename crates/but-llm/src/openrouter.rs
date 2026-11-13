@@ -1,7 +1,7 @@
+use crate::tool::Toolset;
 use anyhow::Result;
 use async_openai::{Client, config::OpenAIConfig};
-use but_secret::{Sensitive, secret};
-use but_tools::tool::Toolset;
+use but_secret::Sensitive;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
@@ -14,8 +14,6 @@ use crate::{
     },
 };
 
-const OPENROUTER_API_BASE_DEFAULT: &str = "https://openrouter.ai/api/v1";
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenRouterConfig {
     pub api_base: String,
@@ -24,7 +22,7 @@ pub struct OpenRouterConfig {
 impl Default for OpenRouterConfig {
     fn default() -> Self {
         Self {
-            api_base: OPENROUTER_API_BASE_DEFAULT.to_string(),
+            api_base: crate::DEFAULT_OPENROUTER_ENDPOINT.to_string(),
         }
     }
 }
@@ -37,29 +35,16 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    pub fn with(config: Option<OpenRouterConfig>, model: Option<String>) -> Option<Self> {
-        let config = config.unwrap_or_default();
-        let api_key = Self::retrieve_api_key()?;
-        Some(Self {
-            config,
+    pub fn with(
+        api_key: Sensitive<String>,
+        config: Option<OpenRouterConfig>,
+        model: Option<String>,
+    ) -> Self {
+        Self {
+            config: config.unwrap_or_default(),
             model,
             api_key,
-        })
-    }
-
-    fn retrieve_api_key() -> Option<Sensitive<String>> {
-        // Try secret storage first, then fall back to env var
-        if let Ok(Some(key)) = secret::retrieve("aiOpenRouterKey", secret::Namespace::Global)
-            && !key.0.trim().is_empty()
-        {
-            return Some(key);
         }
-        if let Ok(val) = std::env::var("OPENROUTER_API_KEY")
-            && !val.trim().is_empty()
-        {
-            return Some(Sensitive(val));
-        }
-        None
     }
 }
 

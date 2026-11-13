@@ -1,11 +1,1 @@
-/CODEOWNERS @krlvi @schacon
-/.github @krlvi @schacon @Caleb-T-Owens @mtsgrd @slarse @samhh
-/crates/but-core @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-ctx @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-db @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-fs @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-graph @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-rebase @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-meta @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-secret @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
-/crates/but-update @krlvi @Caleb-T-Owens @jonathantanmy2 @davidpdrsn
+# Fill in GitCthulhu maintainers; the upstream GitButler owners no longer apply.

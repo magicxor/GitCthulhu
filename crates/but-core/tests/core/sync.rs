@@ -17,7 +17,7 @@ fn exclusive_lock_prevents_second_acquisition() -> anyhow::Result<()> {
     );
     let err_msg = result.err().unwrap().to_string();
     assert!(
-        err_msg.contains("already opened for writing by another GitButler instance"),
+        err_msg.contains("already opened for writing by another GitCthulhu instance"),
         "Error message should indicate lock is already held by another instance, got: {err_msg}"
     );
 
@@ -80,7 +80,8 @@ fn background_refresh_lock_prevents_second_background_refresh() -> anyhow::Resul
     );
     let err_msg = result.err().unwrap().to_string();
     assert!(
-        err_msg.contains("already being refreshed in the background by another GitButler instance"),
+        err_msg
+            .contains("already being refreshed in the background by another GitCthulhu instance"),
         "Error message should indicate background refresh is already in progress, got: {err_msg}"
     );
 
@@ -164,9 +165,82 @@ fn exclusive_repo_access_creates_project_data_dir_for_inter_process_lock() -> an
     let _guard = but_core::sync::exclusive_repo_access("/test/repo-b", Some(&project_data_dir));
 
     assert!(
-        project_data_dir.join("gitbutler.write-lock").exists(),
+        project_data_dir.join("write.lock").exists(),
         "expected inter-process lock file to be created in the project data directory"
     );
 
+    Ok(())
+}
+
+#[test]
+fn try_exclusive_repo_access_times_out_and_then_succeeds() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    let tmp = gix_testtools::tempfile::TempDir::new()?;
+    let project_data_dir = tmp.path().join("data");
+    let git_dir = "/test/repo-try-exclusive";
+
+    let held = but_core::sync::exclusive_repo_access(git_dir, Some(&project_data_dir));
+    let started = std::time::Instant::now();
+    let denied = but_core::sync::try_exclusive_repo_access(
+        git_dir,
+        Some(&project_data_dir),
+        Duration::from_millis(150),
+    );
+    assert!(
+        denied.is_none(),
+        "the in-process lock is held, so the attempt must time out"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "the attempt must wait for (most of) the timeout"
+    );
+
+    drop(held);
+    let granted = but_core::sync::try_exclusive_repo_access(
+        git_dir,
+        Some(&project_data_dir),
+        Duration::from_secs(5),
+    );
+    assert!(
+        granted.is_some(),
+        "after release the lock must be available, which also shows the timed-out attempt released its guard"
+    );
+    assert!(
+        project_data_dir.join("write.lock").exists(),
+        "the inter-process lock file is created in the project data directory"
+    );
+    Ok(())
+}
+
+#[test]
+fn try_exclusive_repo_access_reports_inter_process_lock_held_elsewhere() -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    let tmp = gix_testtools::tempfile::TempDir::new()?;
+    let project_data_dir = tmp.path().to_path_buf();
+    let git_dir = "/test/repo-try-exclusive-file-lock";
+
+    let mut foreign = but_core::sync::LockFile::open(project_data_dir.join("write.lock"))?;
+    assert!(foreign.try_lock()?, "the foreign holder gets the file lock");
+    let denied = but_core::sync::try_exclusive_repo_access(
+        git_dir,
+        Some(&project_data_dir),
+        Duration::from_millis(150),
+    );
+    assert!(
+        denied.is_none(),
+        "the file lock is held by someone else, so the attempt must time out"
+    );
+    foreign.unlock()?;
+    assert!(
+        but_core::sync::try_exclusive_repo_access(
+            git_dir,
+            Some(&project_data_dir),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "once the foreign holder lets go, the lock is granted (and the in-process lock was not leaked)"
+    );
     Ok(())
 }

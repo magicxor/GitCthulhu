@@ -1,0 +1,53 @@
+# Milestone 1 (G12): every M1 region on the feature-rich fixture ("rich": branches, merges, tags, stashes, a
+# remote, a merge in progress with staged, unstaged, untracked and conflicted files), dark theme, 1280x720, then
+# the main window in the light theme. Compare with the layout specs 07, 08 and 09.
+resize 1280x720
+set theme dark
+open repository rich
+wait idle
+shot m1-02-main-log
+select uncommitted row
+wait idle
+shot m1-03-uncommitted-status
+select file unstaged src/app.txt
+wait idle
+shot m1-04-diff-unified
+set diff split
+wait idle
+shot m1-05-diff-split
+set diff unified
+clear file selection
+select log row 2
+wait idle
+shot m1-06-commit-changes
+expand side sections
+wait idle
+shot m1-07-side-panel-expanded
+open context menu branch main at 120 170
+wait idle
+shot m1-08-branch-menu
+close menu
+open dialog settings
+assert dialog open
+wait idle
+shot m1-09-settings
+close dialog
+open dialog new-branch
+assert dialog open
+wait idle
+shot m1-10-create-branch
+close dialog
+open blame src/app.txt
+wait idle
+shot m1-11-blame
+close view
+open history src/app.txt
+wait idle
+shot m1-12-file-history
+close view
+wait idle
+set theme light
+wait idle
+shot m1-14-main-light
+set theme dark
+assert no error

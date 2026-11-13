@@ -16,8 +16,7 @@ impl Socket for BufStream<UnixStream> {
 
     fn pid(&self) -> Result<Pid, Self::Error> {
         self.get_ref()
-            .peer_cred()
-            .unwrap()
+            .peer_cred()?
             .pid()
             .ok_or(std::io::Error::other(
                 "no pid available for peer connection",
@@ -25,7 +24,7 @@ impl Socket for BufStream<UnixStream> {
     }
 
     fn uid(&self) -> Result<Uid, Self::Error> {
-        Ok(self.get_ref().peer_cred().unwrap().uid())
+        Ok(self.get_ref().peer_cred()?.uid())
     }
 
     async fn read_line(&mut self) -> Result<String, Self::Error> {
@@ -54,7 +53,7 @@ pub struct TokioAskpassServer {
 impl TokioAskpassServer {
     pub(crate) async fn new() -> Result<Self, std::io::Error> {
         let connection_string =
-            std::env::temp_dir().join(format!("gitbutler-askpass-{}", rand::random::<u64>()));
+            std::env::temp_dir().join(format!("gitcthulhu-askpass-{}", rand::random::<u64>()));
 
         let listener = UnixListener::bind(&connection_string)?;
 

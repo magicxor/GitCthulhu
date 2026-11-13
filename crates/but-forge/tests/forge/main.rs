@@ -72,7 +72,7 @@ fn derives_supported_forge_repository_urls() {
     ];
 
     for (url, forge, owner, repo, protocol) in cases {
-        let actual = derive_forge_repo_info(url, None).unwrap();
+        let actual = derive_forge_repo_info(url, None, &[]).unwrap();
         assert_eq!(actual.forge, forge, "forge should be derived from {url}");
         assert_eq!(actual.owner, owner, "owner should be derived from {url}");
         assert_eq!(actual.repo, repo, "repository should be derived from {url}");
@@ -109,7 +109,7 @@ fn azure_encoded_path_characters_are_not_url_delimiters() {
             "repo#one",
         ),
     ] {
-        let actual = derive_forge_repo_info(url, None).unwrap();
+        let actual = derive_forge_repo_info(url, None, &[]).unwrap();
         assert_eq!(actual.owner, "org/project", "owner should survive in {url}");
         assert_eq!(
             actual.repo, expected_repo,
@@ -121,7 +121,7 @@ fn azure_encoded_path_characters_are_not_url_delimiters() {
 #[test]
 fn azure_https_organization_can_be_named_v3() {
     let actual =
-        derive_forge_repo_info("https://dev.azure.com/v3/project/_git/repo", None).unwrap();
+        derive_forge_repo_info("https://dev.azure.com/v3/project/_git/repo", None, &[]).unwrap();
     assert_eq!(actual.forge, ForgeName::Azure, "host identifies Azure");
     assert_eq!(
         actual.owner, "v3/project",
@@ -139,7 +139,7 @@ fn rejects_non_forge_and_malformed_repository_urls() {
     ] {
         for override_forge in [None, Some(ForgeName::GitLab)] {
             assert!(
-                derive_forge_repo_info(url, override_forge).is_none(),
+                derive_forge_repo_info(url, override_forge, &[]).is_none(),
                 "an override must not make {url} identify a hosted forge repository"
             );
         }
@@ -154,6 +154,7 @@ fn derive_repo_info_uses_override_for_self_hosted_url() {
     let info = derive_forge_repo_info(
         "https://git.selfhosted.example/group/repo.git",
         Some(ForgeName::GitLab),
+        &[],
     )
     .expect("override should resolve the forge for an otherwise-unknown host");
     assert_eq!(info.forge, ForgeName::GitLab);
@@ -194,7 +195,7 @@ fn override_uses_forge_specific_parser_for_encoded_and_nested_paths() {
             "ssh",
         ),
     ] {
-        let info = derive_forge_repo_info(url, Some(forge.clone()))
+        let info = derive_forge_repo_info(url, Some(forge.clone()), &[])
             .expect("the override must select the forge-specific repository parser");
         assert_eq!(info.forge, forge, "the override must identify {url}");
         assert_eq!(info.owner, owner, "the namespace must survive in {url}");

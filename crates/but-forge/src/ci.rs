@@ -6,7 +6,9 @@ use crate::ForgeName;
 /// is what GitHub is asked about instead, as for a review from a fork, whose
 /// branch the base repository doesn't have. The other forges look checks up by
 /// branch, so they are always asked about `reference`.
-pub fn ci_checks_for_ref_with_cache(
+///
+/// Dropping the returned future abandons the request; the cache is written only after the forge has answered.
+pub async fn ci_checks_for_ref_with_cache(
     preferred_forge_user: Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
@@ -33,16 +35,20 @@ pub fn ci_checks_for_ref_with_cache(
                 reference,
                 head_commit,
                 db,
-            )?
+            )
+            .await?
         }
-        crate::CacheConfig::NoCache => fetch_and_refresh_cache(
-            preferred_forge_user,
-            forge_repo_info,
-            storage,
-            reference,
-            head_commit,
-            db,
-        )?,
+        crate::CacheConfig::NoCache => {
+            fetch_and_refresh_cache(
+                preferred_forge_user,
+                forge_repo_info,
+                storage,
+                reference,
+                head_commit,
+                db,
+            )
+            .await?
+        }
     };
     Ok(checks)
 }
@@ -55,7 +61,7 @@ pub fn ci_checks_for_ref_with_cache(
 /// branch) is surfaced as "no checks" for display but must not overwrite the
 /// previously-good checks that cache-only readers such as `but status` rely on,
 /// since it can be transient.
-fn fetch_and_refresh_cache(
+async fn fetch_and_refresh_cache(
     preferred_forge_user: Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
@@ -67,7 +73,7 @@ fn fetch_and_refresh_cache(
         ForgeName::GitHub => head_commit.unwrap_or(reference),
         ForgeName::GitLab | ForgeName::Bitbucket | ForgeName::Azure => reference,
     };
-    let fetched = ci_checks_for_ref(preferred_forge_user, forge_repo_info, storage, asked)?;
+    let fetched = ci_checks_for_ref(preferred_forge_user, forge_repo_info, storage, asked).await?;
     Ok(refresh_cache_with_fetched(db, reference, fetched))
 }
 
@@ -101,7 +107,7 @@ fn refresh_cache_with_fetched(
 }
 
 /// Fetch checks from the forge. `None` means the ref did not resolve.
-fn ci_checks_for_ref(
+async fn ci_checks_for_ref(
     preferred_forge_user: Option<crate::ForgeUser>,
     forge_repo_info: &crate::forge::ForgeRepoInfo,
     storage: &but_forge_storage::Controller,
@@ -112,75 +118,47 @@ fn ci_checks_for_ref(
     } = forge_repo_info;
     let preferred_forge_user =
         crate::resolve_account(&preferred_forge_user, forge_repo_info, storage)?;
+    let with_reference = |mut check: CiCheck| {
+        check.reference = reference.to_owned();
+        check
+    };
     match forge {
         ForgeName::GitHub => {
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.github().cloned());
-
-            // Clone owned data for thread
-            let owner = owner.clone();
-            let repo = repo.clone();
-            let storage = storage.clone();
-            let reference = reference.to_string();
-            let reference_for_checks = reference.clone();
-
-            let checks = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(but_github::checks::list_for_ref(
-                        preferred_account.as_ref(),
-                        &owner,
-                        &repo,
-                        &reference,
-                        &storage,
-                    ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))?;
-            checks.map(|maybe_runs| {
-                maybe_runs.map(|runs| {
-                    runs.into_iter()
-                        .map(|check| {
-                            let mut ci_check = CiCheck::from(check);
-                            ci_check.reference = reference_for_checks.to_string();
-                            ci_check
-                        })
-                        .collect()
-                })
-            })
+            let checks = but_github::checks::list_for_ref(
+                preferred_account.as_ref(),
+                owner,
+                repo,
+                reference,
+                storage,
+            )
+            .await?;
+            Ok(checks.map(|runs| {
+                runs.into_iter()
+                    .map(CiCheck::from)
+                    .map(with_reference)
+                    .collect()
+            }))
         }
         ForgeName::GitLab => {
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.gitlab().cloned());
-
-            // Clone owned data for thread
             let project_id = but_gitlab::GitLabProjectId::new(owner, repo);
-            let storage = storage.clone();
-            let reference = reference.to_string();
-            let reference_for_checks = reference.clone();
-
-            let pipelines = std::thread::spawn(move || -> anyhow::Result<_> {
-                let runtime = tokio::runtime::Runtime::new()
-                    .map_err(|err| anyhow::anyhow!("Failed to create tokio runtime: {err}"))?;
-                runtime.block_on(but_gitlab::checks::list_pipeline_jobs_for_ref(
-                    preferred_account.as_ref(),
-                    project_id,
-                    &reference,
-                    &storage,
-                ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
+            let pipelines = but_gitlab::checks::list_pipeline_jobs_for_ref(
+                preferred_account.as_ref(),
+                project_id,
+                reference,
+                storage,
+            )
+            .await?;
             Ok(Some(
                 pipelines
                     .into_iter()
-                    .map(|pipeline| {
-                        let mut ci_check = CiCheck::from(pipeline);
-                        ci_check.reference = reference_for_checks.to_string();
-                        ci_check
-                    })
+                    .map(CiCheck::from)
+                    .map(with_reference)
                     .collect(),
             ))
         }
@@ -188,36 +166,19 @@ fn ci_checks_for_ref(
             let preferred_account = preferred_forge_user
                 .as_ref()
                 .and_then(|user| user.bitbucket().cloned());
-
-            // Clone owned data for thread
-            let workspace = owner.clone();
-            let repo_slug = repo.clone();
-            let storage = storage.clone();
-            let reference = reference.to_string();
-            let reference_for_checks = reference.clone();
-
-            let statuses = std::thread::spawn(move || -> anyhow::Result<_> {
-                let runtime = tokio::runtime::Runtime::new()
-                    .map_err(|err| anyhow::anyhow!("Failed to create tokio runtime: {err}"))?;
-                runtime.block_on(but_bitbucket::checks::list_for_ref(
-                    preferred_account.as_ref(),
-                    &workspace,
-                    &repo_slug,
-                    &reference,
-                    &storage,
-                ))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Failed to join thread: {e:?}"))??;
-
+            let statuses = but_bitbucket::checks::list_for_ref(
+                preferred_account.as_ref(),
+                owner,
+                repo,
+                reference,
+                storage,
+            )
+            .await?;
             Ok(statuses.map(|statuses| {
                 statuses
                     .into_iter()
-                    .map(|status| {
-                        let mut ci_check = CiCheck::from(status);
-                        ci_check.reference = reference_for_checks.to_string();
-                        ci_check
-                    })
+                    .map(CiCheck::from)
+                    .map(with_reference)
                     .collect()
             }))
         }
@@ -228,7 +189,6 @@ fn ci_checks_for_ref(
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CiCheck {
     pub id: i64,
@@ -247,9 +207,6 @@ pub struct CiCheck {
     pub last_sync_at: chrono::NaiveDateTime,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiCheck);
-
 impl CiCheck {
     /// The struct version for persistence compatibility purposes
     pub fn struct_version() -> i32 {
@@ -258,7 +215,6 @@ impl CiCheck {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CiOutput {
     pub summary: String,
@@ -266,11 +222,7 @@ pub struct CiOutput {
     pub title: String,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiOutput);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum CiStatus {
     Complete {
@@ -282,11 +234,7 @@ pub enum CiStatus {
     Unknown,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiStatus);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum CiConclusion {
     ActionRequired,
@@ -299,11 +247,7 @@ pub enum CiConclusion {
     Unknown,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CiConclusion);
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequestMinimal {
     pub id: i64,
@@ -314,9 +258,6 @@ pub struct PullRequestMinimal {
     pub head_ref: String,
     pub head_repo_url: Option<String>,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(PullRequestMinimal);
 
 impl From<but_gitlab::GitLabPipelineJob> for CiCheck {
     fn from(job: but_gitlab::GitLabPipelineJob) -> Self {
@@ -537,6 +478,11 @@ mod tests {
         }
     }
 
+    /// Run `future` to completion; the code under test is async, the tests are not.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(future)
+    }
+
     fn test_db() -> (tempfile::TempDir, but_db::DbHandle) {
         let tmp = tempfile::tempdir().unwrap();
         let db = but_db::DbHandle::new_in_directory(tmp.path()).unwrap();
@@ -554,7 +500,13 @@ mod tests {
             let repo = repo(account.forge_name(), "forge.example.com");
             for preferred in std::iter::once(None).chain(accounts.iter().cloned().map(Some)) {
                 assert_auth_error(
-                    ci_checks_for_ref(preferred.clone(), &repo, &storage, REFERENCE).unwrap_err(),
+                    block_on(ci_checks_for_ref(
+                        preferred.clone(),
+                        &repo,
+                        &storage,
+                        REFERENCE,
+                    ))
+                    .unwrap_err(),
                 );
                 for config in [
                     CacheConfig::CacheOnly,
@@ -562,7 +514,7 @@ mod tests {
                         max_age_seconds: 300,
                     },
                 ] {
-                    let checks = ci_checks_for_ref_with_cache(
+                    let checks = block_on(ci_checks_for_ref_with_cache(
                         preferred.clone(),
                         &repo,
                         &cache_storage,
@@ -570,7 +522,7 @@ mod tests {
                         None,
                         &mut db,
                         Some(config),
-                    )
+                    ))
                     .unwrap();
                     assert_eq!(
                         checks.iter().map(|check| check.id).collect::<Vec<_>>(),
@@ -581,7 +533,8 @@ mod tests {
             }
         }
         let azure = repo(ForgeName::Azure, "dev.azure.com");
-        let error = ci_checks_for_ref(None, &azure, &cache_storage, REFERENCE).unwrap_err();
+        let error =
+            block_on(ci_checks_for_ref(None, &azure, &cache_storage, REFERENCE)).unwrap_err();
         assert_eq!(
             error.to_string(),
             "Listing ci checks for forge Azure is not implemented yet.",

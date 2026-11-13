@@ -1,6 +1,14 @@
 #!/bin/sh
-# GitButler installer bootstrap script
-# This script downloads and runs the GitButler installer binary
+# GitCthulhu installer bootstrap script
+# This script downloads and runs the GitCthulhu installer binary.
+#
+# There are no built-in endpoints. Configure them through the environment:
+#   GITCTHULHU_INSTALLER_URL       base URL of the installer API (https). The installer metadata is
+#                                  read from "$GITCTHULHU_INSTALLER_URL/info/<os>/<arch>"; the installer
+#                                  binary must be served by the same host or one of its subdomains.
+#   GITCTHULHU_RELEASE_URL         base URL of the release API, used by the installer binary (https).
+#   GITCTHULHU_RELEASE_PUBLIC_KEY  base64 minisign public key the releases are signed with.
+#   GITCTHULHU_NONINTERACTIVE      set to a non-empty value to skip the shell-configuration prompts.
 
 # Wrap everything in main() to protect against partial downloads when
 # executed via `curl | sh`. The shell won't execute until the entire
@@ -15,6 +23,44 @@ main() {
           exit 1
       fi
   done
+
+  for var in GITCTHULHU_INSTALLER_URL GITCTHULHU_RELEASE_URL GITCTHULHU_RELEASE_PUBLIC_KEY; do
+      eval "value=\${$var:-}"
+      if [ -z "$value" ]; then
+          echo "Error: $var is not set. This installer has no default release server." >&2
+          exit 1
+      fi
+  done
+
+  # The host of an https URL, or nothing if the URL isn't https, carries user information or has an
+  # IP-literal host (whose colons can't be told from a port here).
+  https_host() {
+      authority=$(printf '%s\n' "$1" | sed -n 's|^https://\([^/?#]*\).*$|\1|p')
+      case "$authority" in
+          *@*|*\[*) return 0 ;;
+      esac
+      printf '%s\n' "${authority%%:*}"
+  }
+
+  # Succeeds if host $1 is the trusted host $2 or one of its subdomains.
+  is_trusted_host() {
+      case "$1" in
+          "$2"|*".$2") return 0 ;;
+          *) return 1 ;;
+      esac
+  }
+
+  TRUSTED_HOST=$(https_host "$GITCTHULHU_INSTALLER_URL")
+  if [ -z "$TRUSTED_HOST" ]; then
+      echo "Error: GITCTHULHU_INSTALLER_URL must be an https URL with a host name: $GITCTHULHU_INSTALLER_URL" >&2
+      exit 1
+  fi
+  case "$GITCTHULHU_INSTALLER_URL" in
+      *'?'*|*'#'*)
+          echo "Error: GITCTHULHU_INSTALLER_URL must not have a query or fragment: $GITCTHULHU_INSTALLER_URL" >&2
+          exit 1
+          ;;
+  esac
 
   # Detect OS and architecture
   OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -42,12 +88,12 @@ main() {
 
   # Create temp files and setup cleanup
   # Use explicit templates for portability across GNU/BSD mktemp variants
-  INSTALLER_JSON=$(mktemp "${TMPDIR:-/tmp}/gitbutler-installer-json.XXXXXX")
-  INSTALLER_BIN=$(mktemp "${TMPDIR:-/tmp}/gitbutler-installer-bin.XXXXXX")
+  INSTALLER_JSON=$(mktemp "${TMPDIR:-/tmp}/gitcthulhu-installer-json.XXXXXX")
+  INSTALLER_BIN=$(mktemp "${TMPDIR:-/tmp}/gitcthulhu-installer-bin.XXXXXX")
   trap 'rm -f "$INSTALLER_JSON" "$INSTALLER_BIN"' EXIT INT TERM
 
   # Fetch installer metadata and validate effective URL
-  INSTALLER_API_URL="https://app.gitbutler.com/installers/info/$INSTALLER_OS/$INSTALLER_ARCH"
+  INSTALLER_API_URL="${GITCTHULHU_INSTALLER_URL%/}/info/$INSTALLER_OS/$INSTALLER_ARCH"
   echo "Fetching installer information..."
 
   EFFECTIVE_URL=$(curl --fail --silent --show-error --location --max-redirs 5 --max-time 300 \
@@ -56,15 +102,10 @@ main() {
       exit 1
   }
 
-  case "$EFFECTIVE_URL" in
-      https://app.gitbutler.com/*)
-          : # Valid - stayed on trusted domain
-          ;;
-      *)
-          echo "Error: API was redirected to an untrusted URL: $EFFECTIVE_URL" >&2
-          exit 1
-          ;;
-  esac
+  if [ "$(https_host "$EFFECTIVE_URL")" != "$TRUSTED_HOST" ]; then
+      echo "Error: API was redirected to an untrusted URL: $EFFECTIVE_URL" >&2
+      exit 1
+  fi
 
   # Parse installer URL from JSON
   INSTALLER_URL=$(grep -o '"url":"[^"]*"' "$INSTALLER_JSON" | head -1 | sed 's/"url":"\(.*\)"/\1/')
@@ -75,15 +116,10 @@ main() {
   fi
 
   # Validate URL from API is trusted
-  case "$INSTALLER_URL" in
-      https://releases.gitbutler.com/*)
-          : # Valid
-          ;;
-      *)
-          echo "Error: Installer URL is not from a trusted GitButler domain: $INSTALLER_URL" >&2
-          exit 1
-          ;;
-  esac
+  if ! is_trusted_host "$(https_host "$INSTALLER_URL")" "$TRUSTED_HOST"; then
+      echo "Error: Installer URL is not from the trusted host $TRUSTED_HOST: $INSTALLER_URL" >&2
+      exit 1
+  fi
 
   # Download installer and validate effective URL
   echo "Downloading installer..."
@@ -94,15 +130,10 @@ main() {
       exit 1
   }
 
-  case "$EFFECTIVE_DOWNLOAD_URL" in
-      https://releases.gitbutler.com/*)
-          : # Valid - stayed on trusted domain
-          ;;
-      *)
-          echo "Error: Download was redirected to an untrusted URL: $EFFECTIVE_DOWNLOAD_URL" >&2
-          exit 1
-          ;;
-  esac
+  if ! is_trusted_host "$(https_host "$EFFECTIVE_DOWNLOAD_URL")" "$TRUSTED_HOST"; then
+      echo "Error: Download was redirected to an untrusted URL: $EFFECTIVE_DOWNLOAD_URL" >&2
+      exit 1
+  fi
 
   # Verify downloaded installer
   [ -s "$INSTALLER_BIN" ] || {
@@ -115,7 +146,9 @@ main() {
       exit 1
   }
 
-  # Run installer with forwarded arguments
+  # Run installer with forwarded arguments; it reads GITCTHULHU_RELEASE_URL and
+  # GITCTHULHU_RELEASE_PUBLIC_KEY from the environment.
+  export GITCTHULHU_RELEASE_URL GITCTHULHU_RELEASE_PUBLIC_KEY
   exec "$INSTALLER_BIN" "$@"
 }
 

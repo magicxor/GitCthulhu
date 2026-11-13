@@ -5,11 +5,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use but_project_handle::{ProjectHandleOrLegacyProjectId, REFRESH_SENTINEL_PATH};
 use gitbutler_notify_debouncer::{Debouncer, NoCache, new_debouncer};
 use gix::bstr::ByteSlice as _;
 use notify::{RecommendedWatcher, Watcher};
-use tokio::task;
 use tracing::Level;
 
 use crate::{
@@ -29,8 +27,7 @@ use crate::{
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // The internal rate at which the debouncer will update its state.
-// Keeping a higher timeout on Windows because of file-system issues related
-// to `virtual_branches.toml`.
+// Keeping a higher timeout on Windows because of its slower file-system notifications.
 const TICK_RATE: Duration = if cfg!(windows) {
     Duration::from_millis(250)
 } else {
@@ -63,7 +60,7 @@ impl FileMonitorHandle {
     }
 }
 
-const ENV_WATCH_MODE: &str = "GITBUTLER_WATCH_MODE";
+const ENV_WATCH_MODE: &str = "GITCTHULHU_WATCH_MODE";
 
 /// Control how the filesystem watch should be established.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +96,7 @@ impl std::str::FromStr for WatchMode {
 
 impl WatchMode {
     /// Initialise the mode from `watch_mode_from_settings`, with environment variable override.
-    /// If the environment variable `GITBUTLER_WATCH_MODE` is set, it overrides the feature flag.
+    /// If the environment variable `GITCTHULHU_WATCH_MODE` is set, it overrides the feature flag.
     /// Otherwise, the feature flag value is used.
     pub fn from_env_or_settings<F>(watch_mode_from_settings: &str, get_env_var: F) -> Self
     where
@@ -152,16 +149,18 @@ fn watch_backoff_policy() -> backoff::ExponentialBackoff {
 
 fn setup_watch_plan(
     debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
-    project_id: ProjectHandleOrLegacyProjectId,
     repo: &gix::Repository,
     worktree_path: &Path,
     git_dir: &Path,
     linked_git_dirs: &[&Path],
+    problems: &mut Vec<String>,
 ) -> Result<()> {
+    let mut limit_hit: Option<PathBuf> = None;
     // Start the watcher, but retry if there are transient errors.
-    backoff::retry(watch_backoff_policy(), || {
+    let result = backoff::retry(watch_backoff_policy(), || {
         let mut paths = debouncer.watcher().paths_mut();
         let mut add_error: Option<(std::path::PathBuf, notify::Error)> = None;
+        limit_hit = None;
         compute_watch_plan_for_repo(repo, worktree_path, git_dir, linked_git_dirs, |path, mode| {
             if add_error.is_some() {
                 return Ok(std::ops::ControlFlow::Break(()));
@@ -171,10 +170,10 @@ fn setup_watch_plan(
                 Err(err) => match err.kind {
                     notify::ErrorKind::MaxFilesWatch => {
                         tracing::warn!(
-                            %project_id,
                             path = %path.display(),
                             "OS file watch limit reached; continuing with partial watches. Monitoring coverage may be incomplete until restart."
                         );
+                        limit_hit = Some(path.to_owned());
                         Ok(std::ops::ControlFlow::Break(()))
                     }
                     _ => {
@@ -195,13 +194,24 @@ fn setup_watch_plan(
             Err(err) => Err(into_backoff_err(err, worktree_path))
         }
     })
-        .map_err(backoff_err_to_anyhow).context("Watcher start failed")
+        .map_err(backoff_err_to_anyhow).context("Watcher start failed");
+    if result.is_ok()
+        && let Some(path) = limit_hit
+    {
+        problems.push(format!(
+            "The operating system's limit of file watches was reached at {}: changes in parts of the repository will not be noticed",
+            path.display()
+        ));
+    }
+    result
 }
 
 fn setup_legacy_watch(
     debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
     worktree_path: &Path,
     git_dir: &Path,
+    common_dir: Option<&Path>,
+    problems: &mut Vec<String>,
 ) -> Result<()> {
     let extra_git_dir_to_watch = {
         let mut enclosing_worktree_dir = git_dir.to_owned();
@@ -230,18 +240,79 @@ fn setup_legacy_watch(
             .map_err(|err| into_backoff_err(err, worktree_path))
     })
     .map_err(backoff_err_to_anyhow)
-    .context("failed to start watcher")
+    .context("failed to start watcher")?;
+    if let Some(common_dir) = common_dir {
+        watch_common_dir(debouncer, common_dir, problems)?;
+    }
+    Ok(())
 }
 
-/// Listen to interesting filesystem events of files in `path` that are not `.gitignore`d,
-/// classify them, and associate them with `project_id`.
+/// Watch the parts of the `common_dir` of a linked worktree that matter: refs, `packed-refs`, `config` and
+/// friends, but never the object database.
+fn watch_common_dir(
+    debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
+    common_dir: &Path,
+    problems: &mut Vec<String>,
+) -> Result<()> {
+    let mut limit_hit: Option<PathBuf> = None;
+    let result = backoff::retry(watch_backoff_policy(), || {
+        let mut paths = debouncer.watcher().paths_mut();
+        let mut add_error: Option<(PathBuf, notify::Error)> = None;
+        limit_hit = None;
+        let _flow = crate::watch_plan::emit_git_dir_watches(common_dir, &mut |path, mode| {
+            if add_error.is_some() {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            if let Err(err) = paths.add(path, mode) {
+                if matches!(err.kind, notify::ErrorKind::MaxFilesWatch) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "OS file watch limit reached; continuing with partial watches"
+                    );
+                    limit_hit = Some(path.to_owned());
+                } else {
+                    add_error = Some((path.to_owned(), err));
+                }
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+        .map_err(|err| backoff::Error::permanent(err.into_boxed_dyn_error()))?;
+        if let Some((path, err)) = add_error {
+            return Err(into_backoff_err(err, &path));
+        }
+        paths
+            .commit()
+            .map_err(|err| into_backoff_err(err, common_dir))
+    })
+    .map_err(backoff_err_to_anyhow)
+    .context("failed to watch the common git directory");
+    if result.is_ok()
+        && let Some(path) = limit_hit
+    {
+        problems.push(format!(
+            "The operating system's limit of file watches was reached at {}: changes of the shared git directory will not be noticed",
+            path.display()
+        ));
+    }
+    result
+}
+
+/// Listen to interesting filesystem events of files in `worktree_path` that are not `.gitignore`d, and classify
+/// them.
 /// These are sent through the passed `out` channel, to indicate either **Git** repository changes
 /// or **ProjectWorktree** changes
 /// Use `watch_mode` to control how exactly the directory is watched.
-/// `linked_worktrees` lists the linked worktrees to watch besides the main one, whose changes are
+///
+/// `common_dir` is the common git directory if `worktree_path` is a linked worktree: its refs, `packed-refs` and
+/// `config` are watched as well, and changes there are reported as [`InternalEvent::CommonGitFilesChange`].
+///
+/// `linked_worktrees` lists the linked worktrees to watch besides the opened checkout, whose changes are
 /// reported under their own [`Checkout`]. The list is obtained again whenever a linked worktree is
-/// registered, moved or removed, or when the refresh sentinel is written, and is left as it
-/// was if that fails.
+/// registered, moved or removed, and is left as it was if that fails.
+///
+/// The worker runs on its own thread named `filemonitor` and stops when the returned handle is dropped or `out`
+/// has no receiver anymore.
 ///
 /// ### Why is this not an iterator?
 ///
@@ -254,96 +325,112 @@ fn setup_legacy_watch(
 ///
 /// Additionally, a channel plays better with how events are handled downstream.
 pub fn spawn(
-    project_id: ProjectHandleOrLegacyProjectId,
     worktree_path: &std::path::Path,
+    common_dir: Option<&Path>,
     linked_worktrees: impl Fn() -> Result<Vec<LinkedWorktree>> + Send + 'static,
-    out: tokio::sync::mpsc::UnboundedSender<InternalEvent>,
+    out: std::sync::mpsc::Sender<InternalEvent>,
     watch_mode: WatchMode,
 ) -> Result<FileMonitorHandle> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let (notify_tx, notify_rx) = std::sync::mpsc::channel();
     let worktree_path = gix::path::realpath(worktree_path)?;
+    let common_dir = common_dir
+        .map(gix::path::realpath)
+        .transpose()
+        .context("failed to resolve the common git directory")?;
     let repo = gix::open_opts(&worktree_path, gix::open::Options::isolated()).context(format!(
         "failed to open project repository to obtain git-dir: {}",
         worktree_path.display()
     ))?;
     let git_dir = repo.path().to_owned();
+    // The directory under which linked worktrees are registered (`<common>/worktrees/<name>`).
+    let registry_dir = common_dir.clone().unwrap_or_else(|| git_dir.clone());
     let mut debouncer = new_debouncer(
         DEBOUNCE_TIMEOUT,
         Some(TICK_RATE),
         Some(FLUSH_AFTER_EMPTY),
         {
             let git_dir = git_dir.clone();
+            let common_dir = common_dir.clone();
             move |event: &notify::Event| {
                 is_interesting_kind(event.kind)
-                    && (event.paths.iter())
-                        .any(|path| classify_file(&git_dir, path) == FileKind::Git)
+                    && (event.paths.iter()).any(|path| {
+                        classify_file(&git_dir, path) == FileKind::Git
+                            || common_dir.as_deref().is_some_and(|common_dir| {
+                                classify_file(common_dir, path) == FileKind::Git
+                            })
+                    })
             }
         },
         notify_tx,
     )
     .context("failed to create debouncer")?;
-    let mut linked = linked_checkouts(&git_dir, &linked_worktrees).unwrap_or_default();
-    let linked_git_dirs: Vec<_> = linked
+    let linked = linked_checkouts(&registry_dir, &linked_worktrees).unwrap_or_default();
+    let mut extra_git_dirs: Vec<&Path> = linked
         .iter()
         .map(|checkout| checkout.git_dir.as_path())
         .collect();
+    extra_git_dirs.extend(common_dir.as_deref());
 
     let mut effective_watch_mode = watch_mode;
 
+    // What did not work while setting up, reported as `InternalEvent::WatchError` once the worker runs.
+    let mut problems: Vec<String> = Vec::new();
+    let plan = |debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
+                problems: &mut Vec<String>| {
+        setup_watch_plan(
+            debouncer,
+            &repo,
+            &worktree_path,
+            &git_dir,
+            &extra_git_dirs,
+            problems,
+        )
+    };
+    let legacy = |debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
+                  problems: &mut Vec<String>| {
+        setup_legacy_watch(
+            debouncer,
+            &worktree_path,
+            &git_dir,
+            common_dir.as_deref(),
+            problems,
+        )
+    };
     match watch_mode {
-        WatchMode::Legacy => {
-            setup_legacy_watch(&mut debouncer, &worktree_path, &git_dir)?;
-        }
+        WatchMode::Legacy => legacy(&mut debouncer, &mut problems)?,
         WatchMode::Modern => {
-            if let Err(err) = setup_watch_plan(
-                &mut debouncer,
-                project_id.clone(),
-                &repo,
-                &worktree_path,
-                &git_dir,
-                &linked_git_dirs,
-            ) {
+            if let Err(err) = plan(&mut debouncer, &mut problems) {
                 tracing::warn!(
-                    %project_id,
                     ?err,
                     "watch-plan setup failed; falling back to legacy watch mode"
                 );
                 effective_watch_mode = WatchMode::Legacy;
-                setup_legacy_watch(&mut debouncer, &worktree_path, &git_dir)?;
+                legacy(&mut debouncer, &mut problems)?;
             }
         }
         WatchMode::Auto => {
             if is_wsl() {
-                match setup_watch_plan(
-                    &mut debouncer,
-                    project_id.clone(),
-                    &repo,
-                    &worktree_path,
-                    &git_dir,
-                    &linked_git_dirs,
-                ) {
+                match plan(&mut debouncer, &mut problems) {
                     Ok(()) => {
                         effective_watch_mode = WatchMode::Modern;
                     }
                     Err(err) => {
                         tracing::warn!(
-                            %project_id,
                             ?err,
                             "watch-plan setup failed; falling back to legacy watch mode"
                         );
                         effective_watch_mode = WatchMode::Legacy;
-                        setup_legacy_watch(&mut debouncer, &worktree_path, &git_dir)?;
+                        legacy(&mut debouncer, &mut problems)?;
                     }
                 }
             } else {
                 effective_watch_mode = WatchMode::Legacy;
-                setup_legacy_watch(&mut debouncer, &worktree_path, &git_dir)?;
+                legacy(&mut debouncer, &mut problems)?;
             }
         }
     }
     tracing::debug!(
-        %project_id,
         requested = ?watch_mode,
         effective = ?effective_watch_mode,
         "file watcher started"
@@ -353,10 +440,10 @@ pub fn spawn(
     for checkout in &linked {
         watch_linked_workdir(
             &mut debouncer,
-            &project_id,
             &worktree_path,
             checkout,
             dynamic_watch_enabled,
+            &mut problems,
         );
     }
     let main = WatchedCheckout {
@@ -364,158 +451,290 @@ pub fn spawn(
         workdir: worktree_path,
         git_dir,
     };
-    task::spawn_blocking(move || {
-        let _runtime = tracing::span!(Level::INFO, "file monitor", %project_id ).entered();
-        tracing::debug!(%project_id, "file watcher started");
+    std::thread::Builder::new()
+        .name("filemonitor".into())
+        .spawn(move || {
+            let _runtime = tracing::span!(Level::INFO, "file monitor").entered();
+            run_worker(
+                debouncer,
+                notify_rx,
+                cmd_rx,
+                &main,
+                common_dir.as_deref(),
+                &registry_dir,
+                linked,
+                &linked_worktrees,
+                &out,
+                dynamic_watch_enabled,
+                problems,
+            );
+        })
+        .context("failed to start the file monitor thread")?;
+    Ok(FileMonitorHandle { cmd_tx })
+}
 
-        // Even though the watcher cannot 'double-watch', we keep track of newly added watches
-        // to avoid it doing any work, and for better traces.
-        let mut dynamically_watched_dirs: HashSet<std::path::PathBuf> = HashSet::new();
-        'outer: loop {
-            // Handle control plane messages.
-            loop {
-                match cmd_rx.try_recv() {
-                    Ok(Command::Flush) => debouncer.flush_nonblocking(),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
+/// The body of the worker thread: turn debounced notify events into [`InternalEvent`]s until the handle is dropped
+/// or the receiver of `out` is gone.
+#[allow(clippy::too_many_arguments)]
+fn run_worker(
+    mut debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    notify_rx: std::sync::mpsc::Receiver<gitbutler_notify_debouncer::DebounceEventResult>,
+    cmd_rx: std::sync::mpsc::Receiver<Command>,
+    main: &WatchedCheckout,
+    common_dir: Option<&Path>,
+    registry_dir: &Path,
+    mut linked: Vec<WatchedCheckout>,
+    linked_worktrees: &impl Fn() -> Result<Vec<LinkedWorktree>>,
+    out: &std::sync::mpsc::Sender<InternalEvent>,
+    dynamic_watch_enabled: bool,
+    mut problems: Vec<String>,
+) {
+    // Even though the watcher cannot 'double-watch', we keep track of newly added watches
+    // to avoid it doing any work, and for better traces.
+    let mut dynamically_watched_dirs: HashSet<std::path::PathBuf> = HashSet::new();
+    'outer: loop {
+        // Problems of the setup, and of the dynamic watches of the previous round.
+        for message in problems.drain(..) {
+            if out.send(InternalEvent::WatchError(message)).is_err() {
+                break 'outer;
+            }
+        }
+        // Handle control plane messages.
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(Command::Flush) => debouncer.flush_nonblocking(),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
+            }
+        }
+
+        let result = match notify_rx.recv_timeout(TICK_RATE) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'outer,
+        };
+        let stats = tracing::span!(
+            Level::INFO,
+            "handle debounced events",
+            ignored = tracing::field::Empty,
+            project = tracing::field::Empty,
+            git = tracing::field::Empty,
+            git_noop = tracing::field::Empty,
+            fs_events = tracing::field::Empty,
+        )
+        .entered();
+        match result {
+            Err(errors) => {
+                for err in errors {
+                    tracing::error!(?err, "file watcher error");
+                    problems.push(format!("The file watcher reported an error: {err}"));
                 }
             }
-
-            let result = match notify_rx.recv_timeout(TICK_RATE) {
-                Ok(result) => result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'outer,
-            };
-            let stats = tracing::span!(
-                Level::INFO,
-                "handle debounced events",
-                ignored = tracing::field::Empty,
-                project = tracing::field::Empty,
-                git = tracing::field::Empty,
-                git_noop = tracing::field::Empty,
-                fs_events = tracing::field::Empty,
-            )
-            .entered();
-            match result {
-                Err(err) => {
-                    tracing::error!(?err, "ignored file watcher error");
-                }
-                Ok(events) => {
-                    let num_events = events.len();
-                    let changes_by_checkout = changes_by_checkout(
-                        std::iter::once(&main).chain(&linked),
-                        events
-                            .into_iter()
-                            .filter(|event| is_interesting_kind(event.kind))
-                            .flat_map(|event| event.event.paths),
-                    );
-                    let count = |count_of: fn(&Changes) -> usize| -> usize {
-                        changes_by_checkout
-                            .iter()
-                            .map(|(_, changes)| count_of(changes))
-                            .sum()
-                    };
-                    stats.record("fs_events", num_events);
-                    stats.record("ignored", count(|changes| changes.ignored));
-                    stats.record("git_noop", count(|changes| changes.git_noop));
-                    stats.record("git", count(|changes| changes.git.len()));
-                    stats.record("project", count(|changes| changes.worktree.len()));
-                    let relisted = changes_by_checkout
+            Ok(events) => {
+                let num_events = events.len();
+                let (changes_by_checkout, common_changes) = changes_by_checkout(
+                    std::iter::once(main).chain(&linked),
+                    common_dir,
+                    events
+                        .into_iter()
+                        .filter(|event| is_interesting_kind(event.kind))
+                        .flat_map(|event| event.event.paths),
+                );
+                let count = |count_of: fn(&Changes) -> usize| -> usize {
+                    changes_by_checkout
                         .iter()
-                        .any(|(_, changes)| changes.linked_worktrees_may_differ())
-                        .then(|| linked_checkouts(&main.git_dir, &linked_worktrees))
-                        .flatten();
-                    if let Some(relisted) = &relisted {
-                        if dynamic_watch_enabled {
-                            update_dynamic_watches(
-                                &mut debouncer,
-                                &mut dynamically_watched_dirs,
-                                std::iter::once(main.git_dir.join(LINKED_WORKTREES_DIR)),
-                            );
-                        }
-                        // A moved worktree leaves as its old location and joins as its new one,
-                        // which can be the same watch to the operating system: it must be
-                        // unwatched first or the removal takes the new watch with it.
-                        for removed in linked
-                            .iter()
-                            .filter(|checkout| !relisted.contains(checkout))
-                        {
-                            unwatch_linked_workdir(
-                                &mut debouncer,
-                                &mut dynamically_watched_dirs,
-                                &main.workdir,
-                                removed,
-                                dynamic_watch_enabled,
-                            );
-                        }
-                        for added in relisted
-                            .iter()
-                            .filter(|checkout| !linked.contains(checkout))
-                        {
-                            watch_linked_workdir(
-                                &mut debouncer,
-                                &project_id,
-                                &main.workdir,
-                                added,
-                                dynamic_watch_enabled,
-                            );
-                        }
+                        .map(|(_, changes)| count_of(changes))
+                        .sum()
+                };
+                stats.record("fs_events", num_events);
+                stats.record("ignored", count(|changes| changes.ignored));
+                stats.record("git_noop", count(|changes| changes.git_noop));
+                stats.record("git", count(|changes| changes.git.len()));
+                stats.record("project", count(|changes| changes.worktree.len()));
+                let relisted = (changes_by_checkout
+                    .iter()
+                    .any(|(_, changes)| changes.linked_worktrees_may_differ())
+                    || common_changes
+                        .iter()
+                        .any(|path| is_linked_worktree_registration(path)))
+                .then(|| linked_checkouts(registry_dir, linked_worktrees))
+                .flatten();
+                if let Some(relisted) = &relisted {
+                    if dynamic_watch_enabled {
+                        update_dynamic_watches(
+                            &mut debouncer,
+                            &mut dynamically_watched_dirs,
+                            std::iter::once(registry_dir.join(LINKED_WORKTREES_DIR)),
+                            &mut problems,
+                        );
+                    }
+                    // A moved worktree leaves as its old location and joins as its new one,
+                    // which can be the same watch to the operating system: it must be
+                    // unwatched first or the removal takes the new watch with it.
+                    for removed in linked
+                        .iter()
+                        .filter(|checkout| !relisted.contains(checkout))
+                    {
+                        unwatch_linked_workdir(
+                            &mut debouncer,
+                            &mut dynamically_watched_dirs,
+                            &main.workdir,
+                            removed,
+                            dynamic_watch_enabled,
+                        );
+                    }
+                    for added in relisted
+                        .iter()
+                        .filter(|checkout| !linked.contains(checkout))
+                    {
+                        watch_linked_workdir(
+                            &mut debouncer,
+                            &main.workdir,
+                            added,
+                            dynamic_watch_enabled,
+                            &mut problems,
+                        );
+                    }
+                }
+
+                for (checkout, changes) in changes_by_checkout {
+                    if dynamic_watch_enabled && changes.ignore_filtering_ran {
+                        update_dynamic_watches(
+                            &mut debouncer,
+                            &mut dynamically_watched_dirs,
+                            changes
+                                .worktree
+                                .iter()
+                                .map(|relative_path| checkout.workdir.join(relative_path)),
+                            &mut problems,
+                        );
+                    }
+                    if dynamic_watch_enabled {
+                        update_dynamic_git_dir_watches(
+                            &mut debouncer,
+                            &mut dynamically_watched_dirs,
+                            &checkout.git_dir,
+                            &changes.git,
+                            &mut problems,
+                        );
                     }
 
-                    for (checkout, changes) in changes_by_checkout {
-                        if dynamic_watch_enabled && changes.ignore_filtering_ran {
-                            update_dynamic_watches(
-                                &mut debouncer,
-                                &mut dynamically_watched_dirs,
-                                changes
-                                    .worktree
-                                    .iter()
-                                    .map(|relative_path| checkout.workdir.join(relative_path)),
-                            );
-                        }
-
-                        if !changes.git.is_empty() {
-                            let event = InternalEvent::GitFilesChange(
-                                project_id.clone(),
-                                checkout.id.clone(),
-                                changes.git.into_iter().collect(),
-                            );
-                            if out.send(event).is_err() {
-                                tracing::info!("channel closed - stopping file watcher");
-                                break 'outer;
-                            }
-                        }
-                        if !changes.worktree.is_empty() {
-                            let event = InternalEvent::ProjectFilesChange(
-                                project_id.clone(),
-                                checkout.id.clone(),
-                                changes.worktree.into_iter().collect(),
-                            );
-                            if out.send(event).is_err() {
-                                tracing::info!("channel closed - stopping file watcher");
-                                break 'outer;
-                            }
+                    if !changes.git.is_empty() {
+                        let event = InternalEvent::GitFilesChange(
+                            checkout.id.clone(),
+                            changes.git.into_iter().collect(),
+                        );
+                        if out.send(event).is_err() {
+                            tracing::info!("channel closed - stopping file watcher");
+                            break 'outer;
                         }
                     }
-
-                    if let Some(relisted) = relisted {
-                        linked = relisted;
+                    if !changes.worktree.is_empty() {
+                        let event = InternalEvent::ProjectFilesChange(
+                            checkout.id.clone(),
+                            changes.worktree.into_iter().collect(),
+                        );
+                        if out.send(event).is_err() {
+                            tracing::info!("channel closed - stopping file watcher");
+                            break 'outer;
+                        }
                     }
+                }
+                if let Some(common_dir) = common_dir
+                    && !common_changes.is_empty()
+                {
+                    if dynamic_watch_enabled {
+                        update_dynamic_git_dir_watches(
+                            &mut debouncer,
+                            &mut dynamically_watched_dirs,
+                            common_dir,
+                            &common_changes,
+                            &mut problems,
+                        );
+                    }
+                    let event =
+                        InternalEvent::CommonGitFilesChange(common_changes.into_iter().collect());
+                    if out.send(event).is_err() {
+                        tracing::info!("channel closed - stopping file watcher");
+                        break 'outer;
+                    }
+                }
+                if let Some(relisted) = relisted {
+                    linked = relisted;
                 }
             }
         }
-    });
-    Ok(FileMonitorHandle { cmd_tx })
+    }
+}
+
+/// Watch the git-dir directories that come into existence while we run, given the `git_dir`-relative `changed`
+/// paths: `rebase-merge/` (and its siblings), `modules/`, `modules/<name>/` and `modules/<name>/refs/`.
+/// Never `modules/**/objects/`, a fetch in a submodule would flood the debouncer.
+fn update_dynamic_git_dir_watches(
+    debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
+    dynamically_watched_dirs: &mut HashSet<PathBuf>,
+    git_dir: &Path,
+    changed: &HashSet<PathBuf>,
+    problems: &mut Vec<String>,
+) {
+    let mut non_recursive = Vec::new();
+    let mut recursive = Vec::new();
+    for rel in changed {
+        let mut components = rel.components();
+        let Some(first) = components.next() else {
+            continue;
+        };
+        let first = first.as_os_str();
+        if STATE_DIRS.iter().any(|dir| first == *dir) {
+            if components.next().is_none() {
+                non_recursive.push(git_dir.join(rel));
+            }
+        } else if first == MODULES_DIR {
+            let modules_dir = git_dir.join(MODULES_DIR);
+            non_recursive.push(modules_dir.clone());
+            if let Some(name) = components.next() {
+                let module_dir = modules_dir.join(name.as_os_str());
+                recursive.push(module_dir.join("refs"));
+                non_recursive.push(module_dir);
+            }
+        }
+    }
+    update_dynamic_watches(
+        debouncer,
+        dynamically_watched_dirs,
+        non_recursive.into_iter(),
+        problems,
+    );
+    for dir in recursive {
+        if dynamically_watched_dirs.contains(&dir) || !dir.is_dir() {
+            continue;
+        }
+        match debouncer
+            .watcher()
+            .watch(&dir, notify::RecursiveMode::Recursive)
+        {
+            Ok(()) => {
+                dynamically_watched_dirs.insert(dir);
+            }
+            Err(err) => {
+                tracing::warn!(?dir, ?err, "failed to watch a submodule's refs");
+                problems.push(format!(
+                    "Could not watch the refs of the submodule at {}: {err}",
+                    dir.display()
+                ));
+            }
+        }
+    }
 }
 
 /// Watch the files of the `linked` worktree: with its own watch plan if `use_watch_plan` is set, and
 /// recursively otherwise, unless the recursive watch of `main_workdir` already covers it.
 fn watch_linked_workdir(
     debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
-    project_id: &ProjectHandleOrLegacyProjectId,
     main_workdir: &Path,
     linked: &WatchedCheckout,
     use_watch_plan: bool,
+    problems: &mut Vec<String>,
 ) {
     let res = if use_watch_plan {
         gix::open_opts(&linked.workdir, gix::open::Options::isolated())
@@ -523,11 +742,11 @@ fn watch_linked_workdir(
             .and_then(|repo| {
                 setup_watch_plan(
                     debouncer,
-                    project_id.clone(),
                     &repo,
                     &linked.workdir,
                     &linked.git_dir,
                     &[],
+                    problems,
                 )
             })
     } else if linked.has_own_recursive_watch(main_workdir, use_watch_plan) {
@@ -544,6 +763,10 @@ fn watch_linked_workdir(
             workdir = ?linked.workdir,
             "failed to watch linked worktree; changes to its files will be missed"
         );
+        problems.push(format!(
+            "Could not watch the linked worktree at {}: changes to its files will not be noticed ({err:#})",
+            linked.workdir.display()
+        ));
     }
 }
 
@@ -598,6 +821,7 @@ fn update_dynamic_watches(
     debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
     dynamically_watched_dirs: &mut HashSet<PathBuf>,
     paths: impl Iterator<Item = PathBuf>,
+    problems: &mut Vec<String>,
 ) {
     #[derive(Debug)]
     enum Mode {
@@ -629,7 +853,11 @@ fn update_dynamic_watches(
                 ?mode,
                 ?err,
                 "failed to add or remove watch; changes may be missed until restart"
-            )
+            );
+            problems.push(format!(
+                "Could not update the watch of {}: changes there may not be noticed ({err})",
+                path.display()
+            ));
         });
         match mode {
             Mode::AddWatch if res.is_ok() => {
@@ -689,15 +917,42 @@ fn backoff_err_to_anyhow(
     anyhow::Error::from_boxed(Box::from(err.to_string()))
 }
 
-pub const LOCAL_REFS_DIR: &str = "refs/heads/";
-pub const REMOTE_REFS_DIR: &str = "refs/remotes/";
+/// The directory of all refs, relative to a git dir.
+pub const REFS_DIR: &str = "refs";
+/// `FETCH_HEAD`, relative to a git dir.
 pub const FETCH_HEAD: &str = "FETCH_HEAD";
+/// `HEAD`, relative to a git dir.
 pub const HEAD: &str = "HEAD";
+/// The reflog of `HEAD`, relative to a git dir.
 pub const HEAD_ACTIVITY: &str = "logs/HEAD";
+/// The reflog of the stash, relative to a git dir.
+pub const STASH_ACTIVITY: &str = "logs/refs/stash";
+/// The index, relative to a git dir.
 pub const INDEX: &str = "index";
-pub const GB_FLUSH: &str = "GB_FLUSH";
+/// Where linked worktrees are registered, relative to the common git dir.
 pub const LINKED_WORKTREES_DIR: &str = "worktrees";
+/// The file in a linked worktree's git dir that names its checkout.
 pub const LINKED_WORKTREE_GITDIR: &str = "gitdir";
+/// Where submodule repositories live, relative to the common git dir.
+pub const MODULES_DIR: &str = "modules";
+
+/// Single files directly in a git dir whose change matters.
+const INTERESTING_GIT_DIR_FILES: &[&str] = &[
+    "HEAD",
+    "index",
+    "packed-refs",
+    "config",
+    "FETCH_HEAD",
+    "ORIG_HEAD",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "REBASE_HEAD",
+    "BISECT_LOG",
+];
+
+/// Directories in a git dir that exist only while an operation is in progress, and everything below them matters.
+pub(crate) const STATE_DIRS: &[&str] = &["rebase-merge", "rebase-apply", "sequencer"];
 
 #[derive(PartialEq)]
 struct WatchedCheckout {
@@ -715,11 +970,15 @@ struct Changes {
     ignore_filtering_ran: bool,
 }
 
+/// Distribute `paths` over the `checkouts` (the innermost root wins). Paths in `common_dir` that no checkout
+/// claims are returned separately, relative to `common_dir`, if they are interesting.
 fn changes_by_checkout<'a>(
     checkouts: impl Iterator<Item = &'a WatchedCheckout>,
+    common_dir: Option<&Path>,
     paths: impl IntoIterator<Item = PathBuf>,
-) -> Vec<(&'a WatchedCheckout, Changes)> {
+) -> (Vec<(&'a WatchedCheckout, Changes)>, HashSet<PathBuf>) {
     let mut paths_by_checkout: Vec<_> = checkouts.map(|checkout| (checkout, Vec::new())).collect();
+    let mut common_changes = HashSet::new();
     for path in paths {
         let innermost = paths_by_checkout
             .iter_mut()
@@ -729,12 +988,20 @@ fn changes_by_checkout<'a>(
             .max_by_key(|(depth, _)| *depth);
         if let Some((_, paths)) = innermost {
             paths.push(path);
+        } else if let Some(common_dir) = common_dir
+            && classify_file(common_dir, &path) == FileKind::Git
+            && let Ok(relative) = path.strip_prefix(common_dir)
+        {
+            common_changes.insert(relative.to_owned());
         }
     }
-    paths_by_checkout
-        .into_iter()
-        .map(|(checkout, paths)| (checkout, checkout.changes(paths)))
-        .collect()
+    (
+        paths_by_checkout
+            .into_iter()
+            .map(|(checkout, paths)| (checkout, checkout.changes(paths)))
+            .collect(),
+        common_changes,
+    )
 }
 
 fn linked_checkouts(
@@ -755,9 +1022,7 @@ fn linked_checkouts(
 impl Changes {
     fn linked_worktrees_may_differ(&self) -> bool {
         self.git.iter().any(|path| {
-            path.starts_with(LINKED_WORKTREES_DIR)
-                || path == Path::new(LINKED_WORKTREE_GITDIR)
-                || path == Path::new(REFRESH_SENTINEL_PATH)
+            path.starts_with(LINKED_WORKTREES_DIR) || path == Path::new(LINKED_WORKTREE_GITDIR)
         })
     }
 }
@@ -881,23 +1146,62 @@ enum FileKind {
 
 fn classify_file(git_dir: &Path, file_path: &Path) -> FileKind {
     if let Ok(check_file_path) = file_path.strip_prefix(git_dir) {
-        if check_file_path == Path::new(FETCH_HEAD)
-            || check_file_path == Path::new(HEAD_ACTIVITY)
-            || check_file_path == Path::new(HEAD)
-            || check_file_path == Path::new(GB_FLUSH)
-            || check_file_path == Path::new(INDEX)
-            || check_file_path == Path::new(REFRESH_SENTINEL_PATH)
-            || check_file_path == Path::new(LINKED_WORKTREE_GITDIR)
-            || check_file_path.starts_with(LOCAL_REFS_DIR)
-            || check_file_path.starts_with(REMOTE_REFS_DIR)
-            || is_linked_worktree_registration(check_file_path)
-        {
+        if is_interesting_git_path(check_file_path) {
             FileKind::Git
         } else {
             FileKind::GitUninteresting
         }
     } else {
         FileKind::Project
+    }
+}
+
+/// Whether a change of `rel`, a path relative to a git dir, can alter what a Git client shows.
+///
+/// Objects, `COMMIT_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, lock files and our own drafts are not interesting.
+fn is_interesting_git_path(rel: &Path) -> bool {
+    let mut components = rel.components();
+    let Some(first) = components.next().map(|c| c.as_os_str()) else {
+        return false;
+    };
+    let rest_is_empty = components.as_path().as_os_str().is_empty();
+    if rest_is_empty && INTERESTING_GIT_DIR_FILES.iter().any(|name| first == *name) {
+        return true;
+    }
+    if first == REFS_DIR {
+        return !rest_is_empty;
+    }
+    if STATE_DIRS.iter().any(|dir| first == *dir) {
+        return true;
+    }
+    if first == "logs" {
+        return rel == Path::new(HEAD_ACTIVITY) || rel == Path::new(STASH_ACTIVITY);
+    }
+    if first == LINKED_WORKTREE_GITDIR && rest_is_empty {
+        return true;
+    }
+    if first == MODULES_DIR {
+        return is_interesting_module_path(components.as_path());
+    }
+    is_linked_worktree_registration(rel)
+}
+
+/// `rel` is relative to `modules/`: the repository of a submodule. Its `HEAD`, `index` and refs count, and the
+/// appearance of the directories on the way (so they can be watched), but never its object database.
+fn is_interesting_module_path(rel: &Path) -> bool {
+    let names: Vec<_> = rel.components().map(|c| c.as_os_str()).collect();
+    if names
+        .iter()
+        .any(|name| *name == "objects" || *name == "logs")
+    {
+        return false;
+    }
+    match names.as_slice() {
+        // `modules` itself and `modules/<name>`.
+        [] | [_] => true,
+        [.., last] => {
+            *last == "HEAD" || *last == "index" || names[1..].iter().any(|n| *n == REFS_DIR)
+        }
     }
 }
 
@@ -986,11 +1290,105 @@ mod tests {
         );
     }
 
+    fn kind(path: &str) -> FileKind {
+        classify_file(git_dir(), &Path::new("/repo/.git").join(path))
+    }
+
     #[test]
-    fn classify_refresh_sentinel() {
+    fn classify_everything_a_git_client_shows_as_interesting() {
+        for path in [
+            "HEAD",
+            "index",
+            "packed-refs",
+            "config",
+            "FETCH_HEAD",
+            "ORIG_HEAD",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "REBASE_HEAD",
+            "BISECT_LOG",
+            "logs/HEAD",
+            "logs/refs/stash",
+            "refs/heads/main",
+            "refs/tags/v1",
+            "refs/stash",
+            "refs/gitcthulhu/undo/1",
+            "rebase-merge",
+            "rebase-merge/git-rebase-todo",
+            "rebase-apply/next",
+            "sequencer/todo",
+            "modules",
+            "modules/sub",
+            "modules/sub/HEAD",
+            "modules/sub/index",
+            "modules/sub/refs/remotes/origin/main",
+            "modules/nested/name/HEAD",
+        ] {
+            assert_eq!(kind(path), FileKind::Git, "{path} is interesting");
+        }
+    }
+
+    #[test]
+    fn classify_noise_as_uninteresting() {
+        for path in [
+            "COMMIT_EDITMSG",
+            "MERGE_MSG",
+            "SQUASH_MSG",
+            "gitcthulhu/commit-draft",
+            "gitcthulhu",
+            "index.lock",
+            "refs",
+            "objects/pack/pack-1.pack",
+            "logs/refs/heads/main",
+            "modules/sub/objects/ab/cdef",
+            "modules/sub/objects",
+            "modules/sub/FETCH_HEAD",
+            "modules/sub/logs/HEAD",
+            "gitbutler/REFRESH",
+        ] {
+            assert_eq!(kind(path), FileKind::GitUninteresting, "{path} is noise");
+        }
+    }
+
+    #[test]
+    fn classify_ignores_the_directory_itself() {
         assert_eq!(
-            classify_file(git_dir(), Path::new("/repo/.git/gitbutler/REFRESH")),
-            FileKind::Git
+            classify_file(git_dir(), Path::new("/repo/.git")),
+            FileKind::GitUninteresting,
+            "the git dir itself has no relative path"
+        );
+    }
+
+    #[test]
+    fn common_dir_changes_of_a_linked_worktree_are_split_off() {
+        let main = WatchedCheckout {
+            id: Checkout::Main,
+            workdir: PathBuf::from("/linked"),
+            git_dir: PathBuf::from("/repo/.git/worktrees/linked"),
+        };
+        let common = Path::new("/repo/.git");
+        let (by_checkout, common_changes) = changes_by_checkout(
+            std::iter::once(&main),
+            Some(common),
+            [
+                PathBuf::from("/repo/.git/refs/tags/v1"),
+                PathBuf::from("/repo/.git/packed-refs"),
+                PathBuf::from("/repo/.git/objects/ab/cd"),
+                PathBuf::from("/repo/.git/worktrees/linked/index"),
+            ],
+        );
+        let mut common_changes: Vec<_> = common_changes.into_iter().collect();
+        common_changes.sort();
+        assert_eq!(
+            common_changes,
+            [PathBuf::from("packed-refs"), PathBuf::from("refs/tags/v1")],
+            "refs and packed-refs of the common dir, relative to it; objects are noise"
+        );
+        assert_eq!(by_checkout.len(), 1, "one checkout");
+        assert!(
+            by_checkout[0].1.git.contains(Path::new("index")),
+            "the index belongs to the linked git dir, not to the common dir"
         );
     }
 
@@ -1023,18 +1421,6 @@ mod tests {
     fn classify_linked_worktree_contents_as_uninteresting() {
         assert_eq!(
             classify_file(git_dir(), Path::new("/repo/.git/worktrees/name/HEAD")),
-            FileKind::GitUninteresting
-        );
-    }
-
-    #[test]
-    fn classify_metadata_store_as_uninteresting() {
-        // The metadata store is uninteresting — the sentinel is what signals refreshes.
-        assert_eq!(
-            classify_file(
-                git_dir(),
-                Path::new("/repo/.git/gitbutler/virtual_branches.toml")
-            ),
             FileKind::GitUninteresting
         );
     }

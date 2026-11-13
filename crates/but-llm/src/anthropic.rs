@@ -1,23 +1,30 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
+use crate::tool::Toolset;
 use anyhow::{Context as _, Result};
-use but_secret::{Sensitive, secret};
-use but_tools::tool::Toolset;
+use but_secret::Sensitive;
+use futures::StreamExt as _;
 use reqwest::{
     Response,
-    header::{CONTENT_TYPE, HeaderMap, HeaderValue},
+    header::{HeaderMap, HeaderValue},
 };
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
+use tokio::time::timeout;
 
 use crate::{
-    AI_ANTHROPIC_SECRET_HANDLE, GITBUTLER_ACCESS_TOKEN_HANDLE, StreamToolCallResult, ToolCall,
-    ToolCallContent, ToolResponseContent, chat::ChatMessage, client::LLMClient,
+    GenerateOptions, StreamToolCallResult, ToolCall, ToolCallContent, ToolResponseContent,
+    chat::ChatMessage,
+    client::LLMClient,
+    error::LlmError,
+    http::{RESPONSE_START_TIMEOUT, STREAM_IDLE_TIMEOUT, TOTAL_TIMEOUT},
+    sse::{SseEvent, SseParser},
 };
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-pub const GB_ANTHROPIC_API_BASE: &str = "https://app.gitbutler.com/api/proxy/anthropic";
+/// The output limit of requests that do not set one. Anthropic requires the field on every request.
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Result of a tool calling loop with streaming
 pub struct ConversationResult {
@@ -25,146 +32,108 @@ pub struct ConversationResult {
     pub message_history: Vec<ChatMessage>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, strum::Display)]
-pub enum CredentialsKind {
-    EnvVarAnthropicKey,
-    OwnAnthropicKey,
-    GitButlerProxied,
-}
-
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
-    api_base: &'static str,
-    client: reqwest::Client,
+    api_base: String,
+    headers: HeaderMap,
+    max_tokens: u32,
 }
 
 impl AnthropicClient {
-    pub fn new(kind: CredentialsKind, credentials: &Sensitive<String>) -> Result<Self> {
-        let (api_base, headers) = endpoint(&kind, credentials);
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()?;
-
-        Ok(Self { api_base, client })
+    fn new(api_base: &str, api_key: &Sensitive<String>, max_tokens: u32) -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        let mut key = HeaderValue::from_str(&api_key.0)
+            .context("the Anthropic API key contains characters that cannot be sent in a header")?;
+        key.set_sensitive(true);
+        headers.insert("x-api-key", key);
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static(ANTHROPIC_VERSION),
+        );
+        Ok(Self {
+            api_base: api_base.trim_end_matches('/').to_owned(),
+            headers,
+            max_tokens,
+        })
     }
 
     /// Send a message request to the Anthropic Messages API
-    async fn message(&self, request: &AnthropicRequest) -> Result<AnthropicResponse> {
-        let response = self.message_raw(request).await?;
-        let anthropic_response: AnthropicResponse = response.json().await?;
-        Ok(anthropic_response)
+    async fn message(&self, request: &AnthropicRequest) -> Result<AnthropicResponse, LlmError> {
+        let response = self
+            .request(request)?
+            .timeout(TOTAL_TIMEOUT)
+            .send()
+            .await
+            .map_err(LlmError::from)?;
+        let status = response.status();
+        let body = response.text().await.map_err(LlmError::from)?;
+        if !status.is_success() {
+            return Err(LlmError::from_status(status, &body));
+        }
+        serde_json::from_str(&body)
+            .map_err(|err| LlmError::Provider(format!("the answer could not be read: {err}")))
     }
 
-    async fn message_raw(&self, request: &AnthropicRequest) -> Result<Response> {
-        let api_base = self.api_base;
-        let response = self
-            .client
-            .post(format!("{api_base}/messages"))
-            .json(request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await?;
-            anyhow::bail!("Anthropic API error ({status}): {error_text}");
+    /// Send a streaming request; returns once the response head arrived and is a success.
+    async fn message_raw(&self, request: &AnthropicRequest) -> Result<Response, LlmError> {
+        let response = timeout(RESPONSE_START_TIMEOUT, self.request(request)?.send())
+            .await
+            .map_err(|_| LlmError::timed_out("the response", RESPONSE_START_TIMEOUT))??;
+        let status = response.status();
+        if !status.is_success() {
+            let body = timeout(RESPONSE_START_TIMEOUT, response.text())
+                .await
+                .map_err(|_| {
+                    LlmError::timed_out("the error description", RESPONSE_START_TIMEOUT)
+                })??;
+            return Err(LlmError::from_status(status, &body));
         }
-
         Ok(response)
     }
-}
 
-/// Where requests go, and the headers they send there. GitButler's proxy knows the user by
-/// their GitButler token in `X-Auth-Token`, as GitButler's other endpoints do, and sends its
-/// own key on to Anthropic.
-fn endpoint(kind: &CredentialsKind, credentials: &Sensitive<String>) -> (&'static str, HeaderMap) {
-    let (api_base, auth) = match kind {
-        CredentialsKind::GitButlerProxied => (GB_ANTHROPIC_API_BASE, "X-Auth-Token"),
-        CredentialsKind::EnvVarAnthropicKey | CredentialsKind::OwnAnthropicKey => {
-            (ANTHROPIC_API_BASE, "x-api-key")
-        }
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-        auth,
-        credentials
-            .0
-            .parse()
-            .unwrap_or(HeaderValue::from_static("")),
-    );
-    headers.insert(
-        "anthropic-version",
-        HeaderValue::from_static(ANTHROPIC_VERSION),
-    );
-    (api_base, headers)
+    fn request(&self, request: &AnthropicRequest) -> Result<reqwest::RequestBuilder, LlmError> {
+        Ok(crate::http::client()?
+            .post(format!("{}/messages", self.api_base))
+            .headers(self.headers.clone())
+            .json(request))
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
+    api_base: String,
     model: Option<String>,
-    credentials: (CredentialsKind, Sensitive<String>),
+    api_key: Sensitive<String>,
+    max_tokens: u32,
 }
 
 impl AnthropicProvider {
-    pub fn with(preferred_creds: Option<CredentialsKind>, model: Option<String>) -> Option<Self> {
-        let credentials = if let Some(kind) = preferred_creds {
-            match kind {
-                CredentialsKind::EnvVarAnthropicKey => AnthropicProvider::anthropic_env_var_creds(),
-                CredentialsKind::OwnAnthropicKey => AnthropicProvider::anthropic_own_key_creds(),
-                CredentialsKind::GitButlerProxied => AnthropicProvider::gitbutler_proxied_creds(),
-            }
-        } else {
-            AnthropicProvider::gitbutler_proxied_creds()
-                .or_else(|_| AnthropicProvider::anthropic_own_key_creds())
-                .or_else(|_| AnthropicProvider::anthropic_env_var_creds())
-                .context("No Anthropic credentials found. This can be configured in the app or read from a ANTHROPIC_API_KEY environment variable")
-        };
+    pub fn with(api_key: Sensitive<String>, model: Option<String>) -> Self {
+        Self::with_api_base(api_key, model, ANTHROPIC_API_BASE)
+    }
 
-        match credentials {
-            Ok(credentials) => Some(Self { credentials, model }),
-            Err(e) => {
-                tracing::error!("Failed to retrieve Anthropic credentials: {}", e);
-                None
-            }
+    /// Like [`Self::with`], but sending requests to `api_base` (the part before `/messages`).
+    pub(crate) fn with_api_base(
+        api_key: Sensitive<String>,
+        model: Option<String>,
+        api_base: &str,
+    ) -> Self {
+        Self {
+            api_base: api_base.to_owned(),
+            model,
+            api_key,
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
+    /// The output limit of requests that do not set their own.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
     pub fn client(&self) -> Result<AnthropicClient> {
-        let credentials = &self.credentials.1;
-        let kind = self.credentials.0.clone();
-        AnthropicClient::new(kind, credentials)
-    }
-
-    pub fn credentials_kind(&self) -> CredentialsKind {
-        self.credentials.0.clone()
-    }
-    fn gitbutler_proxied_creds() -> Result<(CredentialsKind, Sensitive<String>)> {
-        let creds = secret::retrieve(GITBUTLER_ACCESS_TOKEN_HANDLE, secret::Namespace::BuildKind)?
-            .ok_or(anyhow::anyhow!(
-                "No GitButler token available. Log-in to use the GitButler Anthropic provider"
-            ))?;
-        Ok((CredentialsKind::GitButlerProxied, creds))
-    }
-
-    fn anthropic_own_key_creds() -> Result<(CredentialsKind, Sensitive<String>)> {
-        let creds = secret::retrieve(AI_ANTHROPIC_SECRET_HANDLE, secret::Namespace::Global)?
-            .ok_or(anyhow::anyhow!(
-                "No Anthropic own key configured. Add this through the GitButler settings"
-            ))?;
-        Ok((CredentialsKind::OwnAnthropicKey, creds))
-    }
-
-    fn anthropic_env_var_creds() -> Result<(CredentialsKind, Sensitive<String>)> {
-        let creds = Sensitive(
-            std::env::var_os("ANTHROPIC_API_KEY")
-                .ok_or(anyhow::anyhow!(
-                    "Environment variable ANTHROPIC_API_KEY is not set"
-                ))?
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("Invalid UTF-8 in ANTHROPIC_API_KEY"))?,
-        );
-        Ok((CredentialsKind::EnvVarAnthropicKey, creds))
+        AnthropicClient::new(&self.api_base, &self.api_key, self.max_tokens)
     }
 }
 
@@ -403,18 +372,9 @@ pub fn structured_output_blocking<
     let model = model.to_string();
     let system_message = system_message.to_string();
 
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(structured_output::<T>(
-                &client,
-                messages,
-                model,
-                system_message,
-            ))
+    crate::runtime::block_on(async move {
+        structured_output::<T>(&client, messages, model, system_message).await
     })
-    .join()
-    .unwrap()
 }
 
 async fn structured_output<T: serde::Serialize + DeserializeOwned + JsonSchema>(
@@ -435,7 +395,7 @@ async fn structured_output<T: serde::Serialize + DeserializeOwned + JsonSchema>(
 
     let request = AnthropicRequest {
         model,
-        max_tokens: 4096,
+        max_tokens: client.max_tokens,
         messages,
         system: Some(enhanced_system),
         tools: None,
@@ -478,53 +438,57 @@ fn response_blocking(
     chat_messages: Vec<ChatMessage>,
     model: &str,
 ) -> anyhow::Result<Option<String>> {
-    let messages: Vec<AnthropicMessage> = chat_messages
-        .into_iter()
-        .map(AnthropicMessage::from)
-        .collect();
-
     let client = client.client()?;
-    let model = model.to_string();
-    let system_message = system_message.to_string();
-
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new().unwrap().block_on(response(
+    crate::runtime::block_on(async {
+        Ok(text(
             &client,
-            messages,
-            model,
             system_message,
-        ))
+            chat_messages,
+            model,
+            &GenerateOptions::default(),
+        )
+        .await?)
     })
-    .join()
-    .unwrap()
 }
 
-async fn response(
+/// Ask for the whole answer at once. `Ok(None)` if the model said nothing.
+pub(crate) async fn text(
     client: &AnthropicClient,
-    messages: Vec<AnthropicMessage>,
-    model: String,
-    system_message: String,
-) -> anyhow::Result<Option<String>> {
-    let request = AnthropicRequest {
-        model,
-        max_tokens: 4096,
-        messages,
-        system: Some(system_message),
+    system_message: &str,
+    chat_messages: Vec<ChatMessage>,
+    model: &str,
+    options: &GenerateOptions,
+) -> Result<Option<String>, LlmError> {
+    let request = text_request(client, system_message, chat_messages, model, options, false);
+    let response = client.message(&request).await?;
+    let text = response
+        .content
+        .into_iter()
+        .find(|block| block.block_type == "text")
+        .and_then(|block| block.text)
+        .filter(|text| !text.is_empty());
+    Ok(text)
+}
+
+fn text_request(
+    client: &AnthropicClient,
+    system_message: &str,
+    chat_messages: Vec<ChatMessage>,
+    model: &str,
+    options: &GenerateOptions,
+    stream: bool,
+) -> AnthropicRequest {
+    AnthropicRequest {
+        model: model.to_owned(),
+        max_tokens: options.max_tokens.unwrap_or(client.max_tokens),
+        messages: chat_messages
+            .into_iter()
+            .map(AnthropicMessage::from)
+            .collect(),
+        system: Some(system_message.to_owned()),
         tools: None,
-        stream: None,
-    };
-
-    let anthropic_response = client.message(&request).await?;
-
-    for block in anthropic_response.content {
-        if block.block_type == "text"
-            && let Some(text) = block.text
-        {
-            return Ok(Some(text));
-        }
+        stream: stream.then_some(true),
     }
-
-    Ok(None)
 }
 
 pub fn stream_response_blocking(
@@ -534,91 +498,111 @@ pub fn stream_response_blocking(
     model: &str,
     on_token: impl Fn(&str) + Send + Sync + 'static,
 ) -> anyhow::Result<Option<String>> {
-    let messages: Vec<AnthropicMessage> = chat_messages
-        .into_iter()
-        .map(AnthropicMessage::from)
-        .collect();
-
     let client = client.client()?;
-    let model = model.to_string();
-    let system_message = system_message.to_string();
-
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(stream_response(
-                &client,
-                messages,
-                model,
-                system_message,
-                on_token,
-            ))
+    crate::runtime::block_on(async {
+        Ok(stream_text(
+            &client,
+            system_message,
+            chat_messages,
+            model,
+            &GenerateOptions::default(),
+            &mut |token| on_token(token),
+        )
+        .await?)
     })
-    .join()
-    .unwrap()
 }
 
-async fn stream_response(
+/// Ask for the answer as a stream, calling `on_token` with each piece as it arrives. Dropping the returned
+/// future closes the connection.
+///
+/// An `error` event in the stream (Anthropic reports overload and similar failures that way after the `200`)
+/// ends the request with that error, and so does a stream that ends before `message_stop`.
+pub(crate) async fn stream_text(
     client: &AnthropicClient,
-    messages: Vec<AnthropicMessage>,
-    model: String,
-    system_message: String,
-    on_token: impl Fn(&str) + Send + Sync + 'static,
-) -> anyhow::Result<Option<String>> {
-    use futures::StreamExt;
-
-    let request = AnthropicRequest {
-        model,
-        max_tokens: 4096,
-        messages,
-        system: Some(system_message),
-        tools: None,
-        stream: Some(true),
-    };
-
+    system_message: &str,
+    chat_messages: Vec<ChatMessage>,
+    model: &str,
+    options: &GenerateOptions,
+    on_token: &mut (dyn FnMut(&str) + Send),
+) -> Result<Option<String>, LlmError> {
+    let request = text_request(client, system_message, chat_messages, model, options, true);
     let response = client.message_raw(&request).await?;
-
-    let mut stream = response.bytes_stream();
-    let mut response_text = String::new();
-    let mut buffer = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        let text = String::from_utf8_lossy(&bytes);
-
-        buffer.push_str(&text);
-
-        // Process complete lines
-        while let Some(line_end) = buffer.find('\n') {
-            let line_owned = buffer[..line_end].trim().to_string();
-            buffer = buffer[line_end + 1..].to_string();
-
-            if line_owned.is_empty() {
-                continue;
-            }
-
-            // SSE format: "data: {...}"
-            if let Some(data) = line_owned.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    break;
-                }
-
-                if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data)
-                    && event.event_type.as_str() == "content_block_delta"
-                    && let Some(delta) = event.delta
-                    && let Some(text) = delta.get("text").and_then(|t| t.as_str())
+    let mut answer = String::new();
+    for_each_event(response, |event| {
+        match event.event_type.as_str() {
+            "content_block_delta" => {
+                if let Some(token) = event
+                    .delta
+                    .as_ref()
+                    .and_then(|delta| delta.get("text"))
+                    .and_then(|text| text.as_str())
                 {
-                    response_text.push_str(text);
-                    on_token(text);
+                    answer.push_str(token);
+                    on_token(token);
                 }
+            }
+            "message_stop" => return std::ops::ControlFlow::Break(()),
+            _ => {}
+        }
+        std::ops::ControlFlow::Continue(())
+    })
+    .await?;
+    Ok((!answer.is_empty()).then_some(answer))
+}
+
+/// What a streamed `error` event says, if `sse` is one.
+fn error_event(sse: &SseEvent, value: &serde_json::Value) -> Option<LlmError> {
+    let is_error = value.get("type").and_then(|t| t.as_str()) == Some("error")
+        || sse.event.as_deref() == Some("error");
+    if !is_error {
+        return None;
+    }
+    let kind = value
+        .pointer("/error/type")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    let message = value
+        .pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("the provider reported an error");
+    Some(LlmError::from_event(kind, message.to_owned()))
+}
+
+/// Read `response` as a stream of events and hand each to `handle` until it breaks.
+///
+/// Fails with the provider's error if it sends an `error` event, and with a network error if the stream ends
+/// (or goes silent) before `handle` broke.
+async fn for_each_event(
+    response: Response,
+    mut handle: impl FnMut(AnthropicStreamEvent) -> std::ops::ControlFlow<()>,
+) -> Result<(), LlmError> {
+    let mut chunks = response.bytes_stream();
+    let mut parser = SseParser::default();
+    loop {
+        let (events, last) = match timeout(STREAM_IDLE_TIMEOUT, chunks.next()).await {
+            Err(_) => return Err(LlmError::timed_out("the next token", STREAM_IDLE_TIMEOUT)),
+            Ok(None) => (parser.finish().into_iter().collect::<Vec<_>>(), true),
+            Ok(Some(chunk)) => (parser.push(&chunk?), false),
+        };
+        for sse in events {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&sse.data) else {
+                continue;
+            };
+            if let Some(err) = error_event(&sse, &value) {
+                return Err(err);
+            }
+            let Ok(event) = serde_json::from_value::<AnthropicStreamEvent>(value) else {
+                continue;
+            };
+            if handle(event).is_break() {
+                return Ok(());
             }
         }
-    }
-
-    if response_text.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(response_text))
+        if last {
+            return Err(LlmError::Network(
+                "the stream ended before the answer was complete".to_owned(),
+            ));
+        }
     }
 }
 
@@ -633,19 +617,9 @@ fn tool_calling_blocking(
     let model = model.to_string();
     let system_message = system_message.to_string();
 
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(tool_calling(
-                &client,
-                messages,
-                tools,
-                model,
-                system_message,
-            ))
+    crate::runtime::block_on(async move {
+        tool_calling(&client, messages, tools, model, system_message).await
     })
-    .join()
-    .unwrap()
 }
 
 async fn tool_calling(
@@ -657,15 +631,14 @@ async fn tool_calling(
 ) -> anyhow::Result<AnthropicResponse> {
     let request = AnthropicRequest {
         model,
-        max_tokens: 4096,
+        max_tokens: client.max_tokens,
         messages,
         system: Some(system_message),
         tools: Some(tools),
         stream: None,
     };
 
-    let anthropic_response = client.message(&request).await?;
-    Ok(anthropic_response)
+    Ok(client.message(&request).await?)
 }
 
 fn tool_calling_stream_blocking(
@@ -680,20 +653,9 @@ fn tool_calling_stream_blocking(
     let model = model.to_string();
     let system_message = system_message.to_string();
 
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(tool_calling_stream(
-                &client,
-                messages,
-                tools,
-                model,
-                system_message,
-                on_token,
-            ))
+    crate::runtime::block_on(async move {
+        tool_calling_stream(&client, messages, tools, model, system_message, on_token).await
     })
-    .join()
-    .unwrap()
 }
 
 async fn tool_calling_stream(
@@ -704,11 +666,9 @@ async fn tool_calling_stream(
     system_message: String,
     on_token: impl Fn(&str) + Send + Sync + 'static,
 ) -> anyhow::Result<StreamToolCallResult> {
-    use futures::StreamExt;
-
     let request = AnthropicRequest {
         model,
-        max_tokens: 4096,
+        max_tokens: client.max_tokens,
         messages,
         system: Some(system_message),
         tools: Some(tools),
@@ -717,104 +677,57 @@ async fn tool_calling_stream(
 
     let response = client.message_raw(&request).await?;
 
-    let mut stream = response.bytes_stream();
     let mut response_text = String::new();
-    let mut buffer = String::new();
     let mut tool_calls: HashMap<String, ToolCall> = HashMap::new();
     let mut current_tool_id: Option<String> = None;
 
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        let text = String::from_utf8_lossy(&bytes);
-
-        buffer.push_str(&text);
-
-        // Process complete lines
-        while let Some(line_end) = buffer.find('\n') {
-            let line_owned = buffer[..line_end].trim().to_string();
-            buffer = buffer[line_end + 1..].to_string();
-
-            if line_owned.is_empty() {
-                continue;
-            }
-
-            // SSE format: "data: {...}"
-            if let Some(data) = line_owned.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    break;
+    for_each_event(response, |event| {
+        match event.event_type.as_str() {
+            "content_block_start" => {
+                if let Some(block) = event.content_block
+                    && block.block_type == "tool_use"
+                    && let (Some(id), Some(name)) = (block.id, block.name)
+                {
+                    current_tool_id = Some(id.clone());
+                    tool_calls.insert(
+                        id.clone(),
+                        ToolCall {
+                            id,
+                            name,
+                            arguments: String::new(),
+                        },
+                    );
                 }
+            }
+            "content_block_delta" => {
+                if let Some(delta) = event.delta {
+                    // Handle text delta
+                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                        response_text.push_str(text);
+                        on_token(text);
+                    }
 
-                if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data) {
-                    match event.event_type.as_str() {
-                        "content_block_start" => {
-                            if let Some(block) = event.content_block
-                                && block.block_type == "tool_use"
-                                && let (Some(id), Some(name)) = (block.id, block.name)
-                            {
-                                current_tool_id = Some(id.clone());
-                                tool_calls.insert(
-                                    id.clone(),
-                                    ToolCall {
-                                        id,
-                                        name,
-                                        arguments: String::new(),
-                                    },
-                                );
-                            }
-                        }
-                        "content_block_delta" => {
-                            if let Some(delta) = event.delta {
-                                // Handle text delta
-                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                    response_text.push_str(text);
-                                    on_token(text);
-                                }
-
-                                // Handle tool input delta
-                                if let Some(partial_json) =
-                                    delta.get("partial_json").and_then(|t| t.as_str())
-                                    && let Some(tool_id) = &current_tool_id
-                                    && let Some(tool_call) = tool_calls.get_mut(tool_id)
-                                {
-                                    tool_call.arguments.push_str(partial_json);
-                                }
-                            }
-                        }
-                        "message_stop"
-                            // Check if we have tool calls to return
-                            if !tool_calls.is_empty() => {
-                                let calls: Vec<ToolCall> = tool_calls.values().cloned().collect();
-                                let text = if response_text.is_empty() {
-                                    None
-                                } else {
-                                    Some(response_text.clone())
-                                };
-                                return Ok((Some(calls), text));
-                            }
-                        _ => {}
+                    // Handle tool input delta
+                    if let Some(partial_json) = delta.get("partial_json").and_then(|t| t.as_str())
+                        && let Some(tool_id) = &current_tool_id
+                        && let Some(tool_call) = tool_calls.get_mut(tool_id)
+                    {
+                        tool_call.arguments.push_str(partial_json);
                     }
                 }
             }
+            "message_stop" => return std::ops::ControlFlow::Break(()),
+            _ => {}
         }
-    }
+        std::ops::ControlFlow::Continue(())
+    })
+    .await?;
 
-    // If we have tool calls, return them
-    if !tool_calls.is_empty() {
-        let calls: Vec<ToolCall> = tool_calls.values().cloned().collect();
-        let text = if response_text.is_empty() {
-            None
-        } else {
-            Some(response_text)
-        };
-        Ok((Some(calls), text))
-    } else {
-        // Otherwise return just the text
-        let text = if response_text.is_empty() {
-            None
-        } else {
-            Some(response_text)
-        };
+    let text = (!response_text.is_empty()).then_some(response_text);
+    if tool_calls.is_empty() {
         Ok((None, text))
+    } else {
+        Ok((Some(tool_calls.into_values().collect()), text))
     }
 }
 
@@ -831,7 +744,7 @@ fn handle_text_response(
     });
 }
 
-fn convert_tool_to_anthropic_format(tool: &dyn but_tools::tool::Tool) -> serde_json::Value {
+fn convert_tool_to_anthropic_format(tool: &dyn crate::tool::Tool) -> serde_json::Value {
     serde_json::json!({
         "name": tool.name(),
         "description": tool.description(),
@@ -1063,24 +976,174 @@ pub fn tool_calling_loop_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_server::{respond, send, serve_once, start_event_stream};
 
-    #[test]
-    fn each_endpoint_gets_the_token_in_the_header_it_reads() {
-        let token = Sensitive("token".to_owned());
-        let (api_base, headers) = endpoint(&CredentialsKind::GitButlerProxied, &token);
-        assert_eq!(api_base, GB_ANTHROPIC_API_BASE);
-        assert_eq!(
-            headers.get("X-Auth-Token").map(HeaderValue::as_bytes),
-            Some(b"token".as_slice()),
-            "app.gitbutler.com knows the user only by X-Auth-Token and answers 401 without it"
-        );
+    fn provider(addr: std::net::SocketAddr) -> AnthropicProvider {
+        AnthropicProvider::with_api_base(
+            Sensitive("secret-key".into()),
+            None,
+            &format!("http://{addr}/v1"),
+        )
+    }
 
-        let (api_base, headers) = endpoint(&CredentialsKind::OwnAnthropicKey, &token);
-        assert_eq!(api_base, ANTHROPIC_API_BASE);
-        assert_eq!(
-            headers.get("x-api-key").map(HeaderValue::as_bytes),
-            Some(b"token".as_slice()),
-            "Anthropic's own API takes the user's key as x-api-key"
+    fn user(text: &str) -> Vec<ChatMessage> {
+        vec![ChatMessage::User(text.to_owned())]
+    }
+
+    const HELLO: &str = "event: content_block_delta\n\
+        data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n";
+
+    const EMPTY_MESSAGE: &str = r#"{"id":"1","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{}}"#;
+
+    #[tokio::test]
+    async fn the_own_key_goes_in_x_api_key_and_the_limit_defaults_to_4096() {
+        let (addr, server) = serve_once(|request, mut stream| async move {
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"{"id":"1","type":"message","role":"assistant","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{}}"#,
+            )
+            .await;
+            request
+        })
+        .await;
+        let client = provider(addr).client().expect("client");
+        let answer = text(
+            &client,
+            "sys",
+            user("ping"),
+            "m",
+            &GenerateOptions::default(),
+        )
+        .await
+        .expect("the request succeeds");
+        assert_eq!(answer.as_deref(), Some("pong"));
+
+        let request = server.await.expect("server task");
+        let head = request.head.to_ascii_lowercase();
+        assert!(
+            request.head.starts_with("POST /v1/messages "),
+            "messages path: {}",
+            request.head
         );
+        assert!(
+            head.contains("x-api-key: secret-key"),
+            "Anthropic takes the key as x-api-key: {head}"
+        );
+        assert!(head.contains("anthropic-version: 2023-06-01"));
+        let body: serde_json::Value = serde_json::from_str(&request.body).expect("JSON body");
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS, "the default limit");
+        assert_eq!(body["system"], "sys");
+    }
+
+    #[tokio::test]
+    async fn a_request_can_set_its_own_limit() {
+        let (addr, server) = serve_once(|request, mut stream| async move {
+            respond(&mut stream, "200 OK", "application/json", EMPTY_MESSAGE).await;
+            request
+        })
+        .await;
+        let client = provider(addr)
+            .with_max_tokens(100)
+            .client()
+            .expect("client");
+        let answer = text(
+            &client,
+            "s",
+            user("u"),
+            "m",
+            &GenerateOptions {
+                max_tokens: Some(16),
+            },
+        )
+        .await
+        .expect("success");
+        assert_eq!(answer, None, "no text block is no answer");
+        let body: serde_json::Value =
+            serde_json::from_str(&server.await.expect("server task").body).expect("JSON body");
+        assert_eq!(
+            body["max_tokens"], 16,
+            "the request's limit wins over the provider's"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_event_in_the_stream_fails_the_request() {
+        let (addr, _server) = serve_once(|_request, mut stream| async move {
+            start_event_stream(&mut stream).await;
+            send(&mut stream, HELLO).await;
+            send(
+                &mut stream,
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            )
+            .await;
+        })
+        .await;
+        let client = provider(addr).client().expect("client");
+        let mut seen = String::new();
+        let err = stream_text(
+            &client,
+            "s",
+            user("u"),
+            "m",
+            &GenerateOptions::default(),
+            &mut |t| seen.push_str(t),
+        )
+        .await
+        .expect_err("a mid-stream overload must not look like a short answer");
+        assert_eq!(
+            err.to_string(),
+            "overloaded_error: Overloaded",
+            "the provider's error is reported"
+        );
+        assert_eq!(seen, "Hel", "text before the error was delivered");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_before_message_stop_is_an_error() {
+        let (addr, _server) = serve_once(|_request, mut stream| async move {
+            start_event_stream(&mut stream).await;
+            send(&mut stream, HELLO).await;
+        })
+        .await;
+        let client = provider(addr).client().expect("client");
+        let err = stream_text(
+            &client,
+            "s",
+            user("u"),
+            "m",
+            &GenerateOptions::default(),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("a cut-off answer is not a complete one");
+        assert!(matches!(err, LlmError::Network(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_complete_stream_returns_the_text() {
+        let (addr, _server) = serve_once(|_request, mut stream| async move {
+            start_event_stream(&mut stream).await;
+            send(&mut stream, HELLO).await;
+            send(
+                &mut stream,
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )
+            .await;
+        })
+        .await;
+        let client = provider(addr).client().expect("client");
+        let answer = stream_text(
+            &client,
+            "s",
+            user("u"),
+            "m",
+            &GenerateOptions::default(),
+            &mut |_| {},
+        )
+        .await
+        .expect("a complete stream succeeds");
+        assert_eq!(answer.as_deref(), Some("Hello"));
     }
 }

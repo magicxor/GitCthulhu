@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::{config::InstallerConfig, http::create_client};
 
-/// Release information from the GitButler API
+/// Release information from the release API
 #[derive(Debug, Deserialize)]
 pub struct Release {
     pub version: String,
@@ -70,7 +70,7 @@ pub(crate) fn fetch_release(config: &InstallerConfig) -> Result<Release> {
         .context("Failed to get effective URL")?
         .ok_or_else(|| anyhow!("Effective URL is missing"))?;
 
-    validate_api_url(effective_url).with_context(|| {
+    validate_api_url(effective_url, config.source.host()).with_context(|| {
         format!("Release API was redirected to an untrusted URL: {effective_url}")
     })?;
 
@@ -91,10 +91,10 @@ pub(crate) fn fetch_release(config: &InstallerConfig) -> Result<Release> {
     Ok(release)
 }
 
-/// Common URL validation logic for GitButler domains.
+/// Common URL validation logic for release URLs.
 ///
 /// Validates HTTPS protocol, parses URL, and checks the host against a predicate.
-fn validate_gitbutler_url(
+fn validate_release_url(
     url: &str,
     url_type: &str,
     is_host_valid: impl Fn(&str) -> bool,
@@ -113,32 +113,29 @@ fn validate_gitbutler_url(
 
     // Validate host using the provided predicate
     if !is_host_valid(host) {
-        bail!("{url_type} is not from a trusted GitButler domain: {url}");
+        bail!("{url_type} is not from the trusted release host: {url}");
     }
 
     Ok(())
 }
 
-/// Validates that an API URL is from the trusted API domain.
+/// Validates that an API URL is served by `trusted_host`, the host of the configured release URL.
 ///
-/// API endpoints should only be served from app.gitbutler.com to prevent
-/// redirecting API requests to other subdomains.
-pub(crate) fn validate_api_url(url: &str) -> Result<()> {
-    validate_gitbutler_url(url, "API URL", |host| host == "app.gitbutler.com")
+/// API endpoints may not be redirected to any other host, not even a subdomain.
+pub(crate) fn validate_api_url(url: &str, trusted_host: &str) -> Result<()> {
+    validate_release_url(url, "API URL", |host| host == trusted_host)
 }
 
-/// Validates that a download URL is from a trusted GitButler domain.
+/// Validates that a download URL is served by `trusted_host` or one of its subdomains.
 ///
-/// This is more permissive than API validation, allowing downloads from:
-/// - `gitbutler.com` (root domain)
-/// - Any `*.gitbutler.com` subdomain (e.g., `releases.gitbutler.com`, `cdn.gitbutler.com`)
-///
-/// This broader policy allows for operational flexibility (CDN distribution, mirrors, etc.)
-/// while maintaining security since all `*.gitbutler.com` subdomains are under GitButler's control.
-/// An attacker would need to compromise GitButler's DNS or infrastructure to exploit this.
-pub(crate) fn validate_download_url(url: &str) -> Result<()> {
-    validate_gitbutler_url(url, "Download URL", |host| {
-        host == "gitbutler.com" || host.ends_with(".gitbutler.com")
+/// This is more permissive than API validation to allow CDN distribution and mirrors below the
+/// release host (e.g. `cdn.<trusted_host>`), which are under the same operator's control.
+pub(crate) fn validate_download_url(url: &str, trusted_host: &str) -> Result<()> {
+    validate_release_url(url, "Download URL", |host| {
+        host == trusted_host
+            || host
+                .strip_suffix(trusted_host)
+                .is_some_and(|prefix| prefix.ends_with('.'))
     })
 }
 
@@ -146,47 +143,62 @@ pub(crate) fn validate_download_url(url: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The host of the test release URL; it is never contacted.
+    const HOST: &str = "releases.example.com";
+
     #[test]
     fn test_validate_api_url() {
-        // Valid API URLs - only app.gitbutler.com
-        assert!(validate_api_url("https://app.gitbutler.com/releases").is_ok());
-        assert!(validate_api_url("https://app.gitbutler.com/releases/nightly").is_ok());
-        assert!(validate_api_url("https://app.gitbutler.com/releases/version/0.18.7").is_ok());
+        // Valid API URLs - only the configured host
+        assert!(validate_api_url("https://releases.example.com/releases", HOST).is_ok());
+        assert!(validate_api_url("https://releases.example.com/releases/nightly", HOST).is_ok());
+        assert!(
+            validate_api_url("https://releases.example.com/releases/version/0.18.7", HOST).is_ok()
+        );
 
         // Invalid - wrong protocol
-        assert!(validate_api_url("http://app.gitbutler.com/releases").is_err());
+        assert!(validate_api_url("http://releases.example.com/releases", HOST).is_err());
 
-        // Invalid - wrong subdomain (even if trusted for downloads)
-        assert!(validate_api_url("https://releases.gitbutler.com/releases").is_err());
-        assert!(validate_api_url("https://gitbutler.com/releases").is_err());
-        assert!(validate_api_url("https://api.gitbutler.com/releases").is_err());
+        // Invalid - other hosts of the same domain (even if trusted for downloads)
+        assert!(validate_api_url("https://cdn.releases.example.com/releases", HOST).is_err());
+        assert!(validate_api_url("https://example.com/releases", HOST).is_err());
 
         // Invalid - untrusted domains
-        assert!(validate_api_url("https://evil.com/releases").is_err());
-        assert!(validate_api_url("https://app.gitbutler.com.evil.com/releases").is_err());
+        assert!(validate_api_url("https://evil.com/releases", HOST).is_err());
+        assert!(validate_api_url("https://releases.example.com.evil.com/releases", HOST).is_err());
     }
 
     #[test]
     fn test_validate_download_url() {
-        // Valid - root domain
-        assert!(validate_download_url("https://gitbutler.com/downloads/file.tar.gz").is_ok());
+        // Valid - the release host itself
+        assert!(validate_download_url("https://releases.example.com/file.tar.gz", HOST).is_ok());
 
-        // Valid - any *.gitbutler.com subdomain
-        assert!(validate_download_url("https://releases.gitbutler.com/file.tar.gz").is_ok());
-        assert!(validate_download_url("https://app.gitbutler.com/downloads/file.tar.gz").is_ok());
-        assert!(validate_download_url("https://cdn.gitbutler.com/file.tar.gz").is_ok());
-        assert!(validate_download_url("https://mirror.gitbutler.com/file.tar.gz").is_ok());
+        // Valid - any subdomain of the release host
+        assert!(
+            validate_download_url("https://cdn.releases.example.com/file.tar.gz", HOST).is_ok()
+        );
+        assert!(
+            validate_download_url("https://a.mirror.releases.example.com/file.tar.gz", HOST)
+                .is_ok()
+        );
 
         // Invalid - wrong protocol
-        assert!(validate_download_url("http://gitbutler.com/file.tar.gz").is_err());
-        assert!(validate_download_url("http://releases.gitbutler.com/file.tar.gz").is_err());
+        assert!(validate_download_url("http://releases.example.com/file.tar.gz", HOST).is_err());
+
+        // Invalid - parent domains and siblings
+        assert!(validate_download_url("https://example.com/file.tar.gz", HOST).is_err());
+        assert!(validate_download_url("https://other.example.com/file.tar.gz", HOST).is_err());
 
         // Invalid - subdomain spoofing attempts
-        assert!(validate_download_url("https://gitbutler.com.evil.com/file.tar.gz").is_err());
-        assert!(validate_download_url("https://evilgitbutler.com/file.tar.gz").is_err());
+        assert!(
+            validate_download_url("https://releases.example.com.evil.com/file.tar.gz", HOST)
+                .is_err()
+        );
+        assert!(
+            validate_download_url("https://evilreleases.example.com/file.tar.gz", HOST).is_err()
+        );
 
         // Invalid - untrusted domains
-        assert!(validate_download_url("https://evil.com/file.tar.gz").is_err());
+        assert!(validate_download_url("https://evil.com/file.tar.gz", HOST).is_err());
     }
 
     #[test]
@@ -195,7 +207,7 @@ mod tests {
             "version": "0.5.1",
             "platforms": {
                 "darwin-aarch64": {
-                    "url": "https://releases.gitbutler.com/file.tar.gz",
+                    "url": "https://releases.example.com/file.tar.gz",
                     "signature": "sig-darwin"
                 },
                 "windows-x86_64": {
@@ -212,7 +224,7 @@ mod tests {
 
         assert_eq!(
             darwin.url.as_deref(),
-            Some("https://releases.gitbutler.com/file.tar.gz")
+            Some("https://releases.example.com/file.tar.gz")
         );
         assert!(windows.url.is_none());
     }

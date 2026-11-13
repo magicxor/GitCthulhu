@@ -1,0 +1,33 @@
+# Milestone-2 integration (X7): the D0 additions together in one session on the clean "linear" fixture, dark theme,
+# 1280x720: the terminal panel running `git status`, Undo / Redo enabled after an operation (with its toast), the
+# update notice in the bottom bar, the history popover over the open terminal, and Settings > Environment with the
+# undo rows. Gitnuro's metrics must stay: tab strip 36, toolbar 64, panes 220 / centre / 330, bottom bar 32.
+# The scenario creates a branch: run it against a fresh sandbox (new-sandbox.ps1 -Force) every time.
+resize 1280x720
+set theme dark
+update serve 9.9.9 https://example.com/gitcthulhu/releases/v9.9.9
+wait idle
+open repository linear
+wait idle
+show terminal
+wait idle
+terminal input git status
+wait terminal shows nothing to commit
+assert terminal shows nothing to commit
+undo demo branch x7-session
+wait idle
+shot x7-01-terminal-undo-notice
+undo history open
+wait idle
+shot x7-02-history-over-terminal
+undo history close
+undo
+wait idle
+shot x7-03-after-undo-redo-enabled
+hide terminal
+wait idle
+open settings page environment
+wait idle
+shot x7-04-settings-environment-undo
+close dialog
+assert no error

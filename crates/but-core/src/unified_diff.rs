@@ -10,7 +10,6 @@ use super::{ChangeState, UnifiedPatch};
 
 /// A hunk as used in a [UnifiedPatch], which also contains all added and removed lines.
 #[derive(Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DiffHunk {
     /// The 1-based line number at which the previous version of the file started.
@@ -38,14 +37,8 @@ pub struct DiffHunk {
     /// Also note that this has possibly been decoded lossily, assuming UTF8 if the encoding couldn't be determined,
     /// replacing invalid codepoints with markers.
     #[serde(serialize_with = "but_serde::bstring_lossy::serialize")]
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(schema_with = "but_schemars::bstring_lossy")
-    )]
     pub diff: BString,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(DiffHunk);
 
 impl std::fmt::Debug for DiffHunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

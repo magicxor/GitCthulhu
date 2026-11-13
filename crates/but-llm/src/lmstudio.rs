@@ -1,6 +1,6 @@
+use crate::tool::Toolset;
 use anyhow::Result;
 use async_openai::{Client, config::OpenAIConfig};
-use but_tools::tool::Toolset;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
@@ -35,10 +35,10 @@ pub struct LMStudioProvider {
 }
 
 impl LMStudioProvider {
-    pub fn with(config: Option<LMStudioConfig>, model: Option<String>) -> Option<Self> {
+    pub fn with(config: Option<LMStudioConfig>, model: Option<String>) -> Self {
         let mut config = config.unwrap_or_default();
         config.api_base = normalize_api_base(&config.api_base);
-        Some(Self { config, model })
+        Self { config, model }
     }
 
     pub fn config(&self) -> &LMStudioConfig {
@@ -62,6 +62,10 @@ impl OpenAIClientProvider for LMStudioProvider {
             .with_api_key("lm-studio");
 
         Ok(Client::with_config(open_ai_config))
+    }
+
+    fn response_start_timeout(&self) -> std::time::Duration {
+        crate::http::LOCAL_RESPONSE_START_TIMEOUT
     }
 }
 

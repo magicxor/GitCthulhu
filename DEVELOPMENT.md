@@ -1,482 +1,182 @@
-# How to Hack on GitButler
+# Developing GitCthulhu
 
-Alrighty, you want to get compiling. We love you already. Your parents raised
-you right. Let's get started.
+GitCthulhu is one Rust workspace (`crates/`). [`crates/AGENTS.md`](crates/AGENTS.md) holds the engineering rules;
+[`AGENTS.md`](AGENTS.md) the rules for agents working on this checkout.
 
----
+## Workspace layout
 
-## Table of Contents
+| Group | Crates |
+| --- | --- |
+| GUI | `gitcthulhu`: the binary (gpui-kit 0.7.3, pinned), plus the helper programs `gitcthulhu-askpass` and `gitcthulhu-editor` |
+| Git backend | `gitcthulhu-git`: plain-Git backend, blocking API, no GPUI; `gitcthulhu-oplog`: snapshot undo/redo |
+| Services | `gitcthulhu-services`: forge, AI and update services over the crates below, no GPUI |
+| Preserved from GitButler | `but-forge`, `but-forge-storage`, `but-github`, `but-gitlab`, `but-bitbucket`, `but-secret` (forges and keychain), `but-llm` (AI), `but-tty` (terminal emulation, libghostty-vt), `but-update`, `but-installer`, `but-db` |
+| Git core and support | `but-core` (snapshots for the oplog; GitButler-era tests with known failures), `gitbutler-git` (askpass harness), `gitbutler-filemonitor` (+ `gitbutler-notify-debouncer`), `but-error`, `but-serde`, `but-utils`, `but-path`, `but-project-handle`, `but-askpass`, `but-testsupport` |
 
-- [Overview](#overview)
-- [CLI-only development](#cli-only-development)
-- [The Basics](#the-basics)
-  - [Prerequisites](#prerequisites)
-  - [Install JavaScript dependencies](#install-javascript-dependencies)
-  - [Run the app](#run-the-app)
-  - [Lint & format](#lint--format)
-- [Debugging](#debugging)
-  - [Logs](#logs)
-  - [Repository](#Repository)
-  - [Tokio](#tokio)
-- [Troubleshooting](#troubleshooting)
-- [Building](#building)
-  - [Building on Windows](#building-on-windows)
-    - [Perl](#perl)
-    - [Crosscompilation](#crosscompilation)
-- [Design](#design)
-- [Contributing](#contributing)
-- [Some Other Random Notes](#some-other-random-notes)
-  - [Icon generation](#icon-generation)
-  - [Release](#release)
-  - [Versioning](#versioning)
-  - [Publishing](#publishing)
-- [Development mode OAuth login](#development-mode-oauth-login)
-- [Joining the GitButler Team](#joining-the-gitbutler-team)
+`but-path`, `but-project-handle`, `but-askpass` and `but-installer` have no dependents in the workspace.
 
----
+## Git engine policy
 
-## Overview
+- Reads (status, diff, log and graph walk, refs, blame, file history, config) run in-process through `gix`.
+- Mutations (commit, checkout, merge, rebase, cherry-pick, revert, reset, stash, tag, branch, remote, submodule,
+  worktree, clone, fetch, pull, push) run the `git` executable (2.34.1 or newer) with askpass-based credential
+  prompts, so hooks run natively; `--no-verify` is only passed for an explicit "Retry without hooks".
+- Whole-file staging runs `git add` / `git restore` / `git rm`; hunk and line staging is an in-process index edit
+  under `index.lock` after a stale check.
+- No `git2`/libgit2.
 
-So how does this whole thing work?
+## Prerequisites
 
-It's a [Tauri app](https://tauri.app/), which is basically like an Electron app,
-in that we can develop a desktop app from one source with multiple OS targets
-and write the UI in HTML and Javascript. Except instead of Node for the
-filesystem access part, Tauri uses [Rust](https://www.rust-lang.org/).
+- Rust, as pinned in `rust-toolchain.toml` (install with rustup).
+- Windows: the Windows SDK (provides `fxc.exe`).
+- Zig 0.17 on `PATH`: `but-tty` builds libghostty-vt with it, and its build script clones the Ghostty sources at the
+  pinned commit (network and `git` needed on the first build; `GHOSTTY_SOURCE_DIR` points it at a local checkout
+  instead). The GUI's default `terminal` feature depends on `but-tty`, so `--exclude but-tty` alone does not help.
+  Without Zig use `cargo check --workspace --exclude but-tty --exclude gitcthulhu` plus `cargo check -p gitcthulhu
+  --no-default-features --features services` for the GUI; the Terminal button is then disabled.
+- Linux: `libxcb1-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev
+  libfreetype-dev libssl-dev pkg-config`. CI and the Docker image also install `libdbus-1-dev`
+  (`scripts/install-minimal-debian-dependencies.sh`), although no crate of the current dependency graph links it.
+- Optional: `cargo-nextest` (`make test`); `nix develop` gives Rust, Zig, nextest, cargo-deny and a few tools, but
+  not the Linux GUI libraries above.
 
-So everything that hits disk is in Rust, everything that the
-user sees is in HTML/JS. Specifically we use [Svelte](https://svelte.dev/)
-in Typescript for that layer.
+## Everyday commands
 
-For a deep dive into the architecture, see [DEEPWIKI](https://deepwiki.com/gitbutlerapp/gitbutler).
-
----
-
-## CLI-only development
-
-The easiest way to get started is by hacking on the `but` CLI.
-
-You only need Rust installed…[^cli-build-prereqs]
-
-```bash
-$ cd gitbutler-repo
-$ curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf | sh
+```sh
+make            # fmt, fmt-check, check, clippy (the whole workspace: needs Zig)
+make test       # cargo nextest run --workspace --exclude but-core
+cargo test --workspace --exclude but-core
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt
 ```
 
-…to build and run the CLI:
+`but-core` still carries GitButler-era tests with known failures (on Windows its fixtures need Unix shell scripts;
+on Linux three ref-name tests fail), so the commands above exclude it. CI runs it separately and non-blocking:
+`cargo test -p but-core` (`make test-legacy`).
 
-```bash
-$ cargo build -p but
-$ cargo run -p but -- --help
-$ cargo run -p but -- -C /path/to/git-repo status
+`scripts/cargo-test.sh` deletes generated fixtures before running tests. `scripts/clean.sh` deletes the generated
+fixtures, and with `--target` also `target/` (never in a main checkout that seeds agent worktrees).
+
+CI (`.github/workflows/ci.yaml`): fmt; clippy, check, the terminal-free GUI check and the tests on Windows, Linux and
+macOS; the `gitcthulhu-git` suite in an Ubuntu 22.04 container with Git 2.34.1 and a German locale. It has not run
+yet for this branch (never pushed).
+
+## Build tooling for parallel worktrees
+
+- `tools/dev/seed-target.ps1` copies the main checkout's compiled dependencies into a fresh worktree's `target/`, so
+  only the workspace crates are compiled there. The main checkout's `target/` is the seed: never `cargo clean` it.
+- `.cargo/config.toml` sets `--cfg tokio_unstable` for Tokio diagnostics; `[profile.dev]` keeps line tables only for
+  the workspace crates.
+
+## Linux runner (Docker)
+
+`pwsh -NoProfile -File tools/dev/linux-test.ps1 <cargo arguments>` runs cargo for this checkout in a container
+(image `gitcthulhu-linux-dev:<toolchain>-<hash>`, rust:1-trixie with the Linux packages and Zig, user uid 1000). Build
+state lives in named volumes: `gitcthulhu-target-main-<hash>` for the main checkout,
+`gitcthulhu-target-wt-<folder>-<hash>` for a worktree, and the shared `gitcthulhu-cargo-home`. `--git-min` uses a
+second image built from ubuntu:22.04 (Git 2.34.1) with its own volumes. `--update` refreshes the image,
+`--drop-volume` deletes a worktree's volume, `--gc` deletes the volumes of worktrees that no longer exist,
+`--prune-images` deletes other tags of the image. The script header documents every option. Examples:
+
+```powershell
+pwsh -NoProfile -File tools/dev/linux-test.ps1 test --workspace --exclude but-core
+pwsh -NoProfile -File tools/dev/linux-test.ps1 --git-min test -p gitcthulhu-git
 ```
 
-To test only the CLI:
+## QA runner: screenshots of the real window (Windows)
 
-```bash
-$ cargo test -p but
+Headless gpui tests (`#[gpui_kit::test]`) check element bounds against the layout specs. To see the real window, the
+`qa` feature adds an in-process scenario runner (`crates/gitcthulhu/src/qa`, `tools/qa`): the app drives itself
+through its own actions, waits until it is idle and captures its own window with `PrintWindow` into PNG files. No OS
+input is injected. Screen capture is implemented for Windows only.
+
+```powershell
+pwsh -NoProfile -File tools\qa\new-sandbox.ps1 -Dest <a folder below "scratch" or %TEMP%>\sbx
+pwsh -NoProfile -File tools\qa\run-gui.ps1 -Sandbox <sbx> -Scenario tools\qa\scenarios\main-window.qa
+pwsh -NoProfile -File tools\qa\run-credential-flow.ps1 -Sandbox <sbx>    # push through a local http server
 ```
 
-Useful locations in the source tree:
+The sandbox holds synthetic fixture repositories and the app data of the run; a qa build refuses to start outside
+one (no network, no real profile). `run-gui.ps1` builds with `--features qa`, writes `report.txt` (one PASS/FAIL/SKIP
+line per step), `verbs.txt` (the scenario language of the build) and the screenshots into `<sbx>\out\<scenario>`.
+Exit codes: 0 passed, 1 a step failed, 2 usage error, 3 the sandbox gate refused, 101 panic (`panic.txt`), 124
+timeout, 125 no report. The scenarios in `tools/qa/scenarios` cover the welcome page, the main window, dialogs,
+rebase, undo, terminal, AI, forge, worktrees, update notice and credentials. `AGENTS.md` describes the scenario
+language and how to add verbs. Never run a qa build outside `run-gui.ps1`.
 
-- `crates/but/src/args` for CLI argument parsing and help text
-- `crates/but/src/command` for command implementations
-- `crates/but/tests` for integration tests
+## Performance tests
 
-[^cli-build-prereqs]:
-    In practice, `cargo build -p but` also builds native
-    dependencies such as `git2` with vendored `openssl` and `libgit2`, so you
-    still need a working C toolchain. On Linux, that commonly means tools such
-    as `build-essential`, `make`, `perl`, `cmake`, and `pkg-config`; on macOS,
-    install Xcode Command Line Tools. On Windows, you’ll need a working
-    MSVC-based toolchain and related native dependencies; see
-    [Building on Windows](#building-on-windows) below for details (including
-    `perl` for `openssl-sys`). If you already completed the desktop
-    prerequisites in [The Basics](#the-basics), you already have the stricter setup.
-    If you already completed the desktop prerequisites in [The Basics](#the-basics) below,
-    you already have the stricter setup.
+The budgets are in spec 20 §9 (backend) and 21 §4.1 (GUI). The perf tests are `#[ignore]`d; they print their
+measurements and assert the budget only with `GITCTHULHU_PERF_ASSERT=1`. Run them in release, one at a time, on a
+quiet machine, and judge by the median of several runs:
 
-## The Basics
-
-OK, let's get it running.
-
-### Prerequisites
-
-First of all, this is a Tauri app, which uses Rust for the backend and Javascript for the frontend. So let's make sure you have all the prerequisites installed.
-
-1. Tauri Dev Deps (https://tauri.app/start/prerequisites/#system-dependencies)
-
-On Mac OS, ensure you've installed XCode and `cmake`. On Linux, if you're on Debian or one of its derivatives like Ubuntu, you can use the following command.
-
-<details>
-<summary>Linux Tauri dependencies</summary>
-
-```bash
-$ sudo apt update
-$ sudo apt install libwebkit2gtk-4.1-dev \
-  build-essential \
-  curl \
-  wget \
-  file \
-  libxdo-dev \
-  libssl-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  cmake
+```sh
+GITCTHULHU_PERF_ASSERT=1 cargo test --release -p gitcthulhu-git --test perf -- --ignored --exact perf_repo_open --nocapture
+GITCTHULHU_PERF_ASSERT=1 cargo test --release -p gitcthulhu-git --test status -- --ignored perf_status_100k_files --nocapture
+cargo test --release -p gitcthulhu-oplog --test restore -- --ignored perf --nocapture
+cargo test --release -p gitcthulhu --lib diff_50k -- --ignored
 ```
 
-</details>
-
-2. Rust
-
-For both Mac OS and Linux, you can use the following `rustup` quick install script to get all the necessary tools.
-
-```bash
-$ cd gitbutler-repo
-$ curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf | sh
-```
-
-3. pnpm
-
-Install standalone pnpm using the [pnpm installation instructions](https://pnpm.io/installation#using-a-standalone-script).
-It provides Node.js.
-
-### Install JavaScript dependencies
-
-From the repository root, install the JavaScript dependencies. This also installs the project's Node.js runtime:
-
-```bash
-$ pnpm install
-```
-
-Re-run it when dependencies change.
-Run project commands through `pnpm` scripts or `pnpm exec` to use that runtime.
-
-> [!NOTE]  
-> We use [turborepo](https://turbo.build/repo) as our monorepo tooling and by default Vercel collects some [basic telemetry](https://turbo.build/repo/docs/telemetry). If you'd like to disable this, please run `pnpm exec turbo telemetry disable` once in the project's root directory after installing dependencies.
-
-### Run the app
-
-First, run cargo build such that supplementary bins such as `gitbutler-git-askpass` are created (Note the default folder (`target`) will be used for the build):
-
-```bash
-$ cargo build
-```
-
-Now you should be able to run the app in development mode:
-
-```bash
-$ pnpm dev:desktop
-```
-
-By default it will not print debug logs to console. If you want debug logs, set `LOG_LEVEL` environment variable:
-
-```bash
-$ LOG_LEVEL=debug pnpm dev:desktop
-```
-
-### Lint & format
-
-In order to have a PR accepted, you need to make sure everything passes our
-Linters, so make sure to run these before submitting. Our CI will shame you
-if you don't.
-
-Javascript:
-
-```bash
-$ pnpm lint
-$ pnpm format
-```
-
-Rust:
-
-```bash
-$ cargo clippy   # see linting errors
-$ cargo fmt      # format code
-```
-
----
+`tests/perf.rs` holds the log, refs, commit details, blame and file history tests (sizes overridable through
+`GITCTHULHU_PERF_*`, see its header); status, graph, diff and stage have theirs next to their modules. CI does not
+run them.
 
 ## Debugging
 
-Now that you have the app running, here are some hints for debugging whatever
-it is that you're working on.
-
-### Logs
-
-The app writes logs into:
-
-1. `stdout` in development mode
-2. The Tauri [logs](https://tauri.app/v1/api/js/path/#platform-specific) directory
-
-One can get performance log when launching the application locally as follows:
-
-```bash
-GITBUTLER_PERFORMANCE_LOG=1 LOG_LEVEL=debug pnpm tauri dev
-```
-
-For more realistic performance logging, use local release builds with `--release`.
-
-```bash
-GITBUTLER_PERFORMANCE_LOG=1 LOG_LEVEL=debug pnpm tauri dev --release
-```
-
-### Repository
-
-Often the behaviour depends on the current context: the repository being displayed. Next to _logs_, it's useful to learn how it's structured.
-
-To do that, _launch the application from a terminal_ as shown in the paragraph above this one, or right below, but with `graphviz` installed.
-The `dot` program should be available in `PATH` so it can run from the terminal.
-
-Doing so can look like this on macOS, for example:
-
-###### For the stable build
-
-```shell
-GITBUTLER_PERFORMANCE_LOG=1 /Applications/GitButler/Contents/MacOS/gitbutler-tauri
-```
-
-###### For the nightly build
-
-```shell
-GITBUTLER_PERFORMANCE_LOG=1 /Applications/GitButler\ Nightly.app/Contents/MacOS/gitbutler-tauri
-```
-
-###### Producing a commit-graph visualization
-
-Then, within the application, type `dot` in any non-editable portion of the GUI, like the cheat code that it is.
-This will pop open an SVG version of the graph that GitButler uses to create the workspace projection.
-
-### Tokio
-
-We are also collecting tokio's runtime tracing information that could be viewed using [tokio-console](https://github.com/tokio-rs/console#tokio-console-prototypes):
-
-- development:
-  ```bash
-  $ tokio-console
-  ```
-- nightly:
-  ```bash
-  $ tokio-console http://127.0.0.1:6668
-  ```
-- production:
-  ```bash
-  $ tokio-console http://127.0.0.1:6667
-  ```
-
----
-
-## Troubleshooting
-
-Common issues and solutions when developing GitButler.
-
-### Turbo/build issues
-
-#### Case-sensitive volume problems
-
-If you're experiencing issues with the `dev:desktop` target failing to start, especially on macOS with case-sensitive filesystems, this may be related to Turborepo's handling of case-sensitive volumes.
-
-**Solution:** See the related issue at [vercel/turborepo#8491](https://github.com/vercel/turborepo/issues/8491) for current workarounds.
-
-#### Turbo daemon issues
-
-If builds are hanging or behaving unexpectedly:
-
-```bash
-# Stop the turbo daemon
-pnpm exec turbo daemon stop
-
-# Clear turbo cache
-pnpm exec turbo daemon clean
-
-# Restart development
-pnpm dev:desktop
-```
-
-### Cache issues
-
-If you're seeing stale builds or unexpected behavior:
-
-```bash
-rm -rf .turbo node_modules
-pnpm install
-# Optional (Rust artifacts):
-cargo clean
-```
-
-### Additional resources
-
-For issues specific to our toolchain components:
-
-- [Turborepo issues](https://github.com/vercel/turborepo/issues)
-- [Tauri issues](https://github.com/tauri-apps/tauri/issues)
-
-If none of these solutions work, please check our [GitHub Issues](https://github.com/gitbutlerapp/gitbutler/issues) or create a new issue with detailed information about your system and the error you're encountering.
-
----
-
-## Building
-
-To build the app in production mode, run:
-
-```bash
-$ pnpm tauri build --features devtools,builtin-but,disable-auto-updates,nightly --config crates/gitbutler-tauri/tauri.conf.nightly-local.json
-```
-
-This will make an asset similar to our nightly build.
-
-### Building on Windows
-
-Building on Windows is a bit of a tricky process. Here are some helpful tips.
-
-#### Perl
-
-A Perl interpreter is required to be installed in order to configure the `openssl-sys`
-crate. We've used [Strawberry Perl](https://strawberryperl.com/) without issue.
-Make sure it's installed and `perl` is available on the `PATH` (it is by default
-after installation, just make sure to restart the terminal after installing).
-[Scoop](https://scoop.sh/) users can install this via `scoop install perl`.
-
-Note that it might appear that the build has hung or frozen on the `openssl-sys` crate.
-It's not, it's just that Cargo can't report the status of a C/C++ build happening
-under the hood, and openssl is _large_. It'll take a while to compile.
-
-#### OpenSSL
-
-To build it, one needs to export the path to the perl installation to use.
-The line below will do the trick in a git-bash.
-
-```bash
-export OPENSSL_SRC_PERL="c:/Strawberry/perl/bin/perl.exe"
-```
-
-To make this change permanent, one would one can add this change (and others) to the `~/.bash_profile`.
-
-```bash
-echo 'export OPENSSL_SRC_PERL="c:/Strawberry/perl/bin/perl.exe"' >> ~/.bash_profile
-```
-
-#### Crosscompilation
-
-This paragraph is about crosscompilation to x86_64-MSVC from ARM Windows,
-a configuration typical for people with Apple Silicon and Parallels VMs,
-which only allow ARM Windows to be used.
-
-The `windows` dependency on `gitbutler-git` doesn't currently compile on ARM,
-which means cross-compilation to x86-64 is required to workaround that. Besides,
-most users will probably still be on INTEL machines, making this capability
-a common requirement.
-
-In a Git `bash`, _with MSVC for x86-64 installed on the system_, run the following
-to prepare the environment.
-
-```bash
-export TRIPLE_OVERRIDE=x86_64-pc-windows-msvc
-export CARGO_BUILD_TARGET=x86_64-pc-windows-msvc
-# for good measure
-export OPENSSL_SRC_PERL="c:/Strawberry/perl/bin/perl.exe"
-```
-
-Here is how to produce a nightly release build:
-
-```
-pnpm tauri build --features windows,devtools,nightly --config  crates/gitbutler-tauri/tauri.conf.nightly.json
-```
-
-And this is how to get a local developer debug build:
-
-```bash
-pnpm tauri dev --features windows --target x86_64-pc-windows-msvc
-```
-
-Note that it's necessary to repeat the `--target` specification as otherwise the final copy operation doesn't work,
-triggered by `tauri` itself.
-
----
-
-## Design
-
-We use [Figma](https://www.figma.com/) for our design work.
-If you're a designer (and even if you're not), you want to contribute to the
-design of GitButler, or your work involves UI, you could duplicate our design file.
-
-GitButler design: [Figma file](https://www.figma.com/file/FbeLt0yjY9RiNn8MXUXsYs/Client-Design?type=design&node-id=0%3A1&mode=design&t=MUDQhR3iOM3DpI9m-1) 🎨
-
----
-
-## Contributing
-
-Now that you're up and running, if you want to change something and open a PR
-for us, make sure to read [CONTRIBUTING.md](CONTRIBUTING.md) to make sure you're
-not wasting your time.
-
----
-
-## Some Other Random Notes
-
-Most of this is for internal GitButler use, but maybe everyone else will find
-it interesting too.
-
----
-
-### Icon generation
-
-I always forget how to do this, but when we update our app icon, run this to
-import it.
-
-```bash
-$ pnpm tauri icon path/to/icon.png
-```
-
-### Release
-
-Building is done via [GitHub Action](https://github.com/gitbutlerapp/gitbutler/actions/workflows/publish.yaml).
-Go to the link and select `Run workflow` from the desired branch.
-
-### Versioning
-
-When running the [release action](https://github.com/gitbutlerapp/gitbutler/actions/workflows/publish.yaml),
-you will have to choose one of `major`, `minor`, or `patch` release type. Action will generate a new version based on your input and current
-version found at `https://app.gitbutler.com/releases`.
-
-### Publishing
-
-To publish a version that you've just build, use [Release Manager](https://gitbutler.retool.com/apps/cb9cbed6-ae0a-11ed-918c-736c4335d3af/Release%20Manager).
-
----
-
-## Development mode OAuth login
-
-By default, you will not be able to log into GitButler using Github/Google because the base url does not match. To be able to do this add ( or update ) the following line to your `.env.development` file. You will need to create the file if it does not exist.
-
-```
-PUBLIC_API_BASE_URL=https://app.gitbutler.com/
-```
-
-The desktop frontend and local backend both honor `PUBLIC_API_BASE_URL`. If you
-need a backend-only override while debugging, `GITBUTLER_API_URL` still takes
-precedence on the Rust side.
-
-When you start the desktop app with `pnpm dev:desktop`, the Tauri launcher now
-loads `apps/desktop/.env`, `.env.local`, `.env.development`, and
-`.env.development.local` into the Rust process as well, so the frontend and
-backend see the same local overrides by default.
-
----
-
-## Joining the GitButler Team
-
-If you are interested in joining our small but tightly knit engineering team, we are currently looking for the following roles:
-
-- [Senior Rust developer](https://jobs.gitbutler.com/jobs/backend-rust) (SF, Berlin or Remote)
-- [Senior TypeScript developer](https://jobs.gitbutler.com/jobs/frontend-typescript) (SF, Berlin or Remote)
-- [Gerrit developer](https://jobs.gitbutler.com/jobs/gerrit-developer) (SF, Berlin or Remote)
-
-## Code Hitlist
-
-This is a list of crates/modules that we want to eliminate or split into smaller crates:
-
-- [gitbutler-reference](crates/gitbutler-reference/) (just bad)
-- [gitbutler-branch-actions](crates/gitbutler-branch-actions/) (contains functionality outside of the virtual branch domain (e.g. commit actions etc.))
-- [gitbutler-branch](crates/gitbutler-branch/) (contains `diff` and `branch` contexts due to a cyclic dependency)
-- [gitbutler_repo::config](crates/gitbutler-repo/src/config.rs) (seems like the wrong abstraction)
+- Logs honour `RUST_LOG` and go to the log file below. A Windows release build has no console
+  (`windows_subsystem = "windows"`), so output only reaches the log file there.
+- `GITCTHULHU_HOME` redirects all application directories (the tests and the QA sandbox use it).
+
+## Where GitCthulhu keeps its data
+
+| What | Location |
+| --- | --- |
+| Config: `settings.json`, `state.json`, `repos.json` | `dirs::config_dir()/gitcthulhu` (`%APPDATA%\gitcthulhu`, `~/.config/gitcthulhu`, `~/Library/Application Support/gitcthulhu`) |
+| Data (forge storage, ...) | `dirs::data_local_dir()/gitcthulhu` (`%LOCALAPPDATA%\gitcthulhu`, `~/.local/share/gitcthulhu`, `~/Library/Application Support/gitcthulhu`) |
+| Logs: `gitcthulhu.log`, rotated at 10 MB, 5 files kept | `<data>/logs` |
+| Cache | `dirs::cache_dir()/gitcthulhu` (`%LOCALAPPDATA%\gitcthulhu`, `~/.cache/gitcthulhu`, `~/Library/Caches/gitcthulhu`) |
+
+On Windows data and cache are the same folder. `GITCTHULHU_HOME` replaces all of them by `config`, `data`, `logs`
+and `cache` below it. Attach `gitcthulhu.log` to bug reports.
+
+- **Inside your repositories**: the undo log is kept as Git objects under `refs/gitcthulhu/oplog/main` (a linked
+  worktree uses `refs/gitcthulhu/oplog/linked/<id>`), and the commit message draft in
+  `.git/gitcthulhu/commit-draft`. Inspect the refs with `git for-each-ref refs/gitcthulhu`; remove one with `git
+  update-ref -d <ref>` (this drops the undo history of that repository; `git gc` then frees the objects).
+- **OS keychain**: forge tokens, AI provider keys and the proxy password are stored in the OS keychain (service
+  names start with `gitcthulhu-`, user name `GitCthulhu`), never in the files above.
+- **Reset**: close the application and delete the directories above. To remove everything, also delete the
+  keychain entries and the `refs/gitcthulhu` refs.
+
+## Build configuration
+
+Compile-time variables are read with `option_env!`/`env!`, so they must be set in the environment of the
+`cargo build` process; changing one needs a rebuild.
+
+| Variable | Effect |
+| --- | --- |
+| `GITCTHULHU_GITHUB_CLIENT_ID` | GitHub OAuth app client id. Unset or empty: GitHub device-flow sign-in is disabled. |
+| `GITCTHULHU_UPDATE_MANIFEST_URL` | Update manifest URL (`{channel}` is replaced by `release` or `nightly`). Unset or empty: update checks and the update notice are disabled. |
+| `GITCTHULHU_CHANNEL` | Icon set of the Windows executable (`assets/app-icon/<channel>`, default `release`). |
+
+A release build needs the first two set; without them it silently lacks GitHub sign-in and update checks.
+
+Features of the `gitcthulhu` crate:
+
+| Feature | Meaning |
+| --- | --- |
+| `terminal` (default) | Embedded terminal (`but-tty`; needs Zig 0.17) |
+| `services` (default) | Forge, AI and update services; without it `start_services` fails with "built without integrations" |
+| `qa` | In-process QA scenario runner and screenshots (`tools/qa`); never in releases |
+| `test-support` | gpui-kit test support, tests only |
+| `gpui-fast` | gpui-kit benchmark passthrough only |
+
+## Installer and updater
+
+`but-installer` (with `scripts/install.sh`) and `but-update` have no built-in endpoints. The installer needs
+`GITCTHULHU_RELEASE_URL` (release API base URL) and `GITCTHULHU_RELEASE_PUBLIC_KEY` (minisign key of the releases),
+the bootstrap script additionally `GITCTHULHU_INSTALLER_URL`; release information is only accepted from the
+configured host, downloads also from its subdomains, always over HTTPS. The macOS installer expects a
+`GitCthulhu.app` bundle with `Contents/MacOS/{gitcthulhu,gitcthulhu-askpass,gitcthulhu-editor}`, the Linux one a
+`gitcthulhu` binary (plus `gitcthulhu.sig`) next to the platform download. The release pipeline that publishes these
+does not exist yet, and the bootstrap script downloads the installer without a signature check.

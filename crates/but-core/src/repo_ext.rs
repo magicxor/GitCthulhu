@@ -1,3 +1,4 @@
+use crate::GitConfigSettings;
 use anyhow::Context as _;
 use bstr::BStr;
 use but_error::Code;
@@ -9,9 +10,6 @@ use gix::{
         transaction::{PreviousValue, RefEdit},
     },
 };
-use std::path::PathBuf;
-
-use crate::{GitConfigSettings, commit::TreeKind};
 
 /// Update `HEAD` to `new_target` and write a reflog entry composed from `operation`, `message`,
 /// and `num_parents`.
@@ -22,7 +20,7 @@ use crate::{GitConfigSettings, commit::TreeKind};
 /// keeping `HEAD` symbolic.
 ///
 /// If `deref` is `false`, update `HEAD` itself. This is what you want when changing which branch
-/// `HEAD` symbolically points to, such as switching it to `refs/heads/gitbutler/edit`.
+/// `HEAD` symbolically points to, such as switching it to `refs/heads/feature`.
 pub fn update_head_reference(
     repo: &gix::Repository,
     new_target: Target,
@@ -44,35 +42,17 @@ pub fn update_head_reference(
     )?)
 }
 
-/// Easy access of settings relevant to GitButler for retrieval and storage in Git settings.
+/// Easy access of repository settings and merge helpers on top of [`gix::Repository`].
 pub trait RepositoryExt: Sized {
     /// Returns a bundle of settings by querying the git configuration itself, assuring fresh data is loaded.
     fn git_settings(&self) -> anyhow::Result<GitConfigSettings>;
-    /// Return the path to store per-project GitButler data, which is guaranteed to be inside
-    /// of the `.git` directory, or in a unique folder outside of it.
-    ///
-    /// Resolution:
-    /// * `gitbutler.storagePath` on release builds, or `gitbutler.<channel>.storagePath`
-    ///   on non-release builds, with values like `gitbutler-alt`, `gitbutler-alt/nested`, or
-    ///   `~/gitbutler-projects`.
-    /// * If it is relative, it is interpreted relative to [`gix::Repository::git_dir`].
-    ///   Paths that stay inside `.git` must live under a top-level directory whose name starts
-    ///   with `gitbutler`.
-    /// * If the resolved path is outside of [`gix::Repository::git_dir`], the storage path
-    ///   becomes `<configured-path>/<project-handle>` so multiple projects can share one base path
-    ///   without clobbering each other. This also applies to relative paths like `../../shared`.
-    /// * Otherwise defaults to `<git-dir>/gitbutler` on all channels.
-    //    The idea is to support one storage location per channel once we can make sure that the previously
-    //    used metadata doesn't get lost, like the target branch, for instance by copying it over from stable.
-    fn gitbutler_storage_path(&self) -> anyhow::Result<PathBuf>;
     /// Set all fields in `config` that are not `None` to disk into local repository configuration, or none of them.
     fn set_git_settings(&self, config: &GitConfigSettings) -> anyhow::Result<()>;
     /// Return all signatures that would be needed to perform a commit as configured in Git: `(author, committer)`.
     fn commit_signatures(&self) -> anyhow::Result<(gix::actor::Signature, gix::actor::Signature)>;
 
-    /// Cherry-pick the changes in the tree of `to_rebase_commit_id` onto `new_base_commit_id`.
-    /// This method deals with the presence of conflicting commits to select the correct trees
-    /// for the cheery-pick merge.
+    /// Cherry-pick the changes in the tree of `to_rebase_commit_id` onto `new_base_commit_id`,
+    /// using the tree of its first parent (or the empty tree for a root commit) as merge base.
     /// Use `merge_options` to control how the underlying merge should be performed. This is useful
     /// to either make it always work, or to accept merge conflicts.
     /// Return the cherry-picked tree only, leaving the caller with embedding it into a new commit.
@@ -90,7 +70,8 @@ pub trait RepositoryExt: Sized {
     /// Create a tree that represents the current worktree and index state on top of `HEAD^{tree}`.
     ///
     /// This includes conflicted index entries and optionally skips untracked files larger than
-    /// `untracked_limit_in_bytes` if that limit is non-zero.
+    /// `untracked_limit_in_bytes` if that limit is non-zero, without reading or hashing them.
+    /// Tracked files are never subject to the limit.
     #[deprecated = "Gitizen alert: Do not soak up the entire working tree including untracked files, find a different solution"]
     fn create_wd_tree(&self, untracked_limit_in_bytes: u64) -> anyhow::Result<gix::ObjectId>;
 
@@ -143,10 +124,6 @@ impl RepositoryExt for gix::Repository {
         GitConfigSettings::try_from_snapshot(&self.config_snapshot())
     }
 
-    fn gitbutler_storage_path(&self) -> anyhow::Result<PathBuf> {
-        but_project_handle::gitbutler_storage_path(self)
-    }
-
     fn set_git_settings(&self, settings: &GitConfigSettings) -> anyhow::Result<()> {
         settings.persist_to_local_config(self)
     }
@@ -158,20 +135,13 @@ impl RepositoryExt for gix::Repository {
             .context("No author is configured in Git")
             .context(Code::AuthorMissing)?;
 
-        let commit_as_gitbutler = self
-            .config_snapshot()
-            .boolean("gitbutler.gitbutlerCommitter")
-            .unwrap_or_default();
-        let committer = if commit_as_gitbutler {
-            committer_signature()
-        } else {
-            self.committer()
-                .transpose()?
-                .and_then(|s| s.to_owned().ok())
-                .unwrap_or_else(committer_signature)
-        };
+        let committer = self
+            .committer()
+            .transpose()?
+            .context("No committer is configured in Git")
+            .context(Code::AuthorMissing)?;
 
-        Ok((author.into(), committer))
+        Ok((author.into(), committer.into()))
     }
 
     fn cherry_pick_commits_to_tree(
@@ -180,25 +150,13 @@ impl RepositoryExt for gix::Repository {
         to_rebase_commit_id: gix::ObjectId,
         merge_options: gix::merge::tree::Options,
     ) -> anyhow::Result<gix::merge::tree::Outcome<'_>> {
-        // TODO: more tests for the handling of conlicting commits in particular
-        let to_rebase_commit = crate::Commit::from_id(to_rebase_commit_id.attach(self))?;
-        // If the commit we are picking is conflicted then we want to use the
-        // original base that was used when it was first cherry-picked.
-        //
-        // If it is not conflicted, then we use the first parent as the base.
-        let base = if to_rebase_commit.is_conflicted() {
-            match to_rebase_commit.inner.parents.first() {
-                None => gix::ObjectId::empty_tree(self.object_hash()),
-                Some(parent_commit) => crate::Commit::from_id(parent_commit.attach(self))?
-                    .tree_id_or_auto_resolution()?
-                    .detach(),
-            }
-        } else {
-            to_rebase_commit.tree_id_or_kind(TreeKind::Base)?.detach()
+        let to_rebase_commit = to_rebase_commit_id.attach(self).object()?.into_commit();
+        let base = match to_rebase_commit.parent_ids().next() {
+            None => gix::ObjectId::empty_tree(self.object_hash()),
+            Some(parent_id) => parent_id.object()?.peel_to_tree()?.id,
         };
-        let ours = crate::Commit::from_id(new_base_commit_id.attach(self))?
-            .tree_id_or_auto_resolution()?;
-        let theirs = to_rebase_commit.tree_id_or_kind(TreeKind::Theirs)?;
+        let ours = new_base_commit_id.attach(self).object()?.peel_to_tree()?.id;
+        let theirs = to_rebase_commit.tree_id()?.detach();
 
         self.merge_trees(
             base,   /* the tree of the parent of the commit to cherry-pick */
@@ -231,13 +189,10 @@ impl RepositoryExt for gix::Repository {
         let mut added_worktree_file = |rela_path: &BStr,
                                        head_tree_editor: &mut gix::object::tree::Editor<'_>|
          -> anyhow::Result<bool> {
-            let Some((id, kind, md)) = pipeline.worktree_file_to_object(rela_path, &index)? else {
+            let Some((id, kind, _md)) = pipeline.worktree_file_to_object(rela_path, &index)? else {
                 head_tree_editor.remove(rela_path)?;
                 return Ok(false);
             };
-            if untracked_limit_in_bytes != 0 && md.len() > untracked_limit_in_bytes {
-                return Ok(false);
-            }
             head_tree_editor.upsert(rela_path, kind, id)?;
             Ok(true)
         };
@@ -369,7 +324,21 @@ impl RepositoryExt for gix::Repository {
             }
         }
 
+        let workdir = self.workdir();
         for rela_path in untracked_items {
+            // The limit applies to untracked files only, and is checked before hashing so that
+            // large files are never read nor written to the object database.
+            // Directories (untracked nested repositories) and symlinks are never subject to it.
+            if untracked_limit_in_bytes != 0
+                && let Some(workdir) = workdir
+                && let Ok(md) = gix::path::from_bstr(rela_path.as_bstr())
+                    .map_err(|_| ())
+                    .and_then(|rela| std::fs::symlink_metadata(workdir.join(rela)).map_err(|_| ()))
+                && md.is_file()
+                && md.len() > untracked_limit_in_bytes
+            {
+                continue;
+            }
             added_worktree_file(rela_path.as_ref(), &mut head_tree_editor)?;
         }
 
@@ -423,26 +392,4 @@ impl RepositoryExt for gix::Repository {
         let (options, conflict_kind) = self.merge_options_fail_fast()?;
         Ok((options.with_rewrites(None), conflict_kind))
     }
-}
-
-const GITBUTLER_COMMIT_AUTHOR_NAME: &str = "GitButler";
-const GITBUTLER_COMMIT_AUTHOR_EMAIL: &str = "gitbutler@gitbutler.com";
-
-/// Provide a signature with the GitButler author, and the current time or the time overridden
-/// depending on the value for `purpose`.
-fn committer_signature() -> gix::actor::Signature {
-    gix::actor::Signature {
-        name: GITBUTLER_COMMIT_AUTHOR_NAME.into(),
-        email: GITBUTLER_COMMIT_AUTHOR_EMAIL.into(),
-        time: commit_time("GIT_COMMITTER_DATE"),
-    }
-}
-
-/// Return the time of a commit as `now` unless the `overriding_variable_name` contains a parseable date,
-/// which is used instead.
-fn commit_time(overriding_variable_name: &str) -> gix::date::Time {
-    std::env::var(overriding_variable_name)
-        .ok()
-        .and_then(|time| gix::date::parse(&time, Some(gix::date::Zoned::now())).ok())
-        .unwrap_or_else(gix::date::Time::now_local_or_utc)
 }

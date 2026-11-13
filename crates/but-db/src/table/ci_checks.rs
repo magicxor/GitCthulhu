@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{DbHandle, M, SchemaVersion, Transaction};
 
 pub(crate) const M: &[M<'static>] = &[M::up(
-    20260105095934,
+    2026_11_12__00_00_02,
     SchemaVersion::Zero,
     "CREATE TABLE `ci_checks`(
 	`id` BIGINT NOT NULL PRIMARY KEY,

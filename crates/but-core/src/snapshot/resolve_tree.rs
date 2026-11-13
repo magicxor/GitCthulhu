@@ -11,19 +11,6 @@ pub struct Outcome<'repo> {
     ///
     /// It's `None` if there were no index-only changes.
     pub index: Option<gix::index::State>,
-    /// Reference edits that when applied in a transaction will set the workspace back to where it was. Only available
-    /// if it was part of the snapshot to begin with.
-    pub workspace_references: Option<Vec<gix::refs::transaction::RefEdit>>,
-    /// The metadata to be applied to the ref-metadata store.
-    pub metadata: Option<MetadataEdits>,
-}
-
-/// Edits for application to the [reference metadata store](crate::RefMetadata).
-pub struct MetadataEdits {
-    /// The workspace metadata stored in the snapshot.
-    pub workspace: (gix::refs::FullName, crate::ref_metadata::Workspace),
-    /// The branch metadata stored in snapshots.
-    pub branches: Vec<(gix::refs::FullName, crate::ref_metadata::Branch)>,
 }
 
 /// Options for use in [super::resolve_tree()].
@@ -55,8 +42,6 @@ pub(super) mod function {
     /// * …cherry-pick the worktree changes onto the `target_worktree_tree_id`, which is assumed to represent the future working directory state
     ///   and which either contains the worktree changes or *preferably* is the `HEAD^{tree}` as the working directory is clean.
     /// * …reconstruct the index to write into `.git/index` (including conflicts), assuming that the current `.git/index` is clean, *or* is the index from which the snapshot was taken.
-    /// * …produce reference edits to put the workspace refs back into place with.
-    /// * …produce metadata that if set will represent the metadata of the entire workspace.
     ///
     /// Note that none of this data is actually manifested in the repository or working tree, they only exists as objects in the Git database,
     /// assuming in-memory objects aren't used in the repository.
@@ -104,7 +89,7 @@ pub(super) mod function {
         let index = match (&head_tree, index, index_conflicts) {
             (_, Some(index_tree), Some(index_conflicts)) => {
                 let (mut index, _path) = repo.index_from_tree(&index_tree.id())?.into_parts();
-                replace_entries_with_their_restored_conflicts(&mut index, index_conflicts.id())?;
+                restore_conflicts_into_index(&mut index, index_conflicts.id())?;
                 Some(index)
             }
             (_, Some(index_tree), None) => {
@@ -113,7 +98,7 @@ pub(super) mod function {
             }
             (Some(worktree_base), None, Some(index_conflicts)) => {
                 let (mut index, _path) = repo.index_from_tree(&worktree_base.id())?.into_parts();
-                replace_entries_with_their_restored_conflicts(&mut index, index_conflicts.id())?;
+                restore_conflicts_into_index(&mut index, index_conflicts.id())?;
                 Some(index)
             }
             (None, None, Some(_index_conflicts)) => bail!(
@@ -126,14 +111,14 @@ pub(super) mod function {
         Ok(Outcome {
             worktree_cherry_pick,
             index,
-            workspace_references: None,
-            metadata: None,
         })
     }
 
-    fn replace_entries_with_their_restored_conflicts(
+    /// Replace the entries of `index` at every path in `conflict_tree` (format `<path>/<stage>`, stage 1..=3,
+    /// as written by [`create_tree()`](crate::snapshot::create_tree()) into `index-conflicts`) by those conflict stages.
+    pub fn restore_conflicts_into_index(
         index: &mut gix::index::State,
-        conflict_tree: gix::Id,
+        conflict_tree: gix::Id<'_>,
     ) -> anyhow::Result<()> {
         let conflict_tree = conflict_tree.object()?.try_into_tree()?;
         // Since we don't expect a lot of entries, quickly record everything.

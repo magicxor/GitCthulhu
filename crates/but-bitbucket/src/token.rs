@@ -60,7 +60,6 @@ pub fn clear_all_bitbucket_accounts(storage: &but_forge_storage::Controller) -> 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", tag = "type", content = "info")]
 pub enum BitbucketAccountIdentifier {
     /// An Atlassian API token (with scopes). `email` is the Atlassian account
@@ -68,8 +67,6 @@ pub enum BitbucketAccountIdentifier {
     /// username used when authenticating.
     ApiToken { email: String },
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(BitbucketAccountIdentifier);
 
 impl BitbucketAccountIdentifier {
     pub fn apitoken(email: &str) -> Self {

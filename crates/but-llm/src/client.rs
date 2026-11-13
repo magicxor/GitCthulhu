@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
+use crate::tool::Toolset;
 use anyhow::Result;
-use but_tools::tool::Toolset;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 

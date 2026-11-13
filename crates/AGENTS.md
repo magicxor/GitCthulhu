@@ -1,147 +1,105 @@
 # Rust Instructions
 
-These are defaults for Rust source and test changes under `crates/`; more
-specific instruction files override them. Do not apply them to generated,
-vendored, or fixture data unless the task is specifically about that code.
+These are defaults for Rust source and test changes under `crates/`; more specific instruction files override
+them. Do not apply them to generated, vendored, or fixture data unless the task is specifically about that code.
 
-## API Boundaries and Legacy
+## Crate Layout
 
-- Treat `gitbutler-*` crates as legacy-heavy, but preserve local ownership and
-  nearby patterns for localized fixes. Do not introduce new `gitbutler-*` usage
-  in newer code unless the surrounding legacy boundary requires it. Keep legacy
-  fixes localized; migrate only when necessary, tiny, tested, and
-  behavior-neutral.
-- Minimize new `VirtualBranchesHandle` usage. At API boundaries, prefer
-  `but_ctx::Context` workspace helpers and newer `but-*` APIs.
-- `but-api` is the API surface for Tauri, CLI, and TUI callers.
-  Outer callers should prefer existing `but-api` functions when they fit, but
-  lower-level crates should not depend on `but-api`.
-- Preserve existing `but-api` macro, transport, serialization, and conversion
-  patterns instead of hand-rolling parallel wrappers.
-- Keep transport DTOs at the API boundary, commonly in a local `json` module,
-  and convert them to domain types before calling lower-level crates.
-- For permissioned `but-api` functions, follow the existing composition shape:
-  acquire permission near the wrapper and delegate to a `_with_perm` or other
-  permission-taking implementation.
-- API consumers such as the CLI, TUI, and other composed callers should use
-  `_with_perm` variants when they already hold permission to avoid extra locking
-  and deadlock risk.
-- Keep `Context` at API/composition boundaries; pass granular dependencies
-  like repo, workspace, metadata, database handles, or an `Editor` into
-  lower-level crates where possible.
-- Acquire repository access locks at top-level API/command boundaries. Do not
-  call helpers that acquire permissions while holding a guard; drop the guard or
-  call a permission-taking helper.
-- Preserve existing `DryRun` semantics; add dry-run support when the API/product
-  surface calls for preview behavior. Dry runs should avoid persisting refs,
-  objects, or oplog entries.
-- When an API offers both action-only and timeline-recording behavior, keep the
-  `*_only*` function free of oplog side effects; prepare a best-effort oplog
-  snapshot in the wrapper and commit it only after the mutation succeeds.
-- New user-facing mutations should participate in undo: record an oplog
-  snapshot via the existing `SnapshotDetails`/`OperationKind` wrapper pattern,
-  and call out any mutation intentionally left out of the timeline rather than
-  omitting it silently. Undo is snapshot-based; do not design bespoke inverse
-  operations for it.
-- Before changing or reviewing code that derives graph/workspace/branch/stack/commit
-  relationships, reachability, dependencies, ordering, operation targets, or Git
-  graph/history/ref-placement mutations, use `crates/WORKSPACE_MODEL.md` as the
-  reference. In short: prefer commit IDs and refs at API boundaries, convert to
-  operation-local selectors inside editor-backed operations, use
-  `but_graph::Graph` for relationship/reachability questions, use
-  `but_rebase::graph_rebase::Editor` for Git graph/history/ref rewrites where an
-  editor model exists, and treat `but_graph::Workspace` and
-  `but_workspace::RefInfo` as lossy presentation/compatibility views unless an
-  existing workspace-shaped boundary requires them.
+Fixed decisions (owner-approved). The virtual-branch code is gone; milestones 1 and 2 of the new crates are built.
+
+- **Git core**: `but-core` (to be slimmed of GitButler-only concepts), `but-error`, `but-serde`,
+  `but-project-handle`, `but-path`, `but-utils`, `gitbutler-git` (askpass harness and transport defaults used by the `gitcthulhu-git` executor; the
+  `gitcthulhu-askpass` and `gitcthulhu-editor` helper programs ship with the `gitcthulhu` package),
+  `but-askpass`, `gitbutler-filemonitor`, `but-testsupport`.
+- **Preserved capabilities**: forge integrations (`but-forge`, `but-forge-storage`, `but-github`, `but-gitlab`,
+  `but-bitbucket`, `but-secret`), AI (`but-llm`), embedded terminal (`but-tty`), installer and updater
+  (`but-installer`, `but-update`), plus `but-db`.
+- **New crates**: `gitcthulhu-git` (UI-agnostic plain-Git backend, blocking API, no GPUI),
+  `gitcthulhu-oplog` (snapshot-based undo/redo on `but_core::snapshot`, no virtual-branch state),
+  `gitcthulhu-services` (the forge, AI and update services over the preserved crates, no GPUI), and
+  `gitcthulhu` (the GUI binary on `gpui-kit` from crates.io; it embeds the fonts in `assets/fonts`
+  and the app icons in `assets/app-icon`, still GitButler's artwork until GitCthulhu's own replaces it).
+- App data and config identity is `gitcthulhu`. GitButler on-disk state (`.git/gitbutler/*`, `refs/gitbutler/*`,
+  `gitbutler.*` config) is neither read nor written.
+- Do not reintroduce virtual branches, stacks, workspace commits, API/CLI layers or Tauri/JS tooling.
+
+## Git Engine Policy
+
+- **Reads** (status, diff, log/graph walk, refs, blame, config): in-process via `gix`.
+- **Mutations** (commit, checkout, merge, rebase, cherry-pick, revert, reset, stash, tag, branch, remote,
+  submodule, worktree, clone, fetch, pull, push): the `git` executable, with askpass-based credential prompts.
+  Hooks must run natively; never pass `--no-verify` and surface hook output and failures to the user.
+- Whole-file staging, unstaging and discarding run `git add`/`git restore`/`git rm`. Hunk and line staging is an
+  in-process index edit (the new blob is the old image plus the selected line edits, written under `index.lock`
+  after a stale check); discarding selected lines writes the worktree file back through the filter pipeline.
+- No `git2`/libgit2 in new code. Treat existing `git2` use as legacy to be removed.
 
 ## Code Shape and Naming
 
-- Use Git/GitButler domain names and keep types/helpers in the crate or module
-  that owns the concept.
-- Avoid vague names like `Manager`, `Service`, `Helper`, `Util`, or `Processor`
-  unless nearby code uses that concept.
-- Solve the present problem directly. Avoid speculative abstractions: one-use
-  traits/types/functions, fake extension points, ceremonial wrappers/modules,
-  and public APIs larger than real callers need.
-- Keep module boundaries discoverable from names and the call graph.
-- Avoid drive-by refactors while fixing a specific bug.
+- Use Git domain names and keep types/helpers in the crate or module that owns the concept.
+- Avoid vague names like `Manager`, `Service`, `Helper`, `Util`, or `Processor` unless nearby code uses that
+  concept.
+- Solve the present problem directly. Avoid speculative abstractions: one-use traits/types/functions, fake
+  extension points, ceremonial wrappers/modules, and public APIs larger than real callers need.
+- Keep module boundaries discoverable from names and the call graph. Avoid drive-by refactors.
 - Prefer explicit domain enum matches when wildcard arms would hide behavior.
-- Comment public API purpose/invariants/errors and complex algorithm intent;
-  avoid comments that merely repeat the code.
+- Comment public API purpose/invariants/errors and complex algorithm intent; avoid comments that repeat the code.
 
 ## Git Repository Semantics
 
-- Do not rediscover Git repositories inside business logic; pass repo/context
-  explicitly.
-- Prefer repository APIs over shelling out to `git`, except at
-  shell/executable boundaries such as hooks, debug tooling, tests, or Git
-  interop helpers.
-- Preserve Git graph semantics even when the shape looks redundant or odd; do
-  not deduplicate, reorder, or smooth graph data unless Git semantics allow it.
-- Use `gix` for new repository logic. Treat `git2` and `Context::git2_repo` as
-  legacy/boundary-only escape hatches for libgit2 checkout/index, hooks,
-  transport/auth, or existing code that cannot reasonably move yet.
-- Keep Git paths, refnames, commit messages, and diff payloads byte-preserving
-  until UI/API boundaries; avoid lossy `String` conversion in business logic.
-- Treat filesystem and worktree writes carefully; use existing locking,
-  transaction, and access patterns.
-- Avoid implicit `SystemTime::now()` in testable business logic; pass time in
-  when deterministic behavior matters.
-- Use existing reload/invalidation helpers after external repo or worktree
-  changes, especially when working through `Context` caches.
-- Use `anyhow::Context` to explain what operation failed. When frontend/API
-  consumers need classification, use existing `but_error::Code` patterns; do
-  not make consumers match error strings.
+- Do not rediscover Git repositories inside business logic; pass the repository explicitly.
+- Preserve Git graph semantics even when the shape looks redundant or odd; do not deduplicate, reorder, or smooth
+  graph data unless Git semantics allow it.
+- Use `gix` for repository logic.
+- Keep Git paths, refnames, commit messages, and diff payloads byte-preserving until the UI boundary; avoid lossy
+  `String` conversion in business logic.
+- Treat filesystem and worktree writes carefully; use existing locking and access patterns.
+- Avoid implicit `SystemTime::now()` in testable business logic; pass time in when deterministic behavior matters.
+- Use `anyhow::Context` to explain what operation failed. When callers need classification, use existing
+  `but_error::Code` patterns; do not make consumers match error strings.
+- New user-facing mutations should participate in undo: snapshot before the mutation and restore on undo. Undo is
+  snapshot-based; do not design bespoke inverse operations. Call out any mutation intentionally left out.
 
 ## Database Migrations (`but-db`)
 
-- Keep migrations forward-compatible: stay on the current `SchemaVersion` and
-  leave columns or tables that new code stopped using in place. Bumping the
-  version locks every older binary out of the database; reserve it for planned,
-  coordinated breaks, never routine cleanup.
+- `but-db` starts from a fresh GitCthulhu baseline: every table has one baseline migration on
+  `SchemaVersion::Zero`; there is no GitButler database to carry along.
+- New migrations stay forward-compatible on the current `SchemaVersion`: add tables or columns, and leave the ones
+  new code stopped using in place.
+- Moving to `SchemaVersion::One` locks every older binary out of the database. Do it only as a planned break, when
+  an older binary must reject the migrated data (dropped or repurposed data it still reads). The rules are in the
+  `but-db` crate docs (`src/lib.rs`).
 
 ## Version Control
 
-- Assume the worktree may contain other agents' changes. Do not overwrite, clean
-  up, stage, commit, or amend changes you did not make.
-- When asked to branch, commit, push, or open a PR, use the GitButler `but`
-  CLI/workflow when available.
-- When the user says "ship it", commit your changes on a session branch,
-  creating one if needed, then push and open or update the PR. Reuse the
-  existing branch/PR when it already fits the session.
-- For small cleanup or follow-up fixes on your own branch, amend the relevant
-  existing commit(s) when that is the cleaner history.
-- Keep commit messages and PR descriptions succinct: why, impact, and core
-  decisions. Do not list local validation commands in commit messages or add AI
-  co-author trailers or tool branding.
+- Assume the worktree may contain other agents' changes. Do not overwrite, clean up, stage, commit, or amend
+  changes you did not make.
+- Keep commit messages succinct: a short imperative subject, then why, impact, and core decisions. Do not list
+  local validation commands or add AI co-author trailers or tool branding.
 
 ## Testing and Validation
 
-- Run the narrowest relevant test or check first, for example `cargo test
-  -p <crate> <test-name>` or `cargo check -p <crate> --all-targets`.
-- Use existing test-support crates and fixtures; prefer read-only fixtures for
-  read-only behavior.
-- For graph, rebase, or workspace behavior, prefer fixture-backed before/after
-  snapshots using existing visualizers, plus targeted structural assertions for
-  the invariant.
-- When snapshot output is volatile, stabilize inputs or normalize output; do not
-  replace strong snapshots with vague assertions.
-- When optimizing Git traversal or workspace behavior, preserve semantics with a
-  fixture-backed regression test.
-- Run `cargo fmt` for Rust formatting, avoiding unrelated dirty files.
-- Run `cargo clippy --fix --allow-dirty` only after inspecting the diff scope and
-  only when generated edits stay within the intended change.
-- Run `cargo machete` when dependencies changed; verify targets, features, and
-  platform-specific usage before removing dependencies.
-- After changing Rust APIs or types exposed through `@gitbutler/but-sdk`, run
-  `pnpm build:sdk && pnpm format`; this updates
-  `packages/but-sdk/src/generated`.
-- Use workspace-wide checks only when the change affects shared contracts or
-  multiple crates.
+- Run the narrowest relevant test or check first, for example `cargo test -p <crate> <test-name>` or
+  `cargo check -p <crate> --all-targets`.
+- Use `but-testsupport` for fixtures and temporary repositories; prefer read-only fixtures for read-only
+  behavior. Backend integration tests run against throw-away repositories created with the `git` executable.
+- When snapshot output is volatile, stabilize inputs or normalize output; do not replace strong snapshots with
+  vague assertions.
+- Run `cargo fmt` for formatting, avoiding unrelated dirty files.
+- Run `cargo clippy --fix --allow-dirty` only after inspecting the diff scope and only when generated edits stay
+  within the intended change.
+- Run `cargo machete` when dependencies changed; verify targets, features, and platform-specific usage first.
+- Use workspace-wide checks only when the change affects shared contracts or multiple crates.
 
 ## Assertions
 
-- Explain why a standard Rust assertion holds concisely using the last-argument message, like `assert!(1!=2, "arithmetic unit on CPU works")`
-- Snapshot assertions use `snapbox`, like `snapbox::assert_data_eq!(actual, snapbox::str![[r#"..."#]])`. `snapbox::assert_data_eq!` has no message argument, so explain why a snapshot holds with a `// comment` on the line above it.
+- Explain why a standard Rust assertion holds concisely using the last-argument message, like
+  `assert!(1!=2, "arithmetic unit on CPU works")`
+- Snapshot assertions use `snapbox`, like `snapbox::assert_data_eq!(actual, snapbox::str![[r#"..."#]])`.
+  `snapbox::assert_data_eq!` has no message argument, so explain why a snapshot holds with a `// comment` on the
+  line above it.
 - Regenerate inline snapshots by running the tests with `SNAPSHOTS=overwrite`.
-- Remove unstable output before asserting (sanitize ids/timestamps/paths, e.g. the `but_testsupport` helpers) rather than snapshotting it raw. `snapbox` also pattern-matches expected data by default (`[..]` and `...` wildcards, path-separator normalization); append `.raw()` to the expected `snapbox::str!` when the value must match exactly (e.g. it contains backslashes or literal `[..]`/`...`).
+- Remove unstable output before asserting (sanitize ids/timestamps/paths, e.g. the `but_testsupport` helpers)
+  rather than snapshotting it raw. `snapbox` also pattern-matches expected data by default (`[..]` and `...`
+  wildcards, path-separator normalization); append `.raw()` to the expected `snapbox::str!` when the value must
+  match exactly (e.g. it contains backslashes or literal `[..]`/`...`).

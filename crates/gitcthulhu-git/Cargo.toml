@@ -1,0 +1,68 @@
+[package]
+name = "gitcthulhu-git"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+description = "The plain Git backend of GitCthulhu: gix reads, `git` mutations, executor, graph layout"
+
+[lib]
+name = "gitcthulhu_git"
+doctest = false
+
+# Test copies of the helpers (the app ships `gitcthulhu-askpass` / `gitcthulhu-editor` from crates/gitcthulhu).
+[[bin]]
+name = "gitcthulhu-git-askpass"
+path = "src/bin/askpass.rs"
+test = false
+
+[[bin]]
+name = "gitcthulhu-git-editor"
+path = "src/bin/editor.rs"
+test = false
+
+[features]
+default = []
+serde = ["dep:serde", "bstr/serde", "gix/serde", "smallvec/serde"]
+
+[dependencies]
+but-core.workspace = true
+gitbutler-git = { workspace = true, features = ["tokio"] }      # askpass_harness only
+gitbutler-filemonitor.workspace = true
+gix = { workspace = true, features = [
+    "status", "dirwalk", "blob-diff", "revision", "index", "attributes", "excludes",
+    "blame", "mailmap", "parallel", "max-performance",
+] }
+anyhow.workspace = true
+thiserror.workspace = true
+bstr.workspace = true
+bitflags.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+serde = { workspace = true, optional = true }
+serde_json.workspace = true                                     # trace2 events, rebase plan.json
+tokio = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "time", "sync", "macros", "fs", "net"] }
+tempfile.workspace = true
+chardetng = "0.1.17"                                            # same version as but-core
+encoding_rs.workspace = true                                    # decoding (chardetng's encoding type)
+similar.workspace = true                                        # intra-line word diff
+infer.workspace = true                                          # image sniffing
+lru.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.0", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading",
+    "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO",       # Pipes/IO: askpass bin client
+] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "process"] }
+
+[dev-dependencies]
+snapbox.workspace = true
+proptest.workspace = true
+sysinfo = { workspace = true, features = ["system"] }
+
+[lints]
+workspace = true

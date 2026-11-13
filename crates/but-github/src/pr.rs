@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result};
 use crate::client::{GitHubClient, HttpStatusError};
 
 const GITHUB_RATE_LIMIT_MESSAGE: &str = "GitHub's API rate limit was exceeded. Automatic refreshes are paused; the limit usually resets within an hour.";
-const GITHUB_ORG_SAML_RESTRICTION_MESSAGE: &str = "This GitHub organization requires SAML SSO. Authorize the GitButler OAuth app on the organization's SSO page, or authorize your personal access token in GitHub's token SSO settings, then try again.";
+const GITHUB_ORG_SAML_RESTRICTION_MESSAGE: &str = "This GitHub organization requires SAML SSO. Authorize the GitCthulhu OAuth app on the organization's SSO page, or authorize your personal access token in GitHub's token SSO settings, then try again.";
 /// The wording shared by GitHub's classic and fine-grained token-lifetime
 /// refusals; the surrounding sentence names the organization and a token URL,
 /// which never reach the user.
@@ -99,7 +99,7 @@ pub(crate) fn classify_forge_error(err: anyhow::Error) -> anyhow::Error {
             let context = if contains("OAuth App access restrictions") {
                 Some(but_error::Context::new_static(
                     but_error::Code::GitHubOrgOAuthRestricted,
-                    "A GitHub organization has restricted access for the GitButler OAuth app. Ask an organization owner to approve it, or authenticate with a personal access token instead.",
+                    "A GitHub organization has restricted access for the GitCthulhu OAuth app. Ask an organization owner to approve it, or authenticate with a personal access token instead.",
                 ))
             } else if contains("Resource protected by organization SAML enforcement") {
                 Some(but_error::Context::new_static(

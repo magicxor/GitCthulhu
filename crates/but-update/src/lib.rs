@@ -1,59 +1,53 @@
 #![deny(missing_docs)]
-//! Application update checking and management for GitButler.
+//! Update checking for GitCthulhu against a static release manifest.
 //!
-//! This crate provides functionality to check for new versions of GitButler applications
-//! (CLI and GUI), cache update check results, and manage update notifications.
+//! There is no update server: a release publishes a JSON manifest (for example on GitHub Releases or
+//! Pages) and the application compares its own version with it on the client.
 //!
-//! # Core Functionality
+//! # Manifest
 //!
-//! - **Update Checking**: Query the GitButler update server for available updates
-//! - **Caching**: Persist update check results to avoid redundant network requests
-//! - **Suppression**: Temporarily hide update notifications for a configurable duration
-//! - **Locking**: Prevent concurrent update checks across multiple processes
-//!
-//! # Usage Example
-//!
-//! ```rust,no_run
-//! use but_update::{AppName, check_status, available_update};
-//! # use but_settings::AppSettings;
-//!
-//! # fn example(app_settings: &AppSettings, cache: &mut but_db::AppCacheHandle) -> anyhow::Result<()> {
-//! // Check for updates (results are automatically cached)
-//! if let Some(status) = check_status(AppName::Cli, app_settings, cache)? {
-//!     if !status.up_to_date {
-//!         println!("Update available: {}", status.latest_version);
-//!     }
-//! } else {
-//!     println!("Another process is checking for updates");
+//! ```json
+//! {
+//!   "version": "0.2.0",
+//!   "pub_date": "2026-12-01T00:00:00Z",
+//!   "notes": "markdown release notes",
+//!   "release_url": "https://example.com/releases/v0.2.0",
+//!   "platforms": {
+//!     "windows-x86_64": { "url": "https://example.com/GitCthulhu_0.2.0_x64.msi", "signature": "<base64 minisig>" },
+//!     "darwin-aarch64": { "url": "https://example.com/GitCthulhu_0.2.0_arm64.app.tar.gz", "signature": "..." }
+//!   }
 //! }
-//!
-//! // Later, retrieve cached update info without making a network request
-//! if let Some(update) = available_update(cache)? {
-//!     println!("Version {} is available", update.available_version);
-//! }
-//! # Ok(())
-//! # }
 //! ```
 //!
-//! # Caching Behavior
+//! Platform keys are `<os>-<arch>` with the OS spelled `windows`, `linux` or `darwin` (Rust's `macos` is
+//! mapped, see [`platform_key`]). Unknown fields are ignored.
 //!
-//! Update check results are automatically cached to the platform's cache directory.
-//! The cache includes:
-//! - Timestamp of the last check
-//! - Update status (up-to-date or update available)
-//! - Version information and release notes
-//! - Suppression settings (if the user has snoozed the update)
+//! # Functionality
 //!
-//! # Suppression
+//! - [`check_status`] / [`check_status_async`]: fetch the manifest, compare versions with `semver`, cache the
+//!   outcome. A database lock held by another checker makes the call a no-op returning `Ok(None)`.
+//! - [`fetch_status`] + [`record_status`]: the same without holding a database lock during the request.
+//! - [`available_update`]: read the cached outcome without any network access; honours the snooze.
+//! - [`suppress_update`]: snooze the notice for 1-720 hours.
 //!
-//! Users can temporarily suppress update notifications for 1-720 hours (30 days):
+//! The cached outcome is only valid for the `cache_scope` it was produced for (the application passes its
+//! version and release channel), so an upgrade or a channel switch never shows a stale notice.
 //!
 //! ```rust,no_run
-//! use but_update::suppress_update;
+//! use but_update::{CheckParams, available_update, check_status};
 //!
-//! # fn example(cache: &mut but_db::AppCacheHandle) -> anyhow::Result<()> {
-//! // Suppress update notifications for 24 hours
-//! suppress_update(cache, 24)?;
+//! # fn example(cache: &mut but_db::AppCacheHandle) -> Result<(), but_update::CheckError> {
+//! let current = semver::Version::new(0, 1, 0);
+//! let params = CheckParams {
+//!     manifest_url: "https://example.com/latest.json",
+//!     current_version: &current,
+//!     cache_scope: "0.1.0/release",
+//!     user_agent: "GitCthulhu/0.1.0",
+//! };
+//! check_status(&params, cache)?;
+//! if let Some(update) = available_update(cache, &current, params.cache_scope)? {
+//!     println!("version {} is available", update.available_version);
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -61,17 +55,13 @@
 /// Module with functionality around checking the app updateability status.
 mod check;
 
-pub use check::{AppName, CheckUpdateStatus, check_status};
+pub use check::{
+    CheckError, CheckParams, CheckUpdateStatus, Manifest, PlatformEntry, check_status,
+    check_status_async, current_platform_key, fetch_status, platform_key, record_status,
+};
 
 /// Module with functionality for caching update check results.
 pub mod cache;
-pub use cache::{AvailableUpdate, available_update, last_checked, suppress_update};
-
-/// Return `true` if we are still holding a lock on our data as we are fetching it.
-pub fn is_probably_still_running(cache: &mut but_db::AppCacheHandle) -> bool {
-    cache
-        .immediate_transaction_nonblocking()
-        .ok()
-        .flatten()
-        .is_none()
-}
+pub use cache::{
+    AvailableUpdate, available_update, available_update_at, last_checked, suppress_update,
+};

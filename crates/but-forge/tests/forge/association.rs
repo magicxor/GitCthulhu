@@ -129,7 +129,7 @@ fn review_associations_include_settled_state() {
     );
 
     assert_eq!(
-        review_associations_by_head(&db, &repo)
+        review_associations_by_head(&db, &repo, &[])
             .unwrap()
             .get("origin/feature"),
         // The fixture's sha is empty, so no merged head is exposed.
@@ -163,7 +163,7 @@ fn review_associations_follow_the_head_repository() {
     renamed.repository_https_url = Some("https://github.com/acme/new-app.git".into());
     cache_review(&mut db, &renamed).unwrap();
 
-    let by_head = review_associations_by_head(&db, &repo).unwrap();
+    let by_head = review_associations_by_head(&db, &repo, &[]).unwrap();
     let number = |head: &str| by_head.get(head).map(|(number, ..)| *number);
     assert_eq!(
         number("alice/feature"),
@@ -200,7 +200,7 @@ fn review_associations_follow_a_remote_that_pushes_to_a_fork() {
     .unwrap();
 
     assert_eq!(
-        review_associations_by_head(&db, &repo)
+        review_associations_by_head(&db, &repo, &[])
             .unwrap()
             .get("origin/feature")
             .map(|(number, ..)| *number),
@@ -229,7 +229,7 @@ fn unrelated_forks_are_dropped_before_matching_by_name() {
 
     let repo = repo_with_config(&tmp.path().join("known"), config);
     assert_eq!(
-        numbers(without_unrelated_forks(reviews(), &repo)),
+        numbers(without_unrelated_forks(reviews(), &repo, &[])),
         vec![1, 3],
         "a fork no remote points at is someone else's, while yours and the base repository's stay"
     );
@@ -237,7 +237,7 @@ fn unrelated_forks_are_dropped_before_matching_by_name() {
     let with_local = format!("{config}[remote \"gb-local\"]\n\turl = /some/path\n");
     let repo = repo_with_config(&tmp.path().join("local"), &with_local);
     assert_eq!(
-        numbers(without_unrelated_forks(reviews(), &repo)),
+        numbers(without_unrelated_forks(reviews(), &repo, &[])),
         vec![1, 2, 3],
         "a remote whose URL names no forge repository might be the fork, so nothing is dropped"
     );

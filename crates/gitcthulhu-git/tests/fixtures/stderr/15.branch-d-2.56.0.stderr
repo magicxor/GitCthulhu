@@ -1,0 +1,1 @@
+error: cannot delete branch 'main' used by worktree at '/tmp/gc/repo'

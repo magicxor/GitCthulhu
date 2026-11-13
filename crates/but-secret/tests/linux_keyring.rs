@@ -16,17 +16,17 @@ fn reads_existing_secret_service_item() -> anyhow::Result<()> {
     };
 
     let handle = format!("zbus-existing-test-{}", std::process::id());
-    let service = format!("gitbutler-{handle}");
+    let service = format!("gitcthulhu-{handle}");
     // These are the same lookup attributes written by the libdbus backend.
     // Seed through another client so retrieval cannot hit the keyutils cache.
     let mut child = Command::new("secret-tool")
         .args([
             "store",
-            "--label=GitButler migration test",
+            "--label=GitCthulhu migration test",
             "service",
             &service,
             "username",
-            "GitButler",
+            "GitCthulhu",
             "target",
             "default",
         ])

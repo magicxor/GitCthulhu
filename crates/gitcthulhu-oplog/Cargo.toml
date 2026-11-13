@@ -1,0 +1,45 @@
+[package]
+name = "gitcthulhu-oplog"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Snapshot-based undo/redo of GitCthulhu's repository operations"
+
+[lib]
+doctest = false
+
+[features]
+## Fail points for crash-recovery tests, and test-only access to the stack replay.
+test-hooks = []
+
+[dependencies]
+but-core.workspace = true
+gix = { workspace = true, features = ["status", "dirwalk", "merge", "worktree-mutation", "index", "parallel", "serde"] }
+bstr = { workspace = true, features = ["serde"] }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+# Atomic restore-journal writes (NamedTempFile::persist).
+tempfile.workspace = true
+
+[dev-dependencies]
+but-testsupport.workspace = true
+snapbox.workspace = true
+tempfile.workspace = true
+gitcthulhu-oplog = { path = ".", features = ["test-hooks"] }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "record"
+path = "tests/record/main.rs"
+
+[[test]]
+name = "restore"
+path = "tests/restore/main.rs"

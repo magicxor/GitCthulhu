@@ -7,7 +7,6 @@ use crate::{ForgeName, ForgeUser};
 /// doesn't need to branch on forge name. Computed from the project's
 /// own remote URL plus a forge-name lookup for the rest.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeInfo {
     pub name: ForgeName,
@@ -27,11 +26,7 @@ pub struct ForgeInfo {
     pub capabilities: ForgeCapabilities,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeInfo);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeUnitInfo {
     pub name: String,
@@ -39,11 +34,7 @@ pub struct ForgeUnitInfo {
     pub symbol: String,
 }
 
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeUnitInfo);
-
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ForgeCapabilities {
     pub checks: bool,
@@ -55,9 +46,6 @@ pub struct ForgeCapabilities {
     /// Labels and review requests can be listed and changed.
     pub review_management: bool,
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeCapabilities);
 
 /// Build the per-project ForgeInfo from the project's remote URL.
 ///
@@ -71,7 +59,7 @@ pub fn forge_info(
     accounts: &[ForgeUser],
     override_forge: Option<ForgeName>,
 ) -> Option<ForgeInfo> {
-    let repo_info = crate::derive_forge_repo_info(remote_url, override_forge)?;
+    let repo_info = crate::derive_forge_repo_info(remote_url, override_forge, accounts)?;
     let base_url = build_base_url(remote_url, &repo_info, accounts);
     let (commit_path, pr_path) = url_paths(&repo_info.forge);
     let (unit, posthog) = label_for(&repo_info.forge);
@@ -98,7 +86,7 @@ pub fn compare_branch_url(
     accounts: &[ForgeUser],
     override_forge: Option<ForgeName>,
 ) -> Option<String> {
-    let repo_info = crate::derive_forge_repo_info(remote_url, override_forge)?;
+    let repo_info = crate::derive_forge_repo_info(remote_url, override_forge, accounts)?;
     let base_url = build_base_url(remote_url, &repo_info, accounts);
     let head = match fork {
         Some(f) => format!("{f}:{branch}"),
@@ -121,6 +109,24 @@ pub fn compare_branch_url(
             urlencoding::encode(base),
             urlencoding::encode(&head)
         ),
+    })
+}
+
+/// Web URL of `branch` in the repository `remote_url` names (used by "Open in browser" actions).
+/// `accounts` and `override_forge` have the same meaning as in [`forge_info`].
+pub fn branch_url(
+    remote_url: &str,
+    branch: &str,
+    accounts: &[ForgeUser],
+    override_forge: Option<ForgeName>,
+) -> Option<String> {
+    let repo_info = crate::derive_forge_repo_info(remote_url, override_forge, accounts)?;
+    let base_url = build_base_url(remote_url, &repo_info, accounts);
+    Some(match repo_info.forge {
+        ForgeName::GitHub => format!("{base_url}/tree/{}", encode_path(branch)),
+        ForgeName::GitLab => format!("{base_url}/-/tree/{}", encode_path(branch)),
+        ForgeName::Bitbucket => format!("{base_url}/branch/{}", encode_path(branch)),
+        ForgeName::Azure => format!("{base_url}?version=GB{}", urlencoding::encode(branch)),
     })
 }
 

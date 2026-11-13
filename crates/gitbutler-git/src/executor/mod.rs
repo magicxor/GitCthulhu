@@ -1,151 +1,9 @@
-use std::{collections::HashMap, path::Path};
-
 #[cfg(any(test, feature = "tokio"))]
 pub mod tokio;
 
-/// Provides a means for executing Git CLI commands.
-///
-/// There is no `arg0` passed; it's up to the implementation
-/// to decide how to execute the command. For example,
-/// `git status` would be passed as `["status"]`.
-///
-/// The executor also provides a means for spinning up
-/// ad-hoc socket servers, necessary for the authorization
-/// utilities that are passed to Git and SSH to communicate
-/// with the host process to exchange credentials. We also
-/// implement a simple layer of security over this communication
-/// layer to avoid unintended leakage of credentials.
-///
-/// Note that this security layer is _not_ impervious
-/// to determined attackers. It is merely a means to
-/// avoid unintended connections to the socket server
-/// or simple, generic attacks. The threat model assumes
-/// that more sophisticated attacks targeting the host system
-/// are out of scope for this project given that the
-/// communication layer is not a far cry from the user
-/// inputting the credentials manually, directly into the
-/// CLI utility.
-///
-/// # Safety
-///
-/// This trait is marked as unsafe due to the platform-specific
-/// invariants described in [`GitExecutor::create_askpass_server`].
-/// These invariants are not enforced by the typesystem, and while
-/// we have some loose checks to ensure that the invariants are upheld,
-/// we cannot guarantee that they are upheld in all cases. Thus, it is
-/// up to the implementer to ensure that the invariants are upheld.
-#[expect(unsafe_code)]
-pub unsafe trait GitExecutor {
-    /// The error type returned by this executor,
-    /// specifically in cases where the execution fails.
-    ///
-    /// Otherwise, `Ok` is returned in call cases, even when
-    /// the exit code is non-zero.
-    type Error: std::error::Error + core::fmt::Debug + Send + Sync + 'static;
-
-    /// The type of the handle returned by [`GitExecutor::create_askpass_server`].
-    type ServerHandle: AskpassServer + Send + Sync + 'static;
-
-    /// Executes the given Git command with the given arguments.
-    /// `git` is never passed as the first argument (arg 0).
-    ///
-    /// Returns a tuple of `(exit_code, stdout, stderr)`.
-    ///
-    /// To the best of their abilities, child processes should
-    /// be killed if the future is dropped.
-    ///
-    /// `Err` is returned if the command could not be executed,
-    /// **not** if the command returned a non-zero exit code.
-    async fn execute_raw<P: AsRef<Path>>(
-        &self,
-        args: &[&str],
-        cwd: P,
-        envs: Option<HashMap<String, String>>,
-    ) -> Result<(usize, String, String), Self::Error>;
-
-    /// Executes the given Git command with sane defaults.
-    /// `git` is never passed as the first argument (arg 0).
-    ///
-    /// Implementers should use this method over [`Self::execute_raw`]
-    /// when possible.
-    async fn execute<P: AsRef<Path>>(
-        &self,
-        args: &[&str],
-        cwd: P,
-        envs: Option<HashMap<String, String>>,
-    ) -> Result<(usize, String, String), Self::Error> {
-        let mut args = args.as_ref().to_vec();
-
-        args.insert(0, "--no-pager");
-        // '-c' arguments must be inserted in reverse order; Git does not support
-        // shortflags for '-c' arguments, so they must be separated.
-        args.insert(0, "protocol.version=2");
-        args.insert(0, "-c");
-
-        let mut envs = envs.unwrap_or_default();
-        envs.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-        envs.insert("LC_ALL".into(), "C".into()); // Force English. We need this for parsing output.
-
-        self.execute_raw(&args, cwd, Some(envs)).await
-    }
-
-    /// Creates a named pipe server that is compatible with
-    /// the `askpass` utility (see `bin/askpass.rs` and platform-specific
-    /// adjacent sources).
-    ///
-    /// ## Unix
-    ///
-    /// On Unix-like systems (including macOS), this is a unix
-    /// domain socket. The path of the socket is returned as
-    /// a handle type that is format-able as a string which is
-    /// passed to the askpass utility as `GITBUTLER_ASKPASS_SOCKET`.
-    ///
-    /// The socket itself should be created as read/write for the user
-    /// with no access to group or everyone (`0600` or `u+rw ag-a`).
-    ///
-    /// Upon the handle being dropped, the socket must be closed and
-    /// the socket file SHOULD be best-effort unlinked.
-    ///
-    /// Given that this invariant must be upheld, this method is marked
-    /// as unsafe.
-    ///
-    /// ## Windows
-    ///
-    /// On Windows, this is a named pipe. The handle returned must be
-    /// format-able as a string which is passed to the askpass utility
-    /// as `GITBUTLER_ASKPASS_SOCKET` and corresponds to the named
-    /// pipe.
-    ///
-    /// The pipe name MUST start with `\.\pipe\LOCAL\`. Given that this
-    /// invariant must be upheld, this method is marked as unsafe.
-    ///
-    /// Upon the handle being dropped, the pipe must be closed.
-    ///
-    /// # Safety
-    ///
-    /// This method is marked as unsafe due to the platform-specific
-    /// invariants described above that must be upheld by all implementations.
-    /// These invariants are not enforced by the typesystem, and while
-    /// we have some loose checks to ensure that the invariants are upheld,
-    /// we cannot guarantee that they are upheld in all cases. Thus, it is
-    /// up to the implementer to ensure that the invariants are upheld.
-    ///
-    /// If for some reason these invariants are not possible to uphold,
-    /// please open an issue on the repository to discuss this issue.
-    async unsafe fn create_askpass_server(&self) -> Result<Self::ServerHandle, Self::Error>;
-
-    /// Gets some basic information about a file on the filesystem.
-    ///
-    /// This is used to perform some basic security checks
-    /// during askpass authentication.
-    ///
-    /// **Do not follow symbolic links.**
-    async fn stat<P: AsRef<Path>>(&self, path: P) -> Result<FileStat, Self::Error>;
-}
-
 /// Stats for a file on the filesystem.
 ///
-/// This is returned by [`GitExecutor::stat`],
+/// This is returned by `tokio::stat`,
 /// and is just a small subset of the information
 /// typically returned by `stat(2)` and the like,
 /// as we only need a small subset of the information
@@ -163,14 +21,14 @@ pub struct FileStat {
     pub is_regular_file: bool,
 }
 
-/// A handle to a server created by [`GitExecutor::create_askpass_server`].
+/// An askpass server compatible with the askpass helper (`gitcthulhu_git::helper_main::askpass_main`).
 ///
-/// When formatted as a string, the result should be the connection string
-/// necessary for the askpass utility to connect (e.g. a unix domain socket path
-/// or a windows named pipe name; see [`GitExecutor::create_askpass_server`] for
-/// more information).
+/// When formatted as a string, the result is the connection string the askpass helper gets as
+/// `GITCTHULHU_ASKPASS_PIPE`:
 ///
-/// Upon dropping the handle, the server should be closed.
+/// - Unix: the path of a Unix domain socket, readable and writable by the user only (`0600`); it is closed and
+///   best-effort unlinked when the handle is dropped.
+/// - Windows: the name of a named pipe, starting with `\\.\pipe\LOCAL\`; it is closed when the handle is dropped.
 pub trait AskpassServer: core::fmt::Display {
     /// The type of error that is returned by [`AskpassServer::accept`].
     type Error: std::error::Error + core::fmt::Debug + Send + Sync + 'static;
@@ -198,10 +56,7 @@ pub type Pid = PidInner;
 #[cfg(unix)]
 pub type Uid = u32;
 
-/// Platform-specific credentials for a connection to a server created by
-/// [`GitExecutor::create_askpass_server`]. This is passed to the callback
-/// provided to [`GitExecutor::create_askpass_server`] when a connection
-/// is established.
+/// A connection accepted by an [`AskpassServer`], with the platform-specific credentials of its peer.
 pub trait Socket {
     /// The error type returned by I/O operations on this socket.
     type Error: std::error::Error + core::fmt::Debug + Send + Sync + 'static;

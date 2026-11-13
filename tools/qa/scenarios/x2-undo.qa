@@ -1,0 +1,45 @@
+# Milestone 2 (X2): the Undo / Redo UI on the clean "linear" fixture, dark then light, 1280x720. The toolbar's
+# Undo / Redo buttons (tooltips are not part of a capture), the history popover under the Undo chevron, the
+# "Undone" badge, the restore confirmation and the toast actions. Compare with spec 21 section 5.1.
+# The scenario creates branches and a commit: run it against a fresh sandbox (new-sandbox.ps1 -Force) every time.
+resize 1280x720
+set theme dark
+open repository linear
+wait idle
+shot x2-01-toolbar-nothing-to-undo
+# Three recorded operations: a branch, a commit, a second branch.
+undo demo branch feature-x
+wait idle
+undo demo stage notes.txt
+wait idle
+undo demo commit Add notes
+wait idle
+undo demo branch feature-y
+wait idle
+shot x2-02-toolbar-undo-enabled-with-toast
+undo history open
+wait idle
+shot x2-03-history-popover
+undo history close
+# Undo the last branch: Redo becomes available, the toast offers Redo.
+undo
+wait idle
+shot x2-04-after-undo
+undo history open
+wait idle
+shot x2-05-history-undone-badge
+# Restore to before the commit: the confirmation lists what changes; declining it changes nothing.
+undo history restore 1 before
+wait 600
+shot x2-06-restore-confirmation
+close dialog
+wait idle
+redo
+wait idle
+set theme light
+undo history open
+wait idle
+shot x2-07-history-popover-light
+undo history close
+set theme dark
+assert no error

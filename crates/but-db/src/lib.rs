@@ -51,11 +51,16 @@
 //! #### Add a new field
 //!
 //! ```text
-//! Add a new optional string named 'note' to ClaudePermissionRequest in @crates/but-db/tests/db/table/claude.rs
+//! Add a new optional string named 'note' to ForgeReview in @crates/but-db/src/table/forge_reviews.rs
 //! ```
+//!
+//! ## Schema history
+//!
+//! GitCthulhu never opens a GitButler database, so the migration history starts with one baseline migration per
+//! table. The database files are named `gitcthulhu.sqlite` and `gitcthulhu-cache.sqlite` to never pick up a file
+//! written with an older history.
 #![expect(clippy::inconsistent_digit_grouping)]
 #![deny(missing_docs)]
-use but_utils::OnDemand;
 use rusqlite::ErrorCode;
 use std::path::PathBuf;
 
@@ -67,22 +72,12 @@ mod transaction;
 pub mod cache;
 /// Migration helpers for applying and configuring database schema updates.
 pub mod migration;
-pub mod worktrees;
 
 #[rustfmt::skip]
 pub use table::{
-    hunk_assignments::{HunkAssignmentsHandleMut, HunkAssignmentsHandle, HunkAssignment},
-    branch_order::{BranchOrderEntry, BranchOrderHandle, BranchOrderHandleMut, BranchOrderSnapshot},
-    butler_actions::ButlerAction,
-    claude::{ClaudeMessage, ClaudePermissionRequest, ClaudeSession},
-    file_write_locks::FileWriteLock,
     fetch_status::FetchStatus,
-    gerrit_metadata::{GerritMeta, GerritMetadataHandle},
-    obs_markers::{ObsMarker, ObsMarkersHandle, ObsMarkersHandleMut},
     forge_reviews::ForgeReview,
     ci_checks::CiCheck,
-    virtual_branches::{VbStack, VbStackHead, VbState, VirtualBranchesSnapshot, VirtualBranchesHandle, VirtualBranchesHandleMut},
-    worktree_meta::{WorktreeMeta, WorktreeMetaHandle, WorktreeMetaHandleMut},
 };
 
 /// The *retryable* error type used by [`backoff()`] for SQLite operations.
@@ -130,19 +125,9 @@ pub fn map_err(err: rusqlite::Error) -> ::backoff::Error<rusqlite::Error> {
 
 /// The migrations to run, in any order, as ordering is maintained by their date number.
 pub const MIGRATIONS: &[&[M<'static>]] = &[
-    table::M_FULLY_REMOVED,
-    table::hunk_assignments::M,
-    table::branch_order::M,
-    table::butler_actions::M,
-    table::claude::M,
-    table::file_write_locks::M,
     table::fetch_status::M,
-    table::gerrit_metadata::M,
     table::forge_reviews::M,
     table::ci_checks::M,
-    table::virtual_branches::M,
-    table::worktree_meta::M,
-    table::obs_markers::M,
 ];
 
 /// A migration and all the necessary data associated with it to perform it once.
@@ -194,14 +179,6 @@ pub struct AppCacheHandle {
     path: PathBuf,
 }
 
-/// A structure to receive a project-local cache.
-pub struct CacheHandle {
-    /// The open connection to the cache.
-    conn: rusqlite::Connection,
-    /// The path to the project-local cache.
-    path: PathBuf,
-}
-
 /// An abstraction over an open database connection, and for access to the ORM layer and [transactions](DbHandle::transaction()).
 ///
 /// The underlying sqlite database is set up to use Rusts borrow-checker,
@@ -211,9 +188,6 @@ pub struct DbHandle {
     conn: rusqlite::Connection,
     /// The path at which the connection was opened, mainly for debugging.
     path: PathBuf,
-    /// A lazily opened project-local cache. It is in-memory of the parent instance is in-memory,
-    /// or in the same directory as the parent instance.
-    pub cache: OnDemand<CacheHandle>,
 }
 
 /// A wrapper for a [`rusqlite::Transaction`] to allow ORM handles to be created more easily,

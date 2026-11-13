@@ -1,10 +1,10 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
+use crate::tool::Toolset;
 use anyhow::{Context, Result};
 use async_openai::{
     Client,
     config::OpenAIConfig,
-    error::OpenAIError,
     types::chat::{
         ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageContent,
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
@@ -12,7 +12,6 @@ use async_openai::{
         CreateChatCompletionRequestArgs, ResponseFormat, ResponseFormatJsonSchema,
     },
 };
-use but_tools::tool::Toolset;
 use futures::StreamExt;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
@@ -23,23 +22,19 @@ use crate::{
     chat::ConversationResult,
 };
 
-pub trait OpenAIClientProvider {
+pub trait OpenAIClientProvider: Sync {
     fn client(&self) -> Result<Client<OpenAIConfig>>;
-}
 
-/// `err`, with the reason of an endpoint that answers errors as `{"error": "…"}`, as
-/// GitButler's proxy does, rather than in OpenAI's shape, which async-openai can't read.
-fn readable(err: OpenAIError) -> anyhow::Error {
-    #[derive(serde::Deserialize)]
-    struct Said {
-        error: String,
+    /// Whether output limits are sent as `max_completion_tokens`, which OpenAI's own models require, rather
+    /// than the older `max_tokens` that every other OpenAI-compatible server understands.
+    fn uses_max_completion_tokens(&self) -> bool {
+        false
     }
-    if let OpenAIError::JSONDeserialize(_, body) = &err
-        && let Ok(Said { error }) = serde_json::from_str(body)
-    {
-        return anyhow::anyhow!("The AI provider answered: {error}");
+
+    /// How long connecting and waiting for the response head may take.
+    fn response_start_timeout(&self) -> std::time::Duration {
+        crate::http::RESPONSE_START_TIMEOUT
     }
-    err.into()
 }
 
 impl From<ChatMessage> for ChatCompletionRequestMessage {
@@ -97,13 +92,7 @@ pub fn structured_output_blocking<
             .collect::<Vec<_>>(),
     );
 
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(structured_output::<T>(&client, messages, model))
-    })
-    .join()
-    .unwrap()
+    crate::runtime::block_on(async move { structured_output::<T>(&client, messages, model).await })
 }
 
 pub fn response_blocking(
@@ -112,27 +101,16 @@ pub fn response_blocking(
     chat_messages: Vec<ChatMessage>,
     model: &str,
 ) -> anyhow::Result<Option<String>> {
-    let mut messages: Vec<ChatCompletionRequestMessage> =
-        vec![ChatCompletionRequestSystemMessage::from(system_message).into()];
-
-    messages.extend(
-        chat_messages
-            .into_iter()
-            .map(ChatCompletionRequestMessage::from)
-            .collect::<Vec<_>>(),
-    );
-
-    let client = provider.client()?;
-    let messages_owned = messages.clone();
-    let model = model.to_string();
-
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(response(&client, messages_owned, model))
+    crate::runtime::block_on(async {
+        Ok(crate::chat_completions::complete(
+            provider,
+            system_message,
+            chat_messages,
+            model,
+            &crate::GenerateOptions::default(),
+        )
+        .await?)
     })
-    .join()
-    .unwrap()
 }
 
 pub fn tool_calling_blocking(
@@ -146,13 +124,9 @@ pub fn tool_calling_blocking(
     let tools_owned = tools;
     let model = model.to_string();
 
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(tool_calling(&client, messages_owned, tools_owned, model))
+    crate::runtime::block_on(async move {
+        tool_calling(&client, messages_owned, tools_owned, model).await
     })
-    .join()
-    .unwrap()
 }
 
 pub fn stream_response_blocking(
@@ -162,27 +136,17 @@ pub fn stream_response_blocking(
     model: &str,
     on_token: impl Fn(&str) + Send + Sync + 'static,
 ) -> anyhow::Result<Option<String>> {
-    let mut messages: Vec<ChatCompletionRequestMessage> =
-        vec![ChatCompletionRequestSystemMessage::from(system_message).into()];
-
-    messages.extend(
-        chat_messages
-            .into_iter()
-            .map(ChatCompletionRequestMessage::from)
-            .collect::<Vec<_>>(),
-    );
-
-    let client = provider.client()?;
-    let messages_owned = messages.clone();
-    let model = model.to_string();
-
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(stream_response(&client, messages_owned, model, on_token))
+    crate::runtime::block_on(async {
+        Ok(crate::chat_completions::stream(
+            provider,
+            system_message,
+            chat_messages,
+            model,
+            &crate::GenerateOptions::default(),
+            &mut |token| on_token(token),
+        )
+        .await?)
     })
-    .join()
-    .unwrap()
 }
 
 pub fn tool_calling_stream_blocking(
@@ -197,19 +161,9 @@ pub fn tool_calling_stream_blocking(
     let tools_owned = tools;
     let model = model.to_string();
 
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(tool_calling_stream(
-                &client,
-                messages_owned,
-                tools_owned,
-                model,
-                on_token,
-            ))
+    crate::runtime::block_on(async move {
+        tool_calling_stream(&client, messages_owned, tools_owned, model, on_token).await
     })
-    .join()
-    .unwrap()
 }
 pub fn tool_calling_loop(
     provider: &impl OpenAIClientProvider,
@@ -530,7 +484,7 @@ async fn structured_output<T: serde::Serialize + DeserializeOwned + JsonSchema>(
         .response_format(response_format)
         .build()?;
 
-    let response = client.chat().create(request).await.map_err(readable)?;
+    let response = client.chat().create(request).await?;
 
     for choice in response.choices {
         if let Some(content) = choice.message.content {
@@ -574,27 +528,6 @@ fn make_schema_strict(value: &mut serde_json::Value) {
     }
 }
 
-async fn response(
-    client: &Client<OpenAIConfig>,
-    messages: Vec<ChatCompletionRequestMessage>,
-    model: String,
-) -> anyhow::Result<Option<String>> {
-    let request = CreateChatCompletionRequestArgs::default()
-        .model(model)
-        .messages(messages)
-        .build()?;
-
-    let response = client.chat().create(request).await.map_err(readable)?;
-
-    for choice in response.choices {
-        if let Some(content) = choice.message.content {
-            return Ok(Some(content));
-        }
-    }
-
-    Ok(None)
-}
-
 async fn tool_calling(
     client: &Client<OpenAIConfig>,
     messages: Vec<ChatCompletionRequestMessage>,
@@ -607,51 +540,9 @@ async fn tool_calling(
         .tools(tools)
         .build()?;
 
-    let response = client.chat().create(request).await.map_err(readable)?;
+    let response = client.chat().create(request).await?;
 
     Ok(response)
-}
-
-async fn stream_response(
-    client: &Client<OpenAIConfig>,
-    messages: Vec<ChatCompletionRequestMessage>,
-    model: String,
-    on_token: impl Fn(&str) + Send + Sync + 'static,
-) -> anyhow::Result<Option<String>> {
-    let request = CreateChatCompletionRequestArgs::default()
-        .model(model)
-        .messages(messages.clone())
-        .build()?;
-
-    let mut stream = client
-        .chat()
-        .create_stream(request)
-        .await
-        .map_err(readable)?;
-
-    let mut response_text: Option<String> = None;
-
-    while let Some(result) = stream.next().await {
-        let response =
-            (result.map_err(readable)).context("Failed to receive response from OpenAI stream")?;
-        if let Some(chat_choice) = response.choices.first() {
-            // If there is any text content in the response, call the on_token callback
-            if let Some(content) = &chat_choice.delta.content {
-                if response_text.is_none() {
-                    response_text = Some(String::new());
-                }
-
-                if let Some(text) = response_text.as_mut() {
-                    text.push_str(content);
-                }
-
-                let content_str = content.as_str();
-                on_token(content_str);
-            }
-        }
-    }
-
-    Ok(response_text)
 }
 
 async fn tool_calling_stream(
@@ -667,11 +558,7 @@ async fn tool_calling_stream(
         .tools(tools)
         .build()?;
 
-    let mut stream = client
-        .chat()
-        .create_stream(request)
-        .await
-        .map_err(readable)?;
+    let mut stream = client.chat().create_stream(request).await?;
 
     let tool_call_states: Arc<Mutex<HashMap<(u32, u32), ToolCall>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -679,8 +566,7 @@ async fn tool_calling_stream(
     let mut response_text: Option<String> = None;
 
     while let Some(result) = stream.next().await {
-        let response =
-            (result.map_err(readable)).context("Failed to receive response from OpenAI stream")?;
+        let response = (result).context("Failed to receive response from OpenAI stream")?;
         if let Some(chat_choice) = response.choices.first() {
             // Keep track of tool call states
             if let Some(tool_calls) = &chat_choice.delta.tool_calls {
@@ -761,19 +647,6 @@ async fn tool_calling_stream(
 mod tests {
     use super::make_schema_strict;
     use serde_json::json;
-
-    #[test]
-    fn a_string_error_from_the_proxy_says_its_reason() {
-        let body = r#"{"error":"401 Unauthorized"}"#;
-        let unread = serde_json::from_str::<async_openai::error::WrappedError>(body)
-            .expect_err("async-openai expects an object under `error`");
-        let err = super::readable(super::OpenAIError::JSONDeserialize(unread, body.into()));
-        assert_eq!(
-            err.to_string(),
-            "The AI provider answered: 401 Unauthorized",
-            "the proxy's reason, not a decoding error"
-        );
-    }
 
     #[test]
     fn schemas_are_rewritten_for_strict_mode() {

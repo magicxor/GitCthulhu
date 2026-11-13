@@ -1,12 +1,11 @@
 use std::{fmt::Display, path::PathBuf};
 
-use but_project_handle::ProjectHandleOrLegacyProjectId;
 use gix::bstr::BString;
 
 /// The checkout of a repository in which files changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Checkout {
-    /// The main worktree.
+    /// The opened checkout (the main worktree, or the linked worktree that was opened).
     Main,
     /// The linked worktree of this name, i.e. its directory name under `$GIT_COMMON_DIR/worktrees/`.
     Linked(BString),
@@ -26,32 +25,41 @@ pub struct LinkedWorktree {
 pub enum InternalEvent {
     // From file monitor
     /// Paths relative to the git dir of the checkout.
-    GitFilesChange(ProjectHandleOrLegacyProjectId, Checkout, Vec<PathBuf>),
+    GitFilesChange(Checkout, Vec<PathBuf>),
+    /// Paths relative to the common git dir, reported only if the watched checkout is a linked worktree
+    /// (whose refs, `packed-refs` and `config` live in the common dir).
+    CommonGitFilesChange(Vec<PathBuf>),
     /// Paths relative to the working directory of the checkout.
-    ProjectFilesChange(ProjectHandleOrLegacyProjectId, Checkout, Vec<PathBuf>),
+    ProjectFilesChange(Checkout, Vec<PathBuf>),
+    /// Part of the watching does not work: the operating system's watch limit was reached, a directory could not
+    /// be watched, or the watcher reported an error (for example lost events). Changes may be missed; whoever
+    /// consumes the events should refresh by other means.
+    WatchError(String),
 }
 
 impl Display for InternalEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InternalEvent::GitFilesChange(project_id, checkout, paths) => {
+            InternalEvent::GitFilesChange(checkout, paths) => {
                 write!(
                     f,
-                    "GitFileChange({}, {:?}, {})",
-                    project_id,
+                    "GitFileChange({:?}, {})",
                     checkout,
                     comma_separated_paths(paths)
                 )
             }
-            InternalEvent::ProjectFilesChange(project_id, checkout, paths) => {
+            InternalEvent::CommonGitFilesChange(paths) => {
+                write!(f, "CommonGitFileChange({})", comma_separated_paths(paths))
+            }
+            InternalEvent::ProjectFilesChange(checkout, paths) => {
                 write!(
                     f,
-                    "ProjectFileChange({}, {:?}, {})",
-                    project_id,
+                    "ProjectFileChange({:?}, {})",
                     checkout,
                     comma_separated_paths(paths)
                 )
             }
+            InternalEvent::WatchError(message) => write!(f, "WatchError({message})"),
         }
     }
 }

@@ -1,10 +1,11 @@
 //! The user's shell on a pseudo-terminal, with what it writes read on its own thread.
 
-use std::mem;
+use std::ffi::OsString;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{self, Poll};
+use std::{io, mem};
 
 use futures::channel::mpsc;
 use futures::{Stream, StreamExt as _};
@@ -102,6 +103,87 @@ fn queue() -> (Queue, Output) {
     (queue, output)
 }
 
+/// How a shell is told to run a command in place of its prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    /// cmd.exe: `/s /c "<command>"`, the command as written.
+    Cmd,
+    /// PowerShell (pwsh.exe, powershell.exe): `-Command <command>`.
+    PowerShell,
+    /// A POSIX shell (sh, bash, zsh, fish): `-i -c <command>`, still interactive so it reads the
+    /// same config as at a prompt.
+    Posix,
+    /// A program that can't be given a command, such as `wsl.exe` or a user's own command line:
+    /// it only ever starts at its prompt.
+    Other,
+}
+
+/// The shell a terminal starts: the program, the arguments it always gets, how it's told to run
+/// a command, and variables set for it on top of this process's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellSpec {
+    /// The program, a path or a name looked up on `PATH`.
+    pub program: OsString,
+    /// Arguments before the command's, if any.
+    pub args: Vec<OsString>,
+    pub kind: ShellKind,
+    /// Set for the shell, after the terminal's own (`TERM` and friends).
+    pub env: Vec<(OsString, OsString)>,
+}
+
+impl ShellSpec {
+    /// The platform's default: `%COMSPEC%`, else cmd.exe, on Windows; elsewhere `$SHELL`, else
+    /// /bin/zsh on macOS and /bin/sh, as a login shell.
+    pub fn default_shell() -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                program: std::env::var_os("COMSPEC")
+                    .filter(|shell| !shell.is_empty())
+                    .unwrap_or_else(|| "cmd.exe".into()),
+                args: Vec::new(),
+                kind: ShellKind::Cmd,
+                env: Vec::new(),
+            }
+        }
+        #[cfg(unix)]
+        {
+            let program = std::env::var_os("SHELL")
+                .filter(|shell| !shell.is_empty())
+                .unwrap_or_else(|| {
+                    if cfg!(target_os = "macos") {
+                        "/bin/zsh"
+                    } else {
+                        "/bin/sh"
+                    }
+                    .into()
+                });
+            Self {
+                program,
+                args: vec!["-l".into()],
+                kind: ShellKind::Posix,
+                env: Vec::new(),
+            }
+        }
+    }
+
+    /// The arguments that run `command`, after [`ShellSpec::args`], as the shell's kind takes them,
+    /// or an error for a shell that can't run one.
+    pub fn command_args(&self, command: &str) -> io::Result<Vec<OsString>> {
+        Ok(match self.kind {
+            ShellKind::Cmd => vec!["/s".into(), "/c".into(), command.into()],
+            ShellKind::PowerShell => vec!["-Command".into(), command.into()],
+            ShellKind::Posix => vec!["-i".into(), "-c".into(), command.into()],
+            ShellKind::Other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "this shell can't be given a command to run",
+                ));
+            }
+        })
+    }
+}
+
 /// A grid size, with the pixel size of one cell for programs that ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Size {
@@ -140,6 +222,47 @@ mod tests {
         assert!(
             !queue.full(),
             "a reader stopped now would never start again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    fn spec(kind: ShellKind) -> ShellSpec {
+        ShellSpec {
+            program: "sh".into(),
+            args: Vec::new(),
+            kind,
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn each_kind_of_shell_is_told_a_command_its_own_way() {
+        let args = |kind| -> Vec<String> {
+            (spec(kind)
+                .command_args("ls")
+                .expect("this kind takes commands"))
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+        };
+        assert_eq!(args(ShellKind::Cmd), ["/s", "/c", "ls"], "cmd.exe");
+        assert_eq!(
+            args(ShellKind::PowerShell),
+            ["-Command", "ls"],
+            "PowerShell"
+        );
+        assert_eq!(
+            args(ShellKind::Posix),
+            ["-i", "-c", "ls"],
+            "interactive POSIX shells"
+        );
+        assert!(
+            spec(ShellKind::Other).command_args("ls").is_err(),
+            "a shell of no known kind is never given a command"
         );
     }
 }

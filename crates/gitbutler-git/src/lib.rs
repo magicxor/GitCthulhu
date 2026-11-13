@@ -1,30 +1,15 @@
-//! GitButler utility library for pushing/fetching Git repositories
-//! using the Git CLI.
+//! The `git` executable side of GitCthulhu's askpass support.
 //!
-//! **Important Note:** This is an interim library. Please do not rely on it;
-//! it's only used as a temporary measure in the GitButler app until we implement
-//! a longer-term solution for managing Git operations.
+//! [`askpass_harness`] is what the backend (`gitcthulhu-git`) builds on: the askpass server and the transport
+//! defaults for SSH and HTTP. The askpass helper program is not here (it is `gitcthulhu_git::helper_main`).
 #![deny(missing_docs, unsafe_code)]
 #![allow(async_fn_in_trait)]
 #![allow(unknown_lints)]
 
 #[cfg(feature = "tokio")]
-mod context;
-mod error;
-/// utilities to execute a command
+pub mod askpass_harness;
+/// The askpass server: a Unix domain socket or a Windows named pipe, and the peer checks.
 pub mod executor;
-mod refspec;
-mod repository;
 
 #[cfg(feature = "tokio")]
-pub use self::context::{
-    GitContextExt, PushResult, fetch_with_askpass, prune_with_askpass, push_with_askpass,
-    remote_failure_reason,
-};
-#[cfg(feature = "tokio")]
 pub use self::executor::tokio;
-pub use self::{
-    error::Error,
-    refspec::{Error as RefSpecError, RefSpec},
-    repository::{clone, fetch, prune, push},
-};

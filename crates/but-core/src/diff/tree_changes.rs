@@ -1,18 +1,9 @@
 use gix::{diff::tree_with_rewrites::Change, prelude::TreeDiffChangeExt};
 
-use crate::{ChangeState, Commit, ModeFlags, TreeChange, TreeStatus, commit::TreeKind};
+use crate::{ChangeState, ModeFlags, TreeChange, TreeStatus};
 
-// TODO: use `peel_to_tree()` once special conflict markers aren't needed anymore.
 fn id_to_tree(repo: &gix::Repository, id: gix::ObjectId) -> anyhow::Result<gix::Tree<'_>> {
-    let object = repo.find_object(id)?;
-    if object.kind == gix::object::Kind::Commit {
-        let commit = Commit::from_id(object.peel_to_commit()?.id())?;
-        let tree = commit.tree_id_or_kind(TreeKind::AutoResolution)?;
-        let tree = repo.find_tree(tree)?;
-        Ok(tree)
-    } else {
-        Ok(object.peel_to_tree()?)
-    }
+    Ok(repo.find_object(id)?.peel_to_tree()?)
 }
 
 /// A type representing one or more changes of a tree entry itself, with utility methods for convenience.
@@ -28,8 +19,6 @@ impl TreeChanges {
     /// there was no tree to compare `lhs` to (e.g. in case of the first commit).
     ///
     /// Can be given either a commit or a tree oid.
-    ///
-    /// Note that we deal with conflicted commits correctly by resolving to the actual tree, not the one with meta-data.
     ///
     /// They are sorted by their current path.
     ///

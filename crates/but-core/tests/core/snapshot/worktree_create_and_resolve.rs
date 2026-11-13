@@ -31,9 +31,6 @@ Outcome {
     worktree: None,
     index: None,
     index_conflicts: None,
-    workspace_references: None,
-    head_references: None,
-    metadata: None,
 }
 
 "#]]
@@ -44,14 +41,9 @@ Outcome {
         snapshot::resolve_tree::Options::default(),
     )?;
     assert!(out.index.is_none());
-    assert!(out.metadata.is_none());
     assert!(
         out.worktree_cherry_pick.is_none(),
         "no worktree to cherry-pick"
-    );
-    assert!(
-        out.workspace_references.is_none(),
-        "didn't ask to store this"
     );
 
     Ok(())
@@ -88,9 +80,6 @@ Outcome {
     ),
     index: None,
     index_conflicts: None,
-    workspace_references: None,
-    head_references: None,
-    metadata: None,
 }
 
 "#]]
@@ -111,11 +100,6 @@ Outcome {
         Due to the way this works, we don't have to test much as we rely on gix merge to work."
     );
     assert!(res_out.index.is_none());
-    assert!(res_out.metadata.is_none());
-    assert!(
-        res_out.workspace_references.is_none(),
-        "didn't ask to store this"
-    );
 
     state.selection.clear();
     let out = snapshot::create_tree(head_tree_id, state)?;
@@ -164,9 +148,6 @@ Outcome {
     ),
     index: None,
     index_conflicts: None,
-    workspace_references: None,
-    head_references: None,
-    metadata: None,
 }
 
 "#]]
@@ -187,11 +168,6 @@ Outcome {
         Due to the way this works, we don't have to test much as we rely on gix merge to work."
     );
     assert!(res_out.index.is_none());
-    assert!(res_out.metadata.is_none());
-    assert!(
-        res_out.workspace_references.is_none(),
-        "didn't ask to store this"
-    );
 
     state.selection.clear();
     let out = snapshot::create_tree(head_tree_id, state)?;

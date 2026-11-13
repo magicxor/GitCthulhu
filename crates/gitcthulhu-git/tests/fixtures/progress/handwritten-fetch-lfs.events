@@ -1,0 +1,23 @@
+Message("From https://github.com/octo/repo")
+Phase { phase: "Enumerating objects", remote: true, current: 1532, total: None, percent: None, throughput: None, done: true }
+Phase { phase: "Counting objects", remote: true, current: 10, total: Some(20), percent: Some(50), throughput: None, done: false }
+Phase { phase: "Counting objects", remote: true, current: 20, total: Some(20), percent: Some(100), throughput: None, done: false }
+Phase { phase: "Counting objects", remote: true, current: 20, total: Some(20), percent: Some(100), throughput: None, done: true }
+Phase { phase: "Compressing objects", remote: true, current: 8, total: Some(8), percent: Some(100), throughput: None, done: true }
+Message("remote: Total 1532 (delta 12), reused 3 (delta 3), pack-reused 1500 (from 1)")
+Phase { phase: "Receiving objects", remote: false, current: 1, total: Some(1532), percent: Some(0), throughput: None, done: false }
+Phase { phase: "Receiving objects", remote: false, current: 690, total: Some(1532), percent: Some(45), throughput: Some("1.20 MiB | 2.00 MiB/s"), done: false }
+Phase { phase: "Receiving objects", remote: false, current: 1532, total: Some(1532), percent: Some(100), throughput: Some("2.50 MiB | 2.10 MiB/s"), done: true }
+Phase { phase: "Resolving deltas", remote: false, current: 0, total: Some(12), percent: Some(0), throughput: None, done: false }
+Phase { phase: "Resolving deltas", remote: false, current: 12, total: Some(12), percent: Some(100), throughput: None, done: true }
+Phase { phase: "Receiving objects", remote: false, current: 1234, total: None, percent: None, throughput: Some("1.20 MiB | 2.00 MiB/s"), done: false }
+Phase { phase: "Updating files", remote: false, current: 1, total: Some(2), percent: Some(50), throughput: None, done: false }
+Phase { phase: "Updating files", remote: false, current: 2, total: Some(2), percent: Some(100), throughput: None, done: false }
+Phase { phase: "Updating files", remote: false, current: 2, total: Some(2), percent: Some(100), throughput: None, done: true }
+Phase { phase: "Filtering content", remote: false, current: 2, total: Some(2), percent: Some(100), throughput: Some("1.00 KiB | 0 bytes/s"), done: true }
+Phase { phase: "Downloading LFS objects", remote: false, current: 1, total: Some(2), percent: Some(50), throughput: Some("1.2 MB | 600 KB/s"), done: false }
+Phase { phase: "Downloading LFS objects", remote: false, current: 2, total: Some(2), percent: Some(100), throughput: Some("2.4 MB | 1.2 MB/s"), done: true }
+Message("   3f2a1b0..9c8d7e6  main       -> origin/main")
+Message("Already up to date.")
+Message("remote:")
+Message("remote: Create a pull request for 'feature' on GitHub by visiting:")

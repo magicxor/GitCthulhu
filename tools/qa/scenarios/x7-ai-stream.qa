@@ -1,0 +1,17 @@
+# Milestone-2 integration (X7): the commit box's AI control in the middle of a generation (the button reads "Stop"
+# with a spinner and the message field is read-only) and after it, against the fake local provider streaming one
+# word every 400 ms. Dark theme, 1280x720; compare with 21 section 5.3.
+resize 1280x720
+set theme dark
+ai use fake provider 400
+open repository linear
+wait idle
+ai prepare staged changes
+wait idle
+ai set message wip: sign-up form
+ai generate
+wait 2500
+shot x7-ai-01-streaming-stop
+wait idle
+shot x7-ai-02-generated
+assert no error

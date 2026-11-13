@@ -33,7 +33,7 @@ impl BitbucketClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("gb-bitbucket-integration"),
+            HeaderValue::from_static("gitcthulhu-bitbucket-integration"),
         );
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let basic =
@@ -62,7 +62,7 @@ impl BitbucketClient {
             account_id.client(&access_token)
         } else {
             Err(anyhow::anyhow!(
-                "No Bitbucket access token found for account '{account_id}'.\nRun 'but config forge auth' to re-authenticate."
+                "No Bitbucket access token found for account '{account_id}'.\nSign in again under Settings > Accounts."
             )
             .context(NOT_AUTHENTICATED))
         }
@@ -642,7 +642,7 @@ pub(crate) fn resolve_account(
     let known_accounts = crate::token::list_known_bitbucket_accounts(storage)?;
     let Some(default_account) = known_accounts.first() else {
         return Err(anyhow::anyhow!(
-            "No authenticated Bitbucket users found.\nRun 'but config forge auth' to authenticate with Bitbucket."
+            "No authenticated Bitbucket users found.\nAdd a Bitbucket account under Settings > Accounts."
         )
         .context(NOT_AUTHENTICATED));
     };
@@ -651,7 +651,7 @@ pub(crate) fn resolve_account(
             account
         } else {
             return Err(anyhow::anyhow!(
-                "Preferred Bitbucket account '{account}' has not authenticated yet.\nRun 'but config forge auth' to authenticate, or choose another account."
+                "Preferred Bitbucket account '{account}' has not authenticated yet.\nSign in under Settings > Accounts, or choose another account."
             )
             .context(NOT_AUTHENTICATED));
         }

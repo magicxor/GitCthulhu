@@ -14,7 +14,7 @@ mod local {
             &repo,
             gix::config::Source::Local,
             |config| {
-                set_config_value(config, "gitbutler.testValue", "set")?;
+                set_config_value(config, "gitcthulhu.testValue", "set")?;
                 Ok(())
             }
         )?);
@@ -22,7 +22,7 @@ mod local {
         repo.reload()?;
         assert_eq!(
             repo.config_snapshot()
-                .string("gitbutler.testValue")
+                .string("gitcthulhu.testValue")
                 .map(|value| value.to_string()),
             Some("set".to_owned())
         );
@@ -32,13 +32,13 @@ mod local {
     #[test]
     fn writes_back_local_config_when_value_is_removed() -> anyhow::Result<()> {
         let (mut repo, _tmp) = writable_scenario("git-config-empty");
-        invoke_bash("git config --local gitbutler.testValue kept", &repo);
+        invoke_bash("git config --local gitcthulhu.testValue kept", &repo);
 
         assert!(edit_repo_config(
             &repo,
             gix::config::Source::Local,
             |config| {
-                remove_config_value(config, "gitbutler.testValue")?;
+                remove_config_value(config, "gitcthulhu.testValue")?;
                 Ok(())
             }
         )?);
@@ -46,7 +46,7 @@ mod local {
         repo.reload()?;
         assert_eq!(
             repo.config_snapshot()
-                .string("gitbutler.testValue")
+                .string("gitcthulhu.testValue")
                 .map(|value| value.to_string()),
             None
         );

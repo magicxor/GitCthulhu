@@ -3,34 +3,41 @@
 use std::{
     fs::{self, File},
     io::Read,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
+    os::unix::fs::PermissionsExt as _,
+    path::Path,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::ui;
 
-/// Returns the path to the `but` CLI binary for the given home directory.
-pub(crate) fn but_binary_path(home_dir: &Path) -> PathBuf {
-    home_dir.join(".local/bin/but")
+/// The name of the application binary the installer puts into `~/.local/bin`.
+pub(crate) const APP_BINARY_NAME: &str = "gitcthulhu";
+
+/// Returns the path to the application binary for the given home directory.
+///
+/// Only the Linux install flow puts a bare binary there; macOS installs an app bundle.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn app_binary_path(home_dir: &Path) -> std::path::PathBuf {
+    home_dir.join(".local/bin").join(APP_BINARY_NAME)
 }
 
-/// Validate that but can be executed
+/// Validate that the installed binary at `path` is an executable file.
+///
+/// The binary is a GUI program without a `--version` mode, so it is not run: running it would
+/// open the application window.
 pub(crate) fn validate_installed_binary(path: &Path) -> bool {
-    Command::new(path)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
+    fs::metadata(path)
+        .map(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
-/// Verify the signature for a CLI installable
+/// Verify the minisign signature of an installable against `public_key_b64`, the release
+/// signing key the installer was configured with.
 pub(crate) fn verify_signature(
     installable: &Path,
     signature_b64: &str,
+    public_key_b64: &str,
     temp_dir: &Path,
 ) -> Result<()> {
     crate::ui::info("Verifying download signature...");
@@ -40,12 +47,8 @@ pub(crate) fn verify_signature(
         bail!("Signature is empty - refusing to verify without a valid signature");
     }
 
-    // GitButler's minisign public key
-    let pubkey_str = "RWTrOEI+im1XYA9RBwyxnzFN/evFzJhU1lbQ70LVayWH3WRo7xQnRLD2";
-
-    // Parse the public key
-    let public_key = minisign_verify::PublicKey::from_base64(pubkey_str)
-        .context("Failed to parse public key")?;
+    let public_key = minisign_verify::PublicKey::from_base64(public_key_b64.trim())
+        .context("Failed to parse the release signing public key")?;
 
     // Decode signature from base64 and write to file
     // The signature format from the API is base64-encoded minisign signature file content
@@ -98,6 +101,57 @@ mod tests {
 
     use super::*;
 
+    /// A syntactically valid minisign public key that signed nothing the tests download.
+    const TEST_PUBLIC_KEY: &str = "RWTrOEI+im1XYA9RBwyxnzFN/evFzJhU1lbQ70LVayWH3WRo7xQnRLD2";
+
+    #[test]
+    fn test_validate_installed_binary_needs_an_executable_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join(APP_BINARY_NAME);
+        assert!(
+            !validate_installed_binary(&binary),
+            "a missing binary is not installed"
+        );
+
+        fs::write(&binary, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !validate_installed_binary(&binary),
+            "a file without the executable bit can't be run"
+        );
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            validate_installed_binary(&binary),
+            "an executable file is installed"
+        );
+        assert!(
+            !validate_installed_binary(temp_dir.path()),
+            "a directory is not a binary"
+        );
+    }
+
+    #[test]
+    fn test_app_binary_path() {
+        assert_eq!(
+            app_binary_path(Path::new("/home/user")),
+            Path::new("/home/user/.local/bin/gitcthulhu")
+        );
+    }
+
+    #[test]
+    fn test_verify_signature_rejects_an_invalid_public_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("test.tar.gz");
+        File::create(&test_file).unwrap();
+
+        let err = verify_signature(&test_file, "c2ln", "not a key", temp_dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("public key"),
+            "a broken key is reported as such: {err}"
+        );
+    }
+
     #[test]
     fn test_verify_signature_empty() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -108,12 +162,12 @@ mod tests {
         file.write_all(&[0x1f, 0x8b, 0x08, 0x00]).unwrap();
 
         // Empty signature should fail with clear error
-        let result = verify_signature(&test_file, "", temp_dir.path());
+        let result = verify_signature(&test_file, "", TEST_PUBLIC_KEY, temp_dir.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
 
         // Whitespace-only signature should also fail
-        let result = verify_signature(&test_file, "   ", temp_dir.path());
+        let result = verify_signature(&test_file, "   ", TEST_PUBLIC_KEY, temp_dir.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }

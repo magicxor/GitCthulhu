@@ -1,5 +1,7 @@
-use but_db::{DbHandle, HunkAssignment, migration::improve_concurrency};
+use but_db::{DbHandle, migration::improve_concurrency};
 use rusqlite::{ErrorCode, ffi};
+
+use crate::table::forge_review::forge_review;
 
 #[test]
 fn deferred() -> anyhow::Result<()> {
@@ -9,19 +11,12 @@ fn deferred() -> anyhow::Result<()> {
     let mut t2 = db2.transaction()?;
 
     // Savepoints can be interleaved
-    let ha1 = t1.hunk_assignments_mut()?;
+    let ha1 = t1.forge_reviews_mut()?;
 
     t2.set_nonblocking()?;
-    let ha2 = t2.hunk_assignments_mut()?;
+    let ha2 = t2.forge_reviews_mut()?;
 
-    let assignments = vec![HunkAssignment {
-        id: None,
-        hunk_header: None,
-        path: "ha1".into(),
-        path_bytes: vec![],
-        stack_id: None,
-        branch_ref_bytes: None,
-    }];
+    let assignments = vec![forge_review(1, "first", "ha1")];
     ha1.set_all(assignments.clone())
         .expect("first transaction gets the lock");
 
@@ -32,7 +27,7 @@ fn deferred() -> anyhow::Result<()> {
         "the second transaction would block because the lock is taken"
     );
     assert_eq!(
-        t2.hunk_assignments()
+        t2.forge_reviews()
             .list_all()
             .expect("readers see the original data"),
         [],
@@ -42,18 +37,18 @@ fn deferred() -> anyhow::Result<()> {
     t1.commit()?;
 
     assert_eq!(
-        t2.hunk_assignments().list_all()?,
+        t2.forge_reviews().list_all()?,
         vec![],
         "the data is written through t1, we see the state when creating the transaction"
     );
 
     assert_eq!(
-        db1.hunk_assignments().list_all()?,
+        db1.forge_reviews().list_all()?,
         assignments,
         "the data is visible through the connection, it sees the latest state"
     );
     assert_eq!(
-        db1.transaction()?.hunk_assignments().list_all()?,
+        db1.transaction()?.forge_reviews().list_all()?,
         assignments,
         "the data is visible through a new transaction as well"
     );
@@ -75,34 +70,32 @@ fn savepoint_read_snapshot_stays_consistent_across_tables_with_interleaved_write
     but_db::migration::run(&mut db2, but_db::migration::ours())?;
 
     db1.execute(
-        "INSERT INTO hunk_assignments (id, hunk_header, path, path_bytes)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            "id-1",
-            "@@ -1,1 +1,1 @@",
-            "path/to/file",
-            b"path/to/file".to_vec(),
-        ],
+        "INSERT INTO fetch_status (singleton, last_attempted_ms, last_successful_ms, last_error)
+         VALUES (1, ?1, NULL, NULL)",
+        rusqlite::params![42],
     )?;
 
     let sp1 = db1.savepoint()?;
 
-    let table1_count: i64 = sp1.query_row("SELECT COUNT(*) FROM hunk_assignments", [], |row| {
-        row.get(0)
-    })?;
+    let table1_count: i64 =
+        sp1.query_row("SELECT COUNT(*) FROM fetch_status", [], |row| row.get(0))?;
     assert_eq!(
         table1_count, 1,
         "first read establishes db1 savepoint snapshot"
     );
 
     db2.execute(
-        "INSERT INTO file_write_locks (path, created_at, owner)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params!["path/to/lock", "2024-01-01 00:00:00", "owner-1",],
+        "INSERT INTO ci_checks (
+            id, name, output_summary, output_text, output_title, started_at, status_type,
+            status_conclusion, status_completed_at, head_sha, url, html_url, details_url,
+            pull_requests, reference, last_sync_at, struct_version
+         ) VALUES (1, 'check', '', '', '', NULL, 'queued', NULL, NULL, 'abc', '', '', '', '[]',
+            'refs/heads/main', '2024-01-01 00:00:00', 1)",
+        [],
     )?;
 
     let count = sp1
-        .query_row("SELECT COUNT(*) FROM file_write_locks", [], |row| {
+        .query_row("SELECT COUNT(*) FROM ci_checks", [], |row| {
             row.get::<_, i64>(0)
         })
         .expect("no database error, we see the pre-write state");
@@ -113,9 +106,8 @@ fn savepoint_read_snapshot_stays_consistent_across_tables_with_interleaved_write
 
     sp1.commit()?;
 
-    let latest_count: i64 = db1.query_row("SELECT COUNT(*) FROM file_write_locks", [], |row| {
-        row.get(0)
-    })?;
+    let latest_count: i64 =
+        db1.query_row("SELECT COUNT(*) FROM ci_checks", [], |row| row.get(0))?;
     assert_eq!(
         latest_count, 1,
         "after savepoint ends, new writes are visible"
@@ -146,23 +138,16 @@ fn deferred_savepoint_write_after_concurrent_commit_returns_busy_snapshot() -> a
     // Start two deferred transactions and establish a read snapshot in t2.
     let mut t1 = db1.transaction()?;
     let mut t2 = db2.transaction()?;
-    assert_eq!(t2.hunk_assignments().list_all()?, vec![]);
+    assert_eq!(t2.forge_reviews().list_all()?, vec![]);
 
     // Write through a savepoint in t1 and commit the outer transaction.
-    let assignments = vec![HunkAssignment {
-        id: None,
-        hunk_header: None,
-        path: "from_t1".into(),
-        path_bytes: vec![],
-        stack_id: None,
-        branch_ref_bytes: None,
-    }];
-    t1.hunk_assignments_mut()?.set_all(assignments.clone())?;
+    let assignments = vec![forge_review(1, "from t1", "from_t1")];
+    t1.forge_reviews_mut()?.set_all(assignments.clone())?;
     t1.commit()?;
 
     // t2 tries to write through a savepoint using its stale read snapshot.
     let err = t2
-        .hunk_assignments_mut()?
+        .forge_reviews_mut()?
         .set_all(assignments.clone())
         .expect_err("stale read snapshot cannot be promoted to writer");
     assert_eq!(err.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
@@ -173,7 +158,7 @@ fn deferred_savepoint_write_after_concurrent_commit_returns_busy_snapshot() -> a
     );
 
     assert_eq!(
-        t2.hunk_assignments().list_all()?,
+        t2.forge_reviews().list_all()?,
         vec![],
         "A savepoint rollback does not refresh the outer transaction snapshot."
     );
@@ -182,7 +167,7 @@ fn deferred_savepoint_write_after_concurrent_commit_returns_busy_snapshot() -> a
     drop(t2);
     let t2 = db2.transaction()?;
     assert_eq!(
-        t2.hunk_assignments().list_all()?,
+        t2.forge_reviews().list_all()?,
         assignments,
         "now the prior write is observable"
     );

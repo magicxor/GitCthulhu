@@ -12,17 +12,15 @@ pub struct Options {
     /// commit/amend so the consumed hunks cancel in the 3-way merge and don't
     /// reappear as uncommitted changes.
     pub merge_base_override: Option<gix::ObjectId>,
-    /// Allow checking out GitButler-managed conflicted commits.
-    ///
-    /// Most callers should keep the default refusal and surface a higher-level
-    /// conflict workflow instead. Rebase materialization may opt in when it
-    /// intentionally created the conflicted commit it is about to materialize.
-    pub allow_conflicted_commit_checkout: bool,
     /// Normally, the 3-way merge between the merge base override, the working
     /// directory, and the new HEAD must not result in a conflict. If this field
     /// is true, such a conflict is allowed; all stages in all conflicts will be
     /// written to the index.
     pub allow_uncommitted_changes_to_conflict_with_new_head: bool,
+    /// If `Some(n)` with `n > 0`, untracked files larger than `n` bytes are not hashed when the worktree is
+    /// snapshotted for the 3-way merge. They are then unknown to the checkout, which never removes them and refuses
+    /// to write a file over one of them ([`UncommittedChangesInTheWay`]). `None` or `Some(0)`: hash all (current behaviour).
+    pub untracked_size_limit: Option<u64>,
 }
 
 /// The successful outcome of [super::safe_checkout_from_head()] operation.
@@ -39,8 +37,11 @@ pub struct Outcome {
 ///
 /// It sits below the [`but_error::Context`] with the message, so callers can tell this refusal
 /// from other preconditions by downcasting to it.
-#[derive(Debug)]
-pub struct UncommittedChangesInTheWay;
+#[derive(Debug, Clone)]
+pub struct UncommittedChangesInTheWay {
+    /// The paths that would be overwritten, sorted, deduplicated and not quoted.
+    pub paths: Vec<bstr::BString>,
+}
 
 impl std::fmt::Display for UncommittedChangesInTheWay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -49,12 +50,15 @@ impl std::fmt::Display for UncommittedChangesInTheWay {
 }
 
 impl UncommittedChangesInTheWay {
-    /// The refusal to overwrite the uncommitted changes at `paths`, quoted and sorted.
-    pub(in crate::worktree::checkout) fn refusal(paths: &[String]) -> anyhow::Error {
-        anyhow::anyhow!(UncommittedChangesInTheWay).context(
+    /// The refusal to overwrite the uncommitted changes at `paths`, which are sorted and deduplicated here.
+    pub(in crate::worktree::checkout) fn refusal(mut paths: Vec<bstr::BString>) -> anyhow::Error {
+        paths.sort();
+        paths.dedup();
+        let quoted: Vec<String> = paths.iter().map(|p| format!("{p:?}")).collect();
+        anyhow::anyhow!(UncommittedChangesInTheWay { paths }).context(
             but_error::Context::new(format!(
                 "Uncommitted files would be overwritten by checkout: {}",
-                paths.join(", ")
+                quoted.join(", ")
             ))
             .with_code(but_error::Code::PreconditionFailed),
         )

@@ -60,14 +60,11 @@ pub fn clear_all_gitlab_accounts(storage: &but_forge_storage::Controller) -> Res
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", tag = "type", content = "info")]
 pub enum GitlabAccountIdentifier {
     PatUsername { username: String },
     SelfHosted { username: String, host: String },
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(GitlabAccountIdentifier);
 
 impl GitlabAccountIdentifier {
     pub fn pat(username: &str) -> Self {
@@ -95,8 +92,10 @@ impl GitlabAccountIdentifier {
             GitlabAccountIdentifier::PatUsername { username } => {
                 format!("gitlab_pat_{username}")
             }
-            GitlabAccountIdentifier::SelfHosted { host, .. } => {
-                format!("gitlab_selfhosted_{host}")
+            // The user name is part of the key: two users of one instance must not overwrite
+            // each other's token and cached profile.
+            GitlabAccountIdentifier::SelfHosted { username, host } => {
+                format!("gitlab_selfhosted_{username}_{host}")
             }
         }
     }
@@ -259,4 +258,26 @@ fn find_stored_gitlab_account(
         .gitlab_accounts()?
         .into_iter()
         .find(|account| GitlabAccountIdentifier::from(account) == *account_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitlabAccountIdentifier as Id;
+
+    #[test]
+    fn self_hosted_keys_tell_the_users_of_one_instance_apart() {
+        let host = "https://gitlab.example.com";
+        let (alice, bob) = (Id::selfhosted("alice", host), Id::selfhosted("bob", host));
+        assert_ne!(
+            alice.cache_key(),
+            bob.cache_key(),
+            "two users of one instance must not share a token or a cached profile"
+        );
+        assert_eq!(
+            alice.cache_key(),
+            "gitlab_selfhosted_alice_https://gitlab.example.com",
+            "the key names user and host"
+        );
+        assert_eq!(Id::pat("alice").cache_key(), "gitlab_pat_alice");
+    }
 }

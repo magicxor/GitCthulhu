@@ -1,5 +1,0 @@
-[
-	{ "id": "gitbutler", "name": "GitButler", "radius": "soft", "density": "balanced" },
-	{ "id": "tight", "name": "Tight", "radius": "sharp", "density": "compact" },
-	{ "id": "bubble", "name": "Bubble", "radius": "round", "density": "spacious" }
-]

@@ -4,34 +4,11 @@ use anyhow::{Context as _, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-#[cfg(feature = "legacy")]
-use crate::LegacyProjectId;
-
 /// A self-describing handle to the path of the project on disk, typically the `.git` directory.
 ///
-/// Use it in places where you can't use `but_ctx::Context::gitdir`.
+/// Use it in places where no repository context is available.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProjectHandle(String);
-
-/// JSON input for `project_id` parameters.
-///
-/// This accepts a [`ProjectHandle`] in all builds, and also accepts a legacy [`LegacyProjectId`]
-/// when the `legacy` feature is enabled.
-///
-/// Its serialized form is a plain string — see the `Serialize`/`Deserialize` impls below —
-/// so it describes itself to schemars as one, and API consumers pass an ordinary string.
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "export-schema", schemars(with = "String"))]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ProjectHandleOrLegacyProjectId {
-    /// Self-describing project handle.
-    ProjectHandle(ProjectHandle),
-    /// Legacy UUID project identifier.
-    #[cfg(feature = "legacy")]
-    LegacyProjectId(LegacyProjectId),
-}
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ProjectHandleOrLegacyProjectId);
 
 /// Lifecycle
 impl ProjectHandle {
@@ -142,67 +119,6 @@ impl<'de> serde::Deserialize<'de> for ProjectHandle {
     }
 }
 
-impl std::str::FromStr for ProjectHandleOrLegacyProjectId {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Ok(handle) = value.parse::<ProjectHandle>() {
-            return Ok(Self::ProjectHandle(handle));
-        }
-        #[cfg(feature = "legacy")]
-        if let Ok(project_id) = value.parse::<LegacyProjectId>() {
-            return Ok(Self::LegacyProjectId(project_id));
-        }
-        #[cfg(feature = "legacy")]
-        return Err(anyhow::anyhow!(
-            "Expected `project_id` to be either a ProjectHandle or a legacy ProjectId, got '{value}'"
-        ));
-        #[cfg(not(feature = "legacy"))]
-        return Err(anyhow::anyhow!(
-            "Expected `project_id` to be a ProjectHandle, got '{value}'"
-        ));
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ProjectHandleOrLegacyProjectId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-        value.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-impl serde::Serialize for ProjectHandleOrLegacyProjectId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            ProjectHandleOrLegacyProjectId::ProjectHandle(handle) => {
-                serializer.serialize_str(&handle.to_string())
-            }
-            #[cfg(feature = "legacy")]
-            ProjectHandleOrLegacyProjectId::LegacyProjectId(project_id) => {
-                serializer.serialize_str(&project_id.to_string())
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for ProjectHandleOrLegacyProjectId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProjectHandleOrLegacyProjectId::ProjectHandle(handle) => write!(f, "{handle}"),
-            #[cfg(feature = "legacy")]
-            ProjectHandleOrLegacyProjectId::LegacyProjectId(project_id) => {
-                write!(f, "{project_id}")
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::path_to_string;
@@ -283,9 +199,14 @@ mod tests {
             }
         }
 
+        /// The prefix that makes a path starting with `/` absolute on this platform.
+        const ABSOLUTE_PREFIX: &str = if cfg!(windows) { "C:" } else { "" };
+
         #[test]
         fn requires_urlsafe_base64_payloads() {
-            assert!(encoded_str_to_path("L3RtcA").is_ok());
+            assert!(
+                encoded_str_to_path(&encode(format!("{ABSOLUTE_PREFIX}/tmp").as_bytes())).is_ok()
+            );
             assert!(encoded_str_to_path("%2Ftmp").is_err());
             assert!(encoded_str_to_path("a/b").is_err());
         }
@@ -306,6 +227,7 @@ mod tests {
         #[test]
         fn accepts_urlsafe_text_bytes_for_absolute_paths() -> anyhow::Result<()> {
             let mut absolute_bytes = Vec::with_capacity(64);
+            absolute_bytes.extend(ABSOLUTE_PREFIX.as_bytes());
             absolute_bytes
                 .extend(b"/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-._~");
 

@@ -1,0 +1,2 @@
+error: Entry 'f.txt' not uptodate. Cannot merge.
+fatal: Could not reset index file to revision 'other'.

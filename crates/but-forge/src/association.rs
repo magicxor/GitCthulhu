@@ -45,16 +45,20 @@ pub type ReviewAssociation = (usize, bool, Option<String>);
 /// The merged head is the review's source commit (lowercased hex) when the
 /// review merged, letting the projection recognize a branch whose tip landed
 /// exactly while integration detection still lags a fetch.
+///
+/// `accounts` are the known forge accounts; they let remote URLs of self-hosted forges be recognized
+/// (see [`crate::derive_forge_repo_info()`]).
 pub fn review_associations_by_head(
     db: &but_db::DbHandle,
     repo: &gix::Repository,
+    accounts: &[crate::ForgeUser],
 ) -> anyhow::Result<HashMap<String, ReviewAssociation>> {
     let reviews = crate::list_cached_forge_reviews(db)?;
-    let remotes = remote_repos(repo);
+    let remotes = remote_repos(repo, accounts);
     let mut fork_repos = HashMap::new();
     let mut by_head: HashMap<String, &ForgeReview> = HashMap::new();
     for review in &reviews {
-        let fork_repo = fork_repo(review, &mut fork_repos);
+        let fork_repo = fork_repo(review, &mut fork_repos, accounts);
         for (remote, remote_repos) in &remotes {
             if !remote_may_have(fork_repo.as_ref(), remote_repos) {
                 continue;
@@ -80,15 +84,17 @@ pub fn review_associations_by_head(
 
 /// `reviews` without those from forks that no remote of `repo` fetches from or
 /// pushes to, which are someone else's whatever their branch is called. Use it
-/// before matching reviews to branches by name alone.
+/// before matching reviews to branches by name alone. `accounts` are as in
+/// [`review_associations_by_head()`].
 pub fn without_unrelated_forks(
     mut reviews: Vec<ForgeReview>,
     repo: &gix::Repository,
+    accounts: &[crate::ForgeUser],
 ) -> Vec<ForgeReview> {
-    let remotes = remote_repos(repo);
+    let remotes = remote_repos(repo, accounts);
     let mut fork_repos = HashMap::new();
     reviews.retain(|review| {
-        let fork_repo = fork_repo(review, &mut fork_repos);
+        let fork_repo = fork_repo(review, &mut fork_repos, accounts);
         fork_repo.is_none()
             || (remotes.iter())
                 .any(|(_, remote_repos)| remote_may_have(fork_repo.as_ref(), remote_repos))
@@ -98,7 +104,10 @@ pub fn without_unrelated_forks(
 
 /// Each remote of `repo` by name, with the forge repositories it fetches from and
 /// pushes to, as a remote can fetch from one repository and push to a fork.
-fn remote_repos(repo: &gix::Repository) -> Vec<(String, Vec<crate::ForgeRepoInfo>)> {
+fn remote_repos(
+    repo: &gix::Repository,
+    accounts: &[crate::ForgeUser],
+) -> Vec<(String, Vec<crate::ForgeRepoInfo>)> {
     (repo.remote_names().iter())
         .map(|name| {
             let remote = repo.find_remote(&**name).ok();
@@ -106,7 +115,7 @@ fn remote_repos(repo: &gix::Repository) -> Vec<(String, Vec<crate::ForgeRepoInfo
                 .into_iter()
                 .filter_map(|direction| {
                     let url = remote.as_ref()?.url(direction)?.to_bstring().to_string();
-                    crate::derive_forge_repo_info(&url, None)
+                    crate::derive_forge_repo_info(&url, None, accounts)
                 })
                 .collect();
             (name.to_string(), remote_repos)
@@ -121,12 +130,13 @@ fn remote_repos(repo: &gix::Repository) -> Vec<(String, Vec<crate::ForgeRepoInfo
 fn fork_repo(
     review: &ForgeReview,
     fork_repos: &mut HashMap<String, Option<crate::ForgeRepoInfo>>,
+    accounts: &[crate::ForgeUser],
 ) -> Option<crate::ForgeRepoInfo> {
     let url = (review.repository_https_url.as_ref())
         .or(review.repository_ssh_url.as_ref())
         .filter(|_| review.head_repo_is_fork)?;
     (fork_repos.entry(url.clone()))
-        .or_insert_with(|| crate::derive_forge_repo_info(url, None))
+        .or_insert_with(|| crate::derive_forge_repo_info(url, None, accounts))
         .clone()
 }
 

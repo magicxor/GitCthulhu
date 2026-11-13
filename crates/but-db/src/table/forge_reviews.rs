@@ -4,12 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DbHandle, M, SchemaVersion, Transaction};
 
-pub(crate) const M: &[M<'static>] = &[
-    M::up(
-        20260101223932,
-        SchemaVersion::Zero,
-        "-- Your SQL goes here
-CREATE TABLE `forge_reviews`(
+pub(crate) const M: &[M<'static>] = &[M::up(
+    2026_11_12__00_00_01,
+    SchemaVersion::Zero,
+    "CREATE TABLE `forge_reviews`(
 	`html_url` TEXT NOT NULL,
 	`number` BIGINT NOT NULL PRIMARY KEY,
 	`title` TEXT NOT NULL,
@@ -30,26 +28,12 @@ CREATE TABLE `forge_reviews`(
 	`reviewers` TEXT NOT NULL,
 	`unit_symbol` TEXT NOT NULL,
 	`last_sync_at` TIMESTAMP NOT NULL,
-	`struct_version` INTEGER NOT NULL
+	`struct_version` INTEGER NOT NULL,
+	`head_repo_is_fork` BOOL NOT NULL DEFAULT FALSE,
+	`integration_commit_shas` TEXT NOT NULL DEFAULT '[]',
+	`auto_merge_enabled` BOOL NOT NULL DEFAULT FALSE
 );",
-    ),
-    M::up(
-        20260618093000,
-        SchemaVersion::Zero,
-        "ALTER TABLE `forge_reviews` ADD COLUMN `head_repo_is_fork` BOOL NOT NULL DEFAULT FALSE;",
-    ),
-    M::up(
-        20260624170000,
-        SchemaVersion::Zero,
-        "ALTER TABLE `forge_reviews` ADD COLUMN `integration_commit_shas` TEXT NOT NULL DEFAULT '[]';
-DELETE FROM `forge_reviews`;",
-    ),
-    M::up(
-        20260805120000,
-        SchemaVersion::Zero,
-        "ALTER TABLE `forge_reviews` ADD COLUMN `auto_merge_enabled` BOOL NOT NULL DEFAULT FALSE;",
-    ),
-];
+)];
 
 /// Tests are in `but-db/tests/db/table/forge_review.rs`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

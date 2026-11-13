@@ -2,14 +2,12 @@ use std::collections::HashMap;
 
 use anyhow::{Context as _, Result};
 use but_secret::Sensitive;
-use but_settings::AppSettings;
 use serde::{Deserialize, Serialize};
 
 pub mod checks;
 mod client;
 mod graphql;
 pub mod pr;
-pub mod stacks;
 pub use client::{
     AutoMergeState, CheckRun, CommentReactions, CreatePullRequestParams, GitHubClient,
     GitHubPrLabel, GitHubRepoPermissions, GitHubRepository, GitHubUser, HttpStatusError,
@@ -20,14 +18,64 @@ pub use client::{
 mod token;
 pub use token::{GithubAccountIdentifier, get_gh_access_token};
 
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+/// Where a user enters the device-flow code when GitHub does not say.
+const DEFAULT_VERIFICATION_URI: &str = "https://github.com/login/device";
+/// GitHub's documented minimum polling interval of the device flow, in seconds.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+/// How long a device code lives when GitHub does not say, in seconds.
+const DEFAULT_EXPIRES_IN_SECS: u64 = 900;
+
+/// The user agent of the OAuth requests.
+const OAUTH_USER_AGENT: &str = "gitcthulhu-github-integration";
+/// The timeout of one OAuth request.
+const OAUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Verification {
+    /// The code the user types in at `verification_uri`.
     pub user_code: String,
+    /// The code to poll with.
     pub device_code: String,
+    /// The page where `user_code` is entered.
+    #[serde(default = "default_verification_uri")]
+    pub verification_uri: String,
+    /// The minimum number of seconds between two polls.
+    #[serde(default = "default_interval")]
+    pub interval: u64,
+    /// The number of seconds until `device_code` expires.
+    #[serde(default = "default_expires_in")]
+    pub expires_in: u64,
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(Verification);
+
+fn default_verification_uri() -> String {
+    DEFAULT_VERIFICATION_URI.to_owned()
+}
+
+fn default_interval() -> u64 {
+    DEFAULT_POLL_INTERVAL_SECS
+}
+
+fn default_expires_in() -> u64 {
+    DEFAULT_EXPIRES_IN_SECS
+}
+
+/// The device flow has not finished yet: the user has not confirmed (`authorization_pending`) or polling is
+/// too fast (`slow_down`). Poll again later; this is not a failure.
+///
+/// It is the root of the `anyhow::Error` that [`check_github_auth_status`] returns in these two cases, so
+/// callers recognise it with `downcast_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("GitHub returned an error: {status} ({description})")]
+pub struct DeviceFlowPending {
+    /// GitHub's status string, `authorization_pending` or `slow_down`.
+    pub status: String,
+    /// GitHub's description of the status.
+    pub description: String,
+    /// Whether GitHub asks for slower polling.
+    pub slow_down: bool,
+    /// The new minimum polling interval in seconds, when GitHub names one.
+    pub interval: Option<u64>,
+}
 
 /// Detect GitHub's OAuth error shape (e.g. `device_flow_disabled`, `authorization_pending`) before falling back to the expected payload, so the real cause surfaces instead of a generic "missing field" serde error.
 fn parse_github_oauth_response<T: serde::de::DeserializeOwned>(body: &str) -> Result<T> {
@@ -37,14 +85,16 @@ fn parse_github_oauth_response<T: serde::de::DeserializeOwned>(body: &str) -> Re
         let description = value
             .get("error_description")
             .and_then(serde_json::Value::as_str);
-        let err = anyhow::anyhow!(
-            "GitHub returned an error: {} ({})",
-            error,
-            description.unwrap_or("no description"),
-        );
+        let description = description.unwrap_or("no description");
         return Err(match device_flow_context(error) {
-            Some(context) => err.context(context),
-            None => err,
+            Some(context) => anyhow::anyhow!("GitHub returned an error: {error} ({description})")
+                .context(context),
+            None => anyhow::Error::new(DeviceFlowPending {
+                status: error.to_owned(),
+                description: description.to_owned(),
+                slow_down: error == "slow_down",
+                interval: value.get("interval").and_then(serde_json::Value::as_u64),
+            }),
         });
     }
     serde_json::from_value(value).context("Response body did not match expected schema")
@@ -72,11 +122,19 @@ fn device_flow_context(status: &str) -> Option<but_error::Context> {
     }
 }
 
-pub async fn init_github_device_oauth() -> Result<Verification> {
+/// An HTTP client for the OAuth endpoints.
+fn oauth_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(OAUTH_USER_AGENT)
+        .timeout(OAUTH_TIMEOUT)
+        .build()
+        .context("Failed to create the OAuth client")
+}
+
+/// Start the device flow of the OAuth app `client_id`.
+pub async fn init_github_device_oauth(client_id: &str) -> Result<Verification> {
     let mut req_body = HashMap::new();
-    let app_settings = AppSettings::load_from_default_path_creating_without_customization()?;
-    let client_id = app_settings.github_oauth_app.oauth_client_id.clone();
-    req_body.insert("client_id", client_id.as_str());
+    req_body.insert("client_id", client_id);
     req_body.insert("scope", "repo");
 
     let mut headers = reqwest::header::HeaderMap::new();
@@ -85,7 +143,7 @@ pub async fn init_github_device_oauth() -> Result<Verification> {
         reqwest::header::HeaderValue::from_static("application/json"),
     );
 
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let res = client
         .post("https://github.com/login/device/code")
         .headers(headers)
@@ -111,8 +169,14 @@ pub struct AuthStatusResponse {
     pub host: Option<String>,
 }
 
+/// Ask GitHub whether the user confirmed `device_code` of the OAuth app `client_id`. When they did, the
+/// access token is stored and the signed-in user returned.
+///
+/// While the user has not confirmed yet the error is a [`DeviceFlowPending`]; an expired, denied or
+/// rejected flow carries a [`but_error::Context`] with a `GitHubDevice*` code.
 pub async fn check_github_auth_status(
-    device_code: String,
+    client_id: &str,
+    device_code: &str,
     storage: &but_forge_storage::Controller,
 ) -> Result<AuthStatusResponse> {
     #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -121,10 +185,8 @@ pub async fn check_github_auth_status(
     }
 
     let mut req_body = HashMap::new();
-    let app_settings = AppSettings::load_from_default_path_creating_without_customization()?;
-    let client_id = app_settings.github_oauth_app.oauth_client_id.clone();
-    req_body.insert("client_id", client_id.as_str());
-    req_body.insert("device_code", device_code.as_str());
+    req_body.insert("client_id", client_id);
+    req_body.insert("device_code", device_code);
     req_body.insert("grant_type", "urn:ietf:params:oauth:grant-type:device_code");
 
     let mut headers = reqwest::header::HeaderMap::new();
@@ -133,7 +195,7 @@ pub async fn check_github_auth_status(
         reqwest::header::HeaderValue::from_static("application/json"),
     );
 
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let res = client
         .post("https://github.com/login/oauth/access_token")
         .headers(headers)
@@ -415,7 +477,6 @@ pub mod json {
     /// The credential is stored by the backend as part of the call, so the caller is told
     /// who authenticated and nothing more. Field names are camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct GithubAuthStatusResponse {
         pub login: String,
@@ -444,15 +505,11 @@ pub mod json {
         }
     }
 
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(GithubAuthStatusResponse);
-
     /// Serializable version of [`AuthenticatedUser`] with exposed access token.
     ///
     /// This struct represents an authenticated GitHub user with their credentials
     /// exposed as plain strings for API responses. Field names are converted to camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
     #[serde(rename_all = "camelCase")]
     pub struct GithubAuthenticatedUserSensitive {
         /// The GitHub access token as a plain string (sensitive data).
@@ -486,9 +543,6 @@ pub mod json {
             }
         }
     }
-
-    #[cfg(feature = "export-schema")]
-    but_schemars::register_sdk_type!(GithubAuthenticatedUserSensitive);
 }
 
 #[cfg(test)]
@@ -579,7 +633,7 @@ mod tests {
                 }
                 (ctx, expected) => panic!("{status}: got {ctx:?}, expected {expected:?}"),
             }
-            // `but_api::json::Error` serializes the context message when present, else the chain.
+            // The API layer's JSON error serializes the context message when present, else the chain.
             let api_message = err
                 .custom_context_or_error_chain()
                 .message
@@ -602,6 +656,75 @@ mod tests {
                 "{status}: {display}"
             );
         }
+    }
+
+    #[test]
+    fn verification_keeps_what_github_says_and_defaults_the_rest() {
+        let full: Verification = parse_github_oauth_response(
+            r#"{"device_code":"dc","user_code":"WDJB-MJHT","verification_uri":"https://ghe.example/login/device","expires_in":600,"interval":10}"#,
+        )
+        .expect("a device code response");
+        assert_eq!(
+            (
+                full.device_code.as_str(),
+                full.user_code.as_str(),
+                full.verification_uri.as_str(),
+                full.expires_in,
+                full.interval
+            ),
+            (
+                "dc",
+                "WDJB-MJHT",
+                "https://ghe.example/login/device",
+                600,
+                10
+            ),
+            "the page, lifetime and polling interval GitHub names are kept"
+        );
+        let minimal: Verification =
+            parse_github_oauth_response(r#"{"device_code":"dc","user_code":"X"}"#)
+                .expect("a bare device code response");
+        assert_eq!(
+            (
+                minimal.verification_uri.as_str(),
+                minimal.expires_in,
+                minimal.interval
+            ),
+            ("https://github.com/login/device", 900, 5),
+            "GitHub's documented defaults fill in what is missing"
+        );
+    }
+
+    #[test]
+    fn pending_device_flow_statuses_are_a_typed_error_with_the_new_interval() {
+        let err = parse_github_oauth_response::<serde_json::Value>(
+            r#"{"error":"slow_down","error_description":"too fast","interval":15}"#,
+        )
+        .expect_err("slow_down is not a result");
+        let pending = err
+            .downcast_ref::<DeviceFlowPending>()
+            .expect("the error is the typed pending status");
+        assert_eq!(
+            (pending.slow_down, pending.interval),
+            (true, Some(15)),
+            "slow_down asks for the interval GitHub names"
+        );
+        let err = parse_github_oauth_response::<serde_json::Value>(
+            r#"{"error":"authorization_pending"}"#,
+        )
+        .expect_err("pending is not a result");
+        let pending = err.downcast_ref::<DeviceFlowPending>().expect("typed");
+        assert_eq!(
+            (pending.slow_down, pending.interval),
+            (false, None),
+            "authorization_pending asks for nothing"
+        );
+        let err = parse_github_oauth_response::<serde_json::Value>(r#"{"error":"expired_token"}"#)
+            .expect_err("expired");
+        assert!(
+            err.downcast_ref::<DeviceFlowPending>().is_none(),
+            "an expired flow is a failure, not a pending one"
+        );
     }
 
     #[test]

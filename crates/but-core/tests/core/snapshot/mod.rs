@@ -1,4 +1,5 @@
 mod index_create_and_resolve;
+mod restore_conflicts;
 mod worktree_create_and_resolve;
 
 mod utils {
@@ -17,7 +18,6 @@ mod utils {
                 .chain(changes.ignored_changes.iter().map(|c| c.path.clone()))
                 .collect(),
             changes,
-            head: false,
         };
         let head_tree_id = repo.head_tree_id_or_empty()?;
 

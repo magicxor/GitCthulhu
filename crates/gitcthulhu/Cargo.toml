@@ -1,0 +1,78 @@
+[package]
+name = "gitcthulhu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "GitCthulhu: a plain Git GUI client on gpui-kit"
+default-run = "gitcthulhu"                            # `cargo run -p gitcthulhu` starts the GUI
+
+[lib]
+name = "gitcthulhu"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "gitcthulhu"
+path = "src/main.rs"
+
+[[bin]]
+name = "gitcthulhu-askpass"                           # RuntimeConfig::askpass_exe default: <dir of current_exe>/gitcthulhu-askpass[.exe]
+path = "src/bin/gitcthulhu-askpass.rs"
+
+[[bin]]
+name = "gitcthulhu-editor"                            # RuntimeConfig::editor_exe default: <dir of current_exe>/gitcthulhu-editor[.exe]
+path = "src/bin/gitcthulhu-editor.rs"
+
+[features]
+default = ["services", "terminal"]                    # `terminal` needs Zig 0.17 on PATH; without it: --no-default-features --features services
+terminal = ["dep:but-tty", "dep:shell-words"]         # needs Zig 0.17 + network at build time; never in M1 acceptance
+services = ["dep:gitcthulhu-services", "dep:but-secret"]   # forge + AI + update
+gpui-fast = ["gpui-kit/gpui-fast"]                    # benchmark passthrough only
+test-support = ["gpui-kit/test-support"]
+qa = ["dep:png", "dep:raw-window-handle", "dep:windows-sys", "dep:keyring", "services"]   # in-process QA scenario runner + capture-only screenshots (src/qa, tools/qa); never in releases
+
+[dependencies]
+gpui-kit = { version = "=0.7.3" }                     # default features: component + assets
+gitcthulhu-git = { workspace = true }                 # no `serde` feature: rebase plans are never persisted
+gitcthulhu-oplog = { workspace = true }
+gitcthulhu-services = { workspace = true, optional = true }
+but-tty = { workspace = true, optional = true }
+but-secret = { workspace = true, optional = true }
+gix = { workspace = true, default-features = false }  # types only; must be the workspace pin so types unify with gitcthulhu-git's
+anyhow.workspace = true
+bstr.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+dirs.workspace = true
+futures.workspace = true
+indexmap = "2"                                        # FileSelection insertion order
+parking_lot.workspace = true
+semver.workspace = true                               # ServicesConfig::app_version
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true                                 # Gravatar hash
+smallvec.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "dump-load", "regex-fancy"] }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
+shell-words = { version = "1", optional = true }
+# Screenshot capture of the app's own window (feature `qa`, Windows only: PrintWindow); versions already in Cargo.lock.
+png = { version = "0.18", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+keyring = { workspace = true, optional = true }          # qa: an in-memory keychain for the fake forge scenarios (X4)
+
+[dev-dependencies]
+gpui-kit = { version = "=0.7.3", features = ["test-support"] }
+tempfile.workspace = true
+keyring.workspace = true                              # in-memory keychain for the forge tests (X4)
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[lints]
+workspace = true

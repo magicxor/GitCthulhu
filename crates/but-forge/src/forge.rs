@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 /// Supported git forge types
 pub enum ForgeName {
@@ -40,9 +39,6 @@ impl ForgeName {
         }
     }
 }
-
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeName);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -117,15 +113,12 @@ impl ForgeRepoInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "provider", rename_all = "lowercase", content = "details")]
 pub enum ForgeUser {
     GitHub(but_github::GithubAccountIdentifier),
     GitLab(but_gitlab::GitlabAccountIdentifier),
     Bitbucket(but_bitbucket::BitbucketAccountIdentifier),
 }
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(ForgeUser);
 
 impl ForgeUser {
     pub fn github(&self) -> Option<&but_github::GithubAccountIdentifier> {

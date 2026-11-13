@@ -347,7 +347,7 @@ fn reconcile_listed_spares_recent_optimistic_inserts_with_non_empty_list() -> an
     Ok(())
 }
 
-fn forge_review(number: i64, title: &str, source_branch: &str) -> ForgeReview {
+pub(crate) fn forge_review(number: i64, title: &str, source_branch: &str) -> ForgeReview {
     ForgeReview {
         html_url: format!("https://github.com/owner/repo/pull/{number}"),
         number,

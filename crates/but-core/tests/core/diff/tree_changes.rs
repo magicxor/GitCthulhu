@@ -1,7 +1,4 @@
-use crate::{
-    commit::conflict_repo,
-    diff::{ui::repo, unified_diffs, unified_patches},
-};
+use crate::diff::{ui::repo, unified_diffs, unified_patches};
 use snapbox::prelude::*;
 
 #[test]
@@ -475,71 +472,6 @@ fn without_previous_tree() -> anyhow::Result<()> {
         lines_added: 1,
         lines_removed: 0,
         files_changed: 6,
-    },
-)
-
-"#]]
-    );
-    Ok(())
-}
-
-#[test]
-fn changes_between_conflicted_and_normal_commit() -> anyhow::Result<()> {
-    let repo = conflict_repo("normal-and-artificial")?;
-    let changes = but_core::diff::tree_changes_with_line_stats(
-        &repo,
-        Some(repo.rev_parse_single("normal")?.into()),
-        repo.rev_parse_single("conflicted")?.into(),
-    )?;
-    snapbox::assert_data_eq!(
-        changes.to_debug(),
-        snapbox::str![[r#"
-(
-    [
-        TreeChange {
-            path: "file",
-            status: Modification {
-                previous_state: ChangeState {
-                    id: Sha1(d95f3ad14dee633a758d2e331151e950dd13e4ed),
-                    kind: Blob,
-                },
-                state: ChangeState {
-                    id: Sha1(e69de29bb2d1d6434b8b29ae775ad8c2e48c5391),
-                    kind: Blob,
-                },
-                flags: None,
-            },
-        },
-    ],
-    Stats {
-        lines_added: 0,
-        lines_removed: 1,
-        files_changed: 1,
-    },
-)
-
-"#]]
-    );
-    Ok(())
-}
-
-#[test]
-fn changes_between_conflicted_and_conflicted_commit() -> anyhow::Result<()> {
-    let repo = conflict_repo("normal-and-artificial")?;
-    let changes = but_core::diff::tree_changes_with_line_stats(
-        &repo,
-        Some(repo.rev_parse_single("conflicted")?.into()),
-        repo.rev_parse_single("conflicted")?.into(),
-    )?;
-    snapbox::assert_data_eq!(
-        changes.to_debug(),
-        snapbox::str![[r#"
-(
-    [],
-    Stats {
-        lines_added: 0,
-        lines_removed: 0,
-        files_changed: 0,
     },
 )
 

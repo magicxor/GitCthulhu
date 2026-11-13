@@ -1,0 +1,13 @@
+# The main window of the feature-rich fixture repository (branches, merges, tags, stashes, a remote, a merge in
+# progress with staged, unstaged, untracked and conflicted files), dark and light, at 1280x720.
+# Compare the screenshots with the Gitnuro layout specs (07, 08, 09).
+resize 1280x720
+open repository rich
+wait idle
+shot main-dark
+set theme light
+wait idle
+shot main-light
+set theme dark
+wait idle
+assert no error

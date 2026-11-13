@@ -1,6 +1,6 @@
+use crate::tool::Toolset;
 use anyhow::Result;
 use async_openai::config::OpenAIConfig;
-use but_tools::tool::Toolset;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
@@ -22,14 +22,17 @@ pub struct OllamaHostConfig {
 }
 
 impl From<String> for OllamaHostConfig {
+    /// Parse `host:port`; an IPv6 host needs its brackets (`[::1]:11434`).
     fn from(endpoint: String) -> Self {
-        let parts: Vec<&str> = endpoint.split(':').collect();
-        let host = parts.first().cloned().unwrap_or("localhost").to_string();
-        let port = parts
-            .get(1)
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(11434);
-        OllamaHostConfig { host, port }
+        let (host, port) = match endpoint.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().unwrap_or(11434)),
+            None => (endpoint.as_str(), 11434),
+        };
+        let host = if host.is_empty() { "localhost" } else { host };
+        OllamaHostConfig {
+            host: host.to_string(),
+            port,
+        }
     }
 }
 
@@ -66,6 +69,10 @@ impl OpenAIClientProvider for OllamaProvider {
             .with_api_base(self.config.api_base())
             .with_api_key("ollama");
         Ok(async_openai::Client::with_config(open_ai_config))
+    }
+
+    fn response_start_timeout(&self) -> std::time::Duration {
+        crate::http::LOCAL_RESPONSE_START_TIMEOUT
     }
 }
 

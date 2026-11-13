@@ -1,0 +1,10 @@
+# The welcome page of an empty window (no repository open), dark and light, at 1280x720.
+# Run: tools\qa\run-gui.ps1 -Sandbox <sandbox> -Scenario tools\qa\scenarios\welcome.qa
+wait idle
+shot welcome-dark
+set theme light
+wait idle
+shot welcome-light
+set theme dark
+assert tab count 1
+assert no error

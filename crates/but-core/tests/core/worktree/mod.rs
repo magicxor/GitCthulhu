@@ -3,6 +3,7 @@ mod checkout;
 mod checkout_vs_git;
 #[cfg(unix)]
 mod checkout_with_override;
+mod untracked_limit;
 
 mod utils {
     /// Using the `repo` `HEAD` commit, build a new commit based on its tree with `edit` and `message`, and return the new commit.

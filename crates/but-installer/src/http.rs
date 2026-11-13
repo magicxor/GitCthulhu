@@ -9,7 +9,7 @@ const REQUEST_TIMEOUT_SECS: u64 = 300;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const MAX_REDIRECTS: u32 = 5;
 const USER_AGENT: &str = concat!(
-    "GitButler-Installer/",
+    "GitCthulhu-Installer/",
     env!("CARGO_PKG_VERSION"),
     " (Rust installer)"
 );

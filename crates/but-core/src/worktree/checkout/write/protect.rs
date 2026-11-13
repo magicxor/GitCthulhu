@@ -60,10 +60,7 @@ pub(super) fn worktree(
     let (pipeline, index) = repo.filter_pipeline(None)?;
     let mut judge = Judge::new(repo, baseline, &index, pipeline)?;
     let mut removals = objects_to_remove(&mut judge, plan)?;
-    refuse_unless_empty(
-        judge_each_once(&mut judge, &mut removals)?,
-        "Uncommitted files would be overwritten by checkout",
-    )?;
+    refuse_unless_empty(judge_each_once(&mut judge, &mut removals)?)?;
     Ok(clearances(removals))
 }
 
@@ -72,7 +69,10 @@ pub(super) fn worktree(
 ///
 /// An object can be removed for several reasons, like being deleted and in the way of the files
 /// that replace it, or being in a directory that is removed too. It's judged once.
-fn judge_each_once(judge: &mut Judge<'_>, removals: &mut [Removal]) -> anyhow::Result<Vec<String>> {
+fn judge_each_once(
+    judge: &mut Judge<'_>,
+    removals: &mut [Removal],
+) -> anyhow::Result<Vec<BString>> {
     let (mut judged, mut changed) = (BTreeSet::new(), Vec::new());
     for removal in removals {
         let new: Vec<BString> = std::mem::take(&mut removal.judged)
@@ -83,7 +83,7 @@ fn judge_each_once(judge: &mut Judge<'_>, removals: &mut [Removal]) -> anyhow::R
             match judge.judge(rela_path.as_ref())? {
                 Verdict::Snapshotted(stat) => removal.observed.push(Observed { rela_path, stat }),
                 Verdict::Ignored => {}
-                Verdict::Changed(path) => changed.push(format!("{path:?}")),
+                Verdict::Changed(path) => changed.push(path),
             }
         }
     }
@@ -106,13 +106,10 @@ pub(super) fn still_as_checked(
             Err(_) => None,
         };
         if !now.is_some_and(|now| stat.matches(&now, ALL_FIELDS)) {
-            changed.push(format!("{rela_path:?}"));
+            changed.push(rela_path.clone());
         }
     }
-    refuse_unless_empty(
-        changed,
-        "Uncommitted files would be overwritten by checkout",
-    )
+    refuse_unless_empty(changed)
 }
 
 /// Whether `err` says nothing is at a path, as it or a directory leading to it is gone.
@@ -464,14 +461,12 @@ fn type_or_mode_changed(
             .is_some()
 }
 
-/// Refuse with `message` and the sorted `paths`, unless there are none.
-fn refuse_unless_empty(mut paths: Vec<String>, message: &str) -> anyhow::Result<()> {
+/// Refuse with the typed [`UncommittedChangesInTheWay`](super::super::UncommittedChangesInTheWay) for `paths`, unless there are none.
+fn refuse_unless_empty(paths: Vec<BString>) -> anyhow::Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    paths.sort();
-    paths.dedup();
-    but_error::bail_precondition!("{message}: {}", paths.join(", "))
+    Err(super::super::UncommittedChangesInTheWay::refusal(paths))
 }
 
 #[cfg(test)]

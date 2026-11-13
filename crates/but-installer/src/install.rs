@@ -4,7 +4,7 @@ use std::{
     fs::{self, File},
     io::Read,
     os::unix::fs::PermissionsExt as _,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,7 +18,7 @@ pub(crate) const APP_BINARY_NAME: &str = "gitcthulhu";
 ///
 /// Only the Linux install flow puts a bare binary there; macOS installs an app bundle.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn app_binary_path(home_dir: &Path) -> PathBuf {
+pub(crate) fn app_binary_path(home_dir: &Path) -> std::path::PathBuf {
     home_dir.join(".local/bin").join(APP_BINARY_NAME)
 }
 

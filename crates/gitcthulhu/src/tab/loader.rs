@@ -468,10 +468,17 @@ impl RepoTab {
         let cancel = CancelToken::new();
         self.loader.log_cancel = Some(cancel.clone());
         self.ctx.model.update(cx, |m, _| m.log.loading = true);
+        // The snapshot is built here too: moving 100k rows into chunks takes milliseconds.
         let bg = cx.background_spawn(async move {
             let mut pager = LogPager::new(&handle.repo, &cancel)?;
-            let page = pager.next_rows(rows, &cancel)?;
-            Ok::<_, GitError>((pager, page))
+            let (rows, max_lane, exhausted) = pager.next_rows(rows, &cancel)?;
+            let snapshot = LogSnapshot {
+                rows: ChunkedRows::new().appended(rows),
+                max_lane,
+                exhausted,
+                generation,
+            };
+            Ok::<_, GitError>((pager, snapshot))
         });
         self.loader.log_task = Some(cx.spawn(async move |this, cx| {
             let result = bg.await;
@@ -483,23 +490,23 @@ impl RepoTab {
     fn apply_log(
         &mut self,
         generation: u64,
-        result: Result<(LogPager, (Vec<super::model::LogRow>, u16, bool)), GitError>,
+        result: Result<(LogPager, LogSnapshot), GitError>,
         cx: &mut Context<Self>,
     ) {
         self.loader.log_task = None;
         self.loader.log_cancel = None;
         match result {
-            Ok((pager, (rows, max_lane, exhausted))) => {
-                let snapshot = LogSnapshot {
-                    rows: ChunkedRows::new().appended(rows),
-                    max_lane,
-                    exhausted,
-                    generation,
-                };
-                self.ctx.model.update(cx, |m, cx| {
+            Ok((pager, snapshot)) => {
+                let exhausted = snapshot.exhausted;
+                let previous = self.ctx.model.update(cx, |m, cx| {
                     m.log_pager = Some(Arc::new(Mutex::new(pager)));
-                    m.set_log(Arc::new(snapshot), cx);
+                    m.set_log(Arc::new(snapshot), cx)
                 });
+                // Freeing a deep log's rows takes milliseconds: off the UI thread (a no-op while a view still holds
+                // the snapshot, which then frees it).
+                if let Some(previous) = previous {
+                    cx.background_spawn(async move { drop(previous) }).detach();
+                }
                 self.emit(RepoTabEvent::LogReloaded { generation }, cx);
                 self.start_commit_graph(exhausted, git::config::COMMIT_GRAPH_THRESHOLD, cx);
             }

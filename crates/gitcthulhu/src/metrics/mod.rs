@@ -149,7 +149,11 @@ pub const UNDO_BUTTON_W: f32 = 64.;
 pub const TERMINAL_HEADER_H: f32 = 34.;
 pub const TERMINAL_DEFAULT_H: f32 = 240.;
 pub const TERMINAL_MIN_H: f32 = 120.;
-pub const TERMINAL_MIN_SPLIT_H: f32 = 200.;
+/// The least height the split keeps above the terminal panel: the right pane's fixed content, so the Staged and
+/// Unstaged headers with Stage all / Unstage all and the commit box never collapse (2 x (34 header + 4 list gap) +
+/// 192 commit box + 8 bottom padding = 276; 21 §5.2, deviation in 21 §6).
+pub const TERMINAL_MIN_SPLIT_H: f32 =
+    2. * (HEADER_BAR_H + status::LIST_GAP) + status::COMMIT_BOX_H + PANE_EDGE_PAD;
 pub const TERMINAL_TAB_MIN_W: f32 = 120.;
 pub const TERMINAL_TAB_MAX_W: f32 = 240.;
 pub const AI_BUTTON_H: f32 = 24.;

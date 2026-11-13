@@ -34,6 +34,9 @@ enum AvatarState {
 pub struct AvatarCache {
     states: HashMap<String, AvatarState>,
     fetcher: Option<AvatarFetcher>,
+    /// Counts [`retry_missing`] calls: a download started before the newest one that fails is not remembered as
+    /// missing (it is asked again), so a late answer cannot undo a retry.
+    generation: u64,
 }
 
 impl Global for AvatarCache {}
@@ -47,8 +50,15 @@ pub fn gravatar_url(email: &str) -> String {
 
 /// Installs the function that downloads avatar images and drops negative cache entries so they are retried.
 pub fn set_fetcher(cx: &mut App, fetcher: AvatarFetcher) {
+    cx.default_global::<AvatarCache>().fetcher = Some(fetcher);
+    retry_missing(cx);
+}
+
+/// Forgets the avatars whose download failed, so they are asked for again when next shown (the downloader's retry
+/// after being offline). Downloads still running then are asked again too if they fail.
+pub fn retry_missing(cx: &mut App) {
     let cache = cx.default_global::<AvatarCache>();
-    cache.fetcher = Some(fetcher);
+    cache.generation += 1;
     cache
         .states
         .retain(|_, state| !matches!(state, AvatarState::Missing));
@@ -89,6 +99,7 @@ fn request(cx: &mut App, key: String, email: String) {
         return;
     };
     cache.states.insert(key.clone(), AvatarState::Loading);
+    let generation = cache.generation;
     let download = fetcher(gravatar_url(&email), cx);
     cx.spawn(async move |cx: &mut AsyncApp| {
         let state = match download.await {
@@ -99,11 +110,21 @@ fn request(cx: &mut App, key: String, email: String) {
             Err(_) => AvatarState::Missing,
         };
         cx.update(|cx| {
-            cx.default_global::<AvatarCache>().states.insert(key, state);
+            settle(cx.default_global::<AvatarCache>(), key, generation, state);
             cx.refresh_windows();
         });
     })
     .detach();
+}
+
+/// Records the answer of a download started at `generation`: a failure from before the newest retry is forgotten
+/// rather than remembered, so the avatar is asked for again.
+fn settle(cache: &mut AvatarCache, key: String, generation: u64, state: AvatarState) {
+    if matches!(state, AvatarState::Missing) && generation != cache.generation {
+        cache.states.remove(&key);
+    } else {
+        cache.states.insert(key, state);
+    }
 }
 
 /// The avatar shape: a circle, or a rounded square for merge commits.
@@ -238,6 +259,33 @@ mod tests {
         assert_eq!(
             url.len(),
             "https://www.gravatar.com/avatar/".len() + 64 + "?s=80&d=404".len()
+        );
+    }
+
+    #[test]
+    fn a_failure_from_before_a_retry_is_asked_again() {
+        let mut cache = AvatarCache::default();
+        let started = cache.generation;
+        cache.states.insert("a@x".into(), AvatarState::Loading);
+        cache.states.insert("b@x".into(), AvatarState::Loading);
+        // The retry fires while both downloads still run.
+        cache.generation += 1;
+        settle(&mut cache, "a@x".into(), started, AvatarState::Missing);
+        assert!(
+            !cache.states.contains_key("a@x"),
+            "a late failure is forgotten, so the next render asks again"
+        );
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, vec![0x89, b'P']));
+        settle(&mut cache, "b@x".into(), started, AvatarState::Ready(image));
+        assert!(
+            matches!(cache.states.get("b@x"), Some(AvatarState::Ready(_))),
+            "a late image is still used"
+        );
+        let now = cache.generation;
+        settle(&mut cache, "c@x".into(), now, AvatarState::Missing);
+        assert!(
+            matches!(cache.states.get("c@x"), Some(AvatarState::Missing)),
+            "a failure since the retry is remembered until the next one"
         );
     }
 

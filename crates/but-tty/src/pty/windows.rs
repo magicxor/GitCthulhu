@@ -51,6 +51,9 @@ pub struct Pty {
     runs_command: bool,
     /// How the shell exited, once it has.
     exit_code: Arc<sync::OnceLock<u32>>,
+    /// The fewest processes seen in the job: the shell and the helpers it keeps at its prompt (Git Bash's launcher
+    /// keeps one), against which more mean a program it started is running.
+    at_prompt: sync::atomic::AtomicU32,
     /// The shell's process id, for tests to watch it end.
     #[cfg(test)]
     pub(crate) process_id: u32,
@@ -143,6 +146,7 @@ impl Pty {
             job,
             runs_command: command.is_some(),
             exit_code,
+            at_prompt: sync::atomic::AtomicU32::new(u32::MAX),
             #[cfg(test)]
             process_id,
         };
@@ -154,6 +158,26 @@ impl Pty {
     /// command, nor for a shell that keeps a helper process (Git Bash's launcher does).
     pub fn shell_in_front(&self) -> bool {
         !self.runs_command && self.job.as_ref().and_then(active_processes) == Some(1)
+    }
+
+    /// Whether a program the shell started is running (a build, an editor), so closing the terminal would end
+    /// it: more processes run in the job than the fewest seen so far, which is what the shell keeps at its prompt.
+    /// Always while the shell runs a command and has not exited.
+    pub fn program_running(&self) -> bool {
+        if self.exit_code.get().is_some() {
+            return false;
+        }
+        if self.runs_command {
+            return true;
+        }
+        let Some(count) = self.job.as_ref().and_then(active_processes) else {
+            return false;
+        };
+        let at_prompt = self
+            .at_prompt
+            .fetch_min(count, sync::atomic::Ordering::Relaxed)
+            .min(count);
+        count > at_prompt
     }
 
     /// The exit code of the command the shell ran, once it exited with one other than 0. Never
@@ -669,6 +693,10 @@ mod tests {
             pty.shell_in_front(),
             "at its prompt the shell is all that runs"
         );
+        assert!(
+            !pty.program_running(),
+            "at its prompt no program of the shell runs"
+        );
         pty.write(b"ping -n 120 127.0.0.1\r")
             .expect("the shell takes input");
         let started = Instant::now();
@@ -686,6 +714,10 @@ mod tests {
         assert!(
             !pty.shell_in_front(),
             "a command the shell runs is in front"
+        );
+        assert!(
+            pty.program_running(),
+            "a plain long-running program counts as running, though it reports nothing"
         );
         drop(pty);
         for id in running {

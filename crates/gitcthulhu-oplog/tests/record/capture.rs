@@ -391,6 +391,37 @@ fn untracked_limits_skip_large_files_and_admit_the_smallest_first() {
         "only the too large file is reported; tracked files are ignored"
     );
     assert!(!has_blob_of(&fx, &big), "the preview hashes nothing");
+    let everything: Vec<_> = [
+        "big.bin",
+        "m0.bin",
+        "m1.bin",
+        "m2.bin",
+        "small.bin",
+        "overflow.bin",
+    ]
+    .into_iter()
+    .map(b)
+    .collect();
+    let mut preview = oplog
+        .preview_skipped(&fx.repo(), &everything)
+        .expect("preview works");
+    preview.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(
+        preview,
+        vec![
+            SkippedFile {
+                path: b("big.bin"),
+                size: 2048,
+                reason: SkipReason::TooLarge
+            },
+            SkippedFile {
+                path: b("overflow.bin"),
+                size: 1010,
+                reason: SkipReason::OverBudget
+            },
+        ],
+        "the preview predicts the budget the way the capture below admits files: smallest first"
+    );
 
     let skipped = record_with_untracked(&fx, options, UntrackedCapture::All);
     assert_eq!(

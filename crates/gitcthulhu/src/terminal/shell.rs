@@ -350,7 +350,18 @@ pub fn quoted(kind: ShellKind, words: impl IntoIterator<Item = impl AsRef<str>>)
                 if plain {
                     word.to_owned()
                 } else {
-                    format!("'{}'", word.replace('\'', "''"))
+                    // PowerShell ends a single-quoted string at any of its single quotes, the typographic ones
+                    // included; each is escaped by doubling it.
+                    let mut quoted = String::with_capacity(word.len() + 2);
+                    quoted.push('\'');
+                    for c in word.chars() {
+                        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                            quoted.push(c);
+                        }
+                        quoted.push(c);
+                    }
+                    quoted.push('\'');
+                    quoted
                 }
             }
             ShellKind::Posix | ShellKind::Other => shell_words::quote(word).into_owned(),

@@ -135,11 +135,17 @@ impl RepoModel {
         cx.notify();
     }
 
-    /// Replaces the log snapshot and notifies `LOG` subscribers.
-    pub fn set_log(&mut self, log: Arc<LogSnapshot>, cx: &mut Context<Self>) {
-        self.log = Loadable::ready(log);
+    /// Replaces the log snapshot and notifies `LOG` subscribers. Returns the previous snapshot, so a caller can drop
+    /// a large one off the UI thread.
+    pub fn set_log(
+        &mut self,
+        log: Arc<LogSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<LogSnapshot>> {
+        let previous = std::mem::replace(&mut self.log, Loadable::ready(log)).value;
         cx.emit(RepoModelEvent(RefreshSet::LOG));
         cx.notify();
+        previous
     }
 
     /// The local branches with a tracking ref: their (local, tracking) commit pairs.

@@ -41,7 +41,7 @@ fn key_of(repo: &Path) -> String {
 }
 
 impl RepoPrefs {
-    /// Loads `repos.json` from `path`: empty when missing, empty plus a `*.bak` rename when corrupt.
+    /// Loads `repos.json` from `path`: empty when missing, empty plus a backup when corrupt (see [`load`]).
     pub fn load_from(path: &Path) -> Loaded<RepoPrefs> {
         load::<RepoPrefs>(path)
     }

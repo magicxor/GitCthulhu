@@ -6,6 +6,7 @@
 //! dialog is centred vertically from an estimated height; stacked dialogs keep the kit's 16 px offset
 //! (deviation 33).
 
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use gpui_kit::component::WindowExt as _;
@@ -13,7 +14,7 @@ use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, Global, IntoElement, ParentElement as _,
-    Render, RenderOnce, SharedString, Styled as _, Subscription, Window, div, px,
+    Render, RenderOnce, SharedString, Styled as _, Subscription, Window, WindowId, div, px,
     transparent_black,
 };
 
@@ -131,19 +132,23 @@ struct Layer {
     build: Weak<dyn Fn(Dialog, &mut Window, &mut App) -> Dialog>,
 }
 
-/// The open dialog layers, bottom first (the kit stacks them in the order they were opened).
+/// The open dialog layers of each window, bottom first (the kit stacks them in the order they were opened).
 #[derive(Default)]
 struct Layers {
     next: u64,
-    stack: Vec<Layer>,
+    stacks: HashMap<WindowId, Vec<Layer>>,
 }
 
 impl Global for Layers {}
 
 impl Layers {
-    /// Forgets the layers the kit has closed.
-    fn prune(&mut self) {
-        self.stack.retain(|layer| layer.build.strong_count() > 0);
+    /// The layers of `window` that the kit has not closed.
+    fn stack(&mut self, window: WindowId) -> &mut Vec<Layer> {
+        self.stacks
+            .retain(|_, stack| stack.iter().any(|layer| layer.build.strong_count() > 0));
+        let stack = self.stacks.entry(window).or_default();
+        stack.retain(|layer| layer.build.strong_count() > 0);
+        stack
     }
 }
 
@@ -151,7 +156,6 @@ impl Layers {
 /// of the app goes through here (the kit's `close_dialog` only knows the top-most layer).
 pub(crate) fn open_layer(window: &mut Window, cx: &mut App, build: LayerBuilder) -> LayerId {
     let layers = cx.default_global::<Layers>();
-    layers.prune();
     layers.next += 1;
     let id = LayerId(layers.next);
     register_layer(window, cx, id, build);
@@ -159,7 +163,8 @@ pub(crate) fn open_layer(window: &mut Window, cx: &mut App, build: LayerBuilder)
 }
 
 fn register_layer(window: &mut Window, cx: &mut App, id: LayerId, build: LayerBuilder) {
-    cx.default_global::<Layers>().stack.push(Layer {
+    let window_id = window.window_handle().window_id();
+    cx.default_global::<Layers>().stack(window_id).push(Layer {
         id,
         build: Rc::downgrade(&build),
     });
@@ -167,29 +172,39 @@ fn register_layer(window: &mut Window, cx: &mut App, id: LayerId, build: LayerBu
     window.open_dialog(cx, move |dialog, window, cx| build(dialog, window, cx));
 }
 
-/// Closes the layer `id`, whatever its place in the stack, and leaves every other layer open. A layer that is
-/// already gone is ignored. The top-most layer is popped; a layer below others cannot be taken out of the kit's
-/// stack, so the layers are closed and the others opened again in their order.
+/// Closes the layer `id` of this window, whatever its place in the stack, and leaves every other layer open. A
+/// layer that is already gone is ignored. The top-most layer is popped; a layer below others cannot be taken out of
+/// the kit's stack, so the layers are closed and the others opened again in their order, and the keyboard focus
+/// goes back where it was (a field of the top dialog).
 pub fn close_layer(window: &mut Window, cx: &mut App, id: LayerId) {
-    let layers = cx.default_global::<Layers>();
-    layers.prune();
-    let Some(position) = layers.stack.iter().position(|layer| layer.id == id) else {
+    let window_id = window.window_handle().window_id();
+    let stack = cx.default_global::<Layers>().stack(window_id);
+    let Some(position) = stack.iter().position(|layer| layer.id == id) else {
         return;
     };
-    if position + 1 == layers.stack.len() {
-        layers.stack.pop();
+    if position + 1 == stack.len() {
+        stack.pop();
         window.close_dialog(cx);
         return;
     }
-    let survivors: Vec<(LayerId, LayerBuilder)> = layers
-        .stack
+    let survivors: Vec<(LayerId, LayerBuilder)> = stack
         .drain(..)
         .filter(|layer| layer.id != id)
         .filter_map(|layer| Some((layer.id, layer.build.upgrade()?)))
         .collect();
+    let focused = window.focused(cx).map(|handle| handle.downgrade());
     window.close_all_dialogs(cx);
     for (id, build) in survivors {
         register_layer(window, cx, id, build);
+    }
+    // Each reopened layer took the focus for its kit frame: give it back to the field that had it, unless that
+    // was in the closed layer.
+    if let Some(focused) = focused {
+        window.defer(cx, move |window, cx| {
+            if let Some(handle) = focused.upgrade() {
+                window.focus(&handle, cx);
+            }
+        });
     }
 }
 

@@ -111,7 +111,8 @@ impl Grid {
     }
 }
 
-/// What the cell drawn under `position` in the window links to, on `rows` drawn on `grid`.
+/// What the cell drawn under `position` in the window links to, on `rows` drawn on `grid`, if the link may be
+/// opened (see [`openable`]); any other link is neither underlined nor followed.
 pub(super) fn link_at(rows: &[Arc<Row>], grid: Grid, position: Point<Pixels>) -> Option<Arc<str>> {
     let at = position - grid.origin;
     if at.x < px(0.) || at.y < px(0.) {
@@ -120,7 +121,32 @@ pub(super) fn link_at(rows: &[Arc<Row>], grid: Grid, position: Point<Pixels>) ->
     let column = (at.x / grid.cell.width).floor() as u16;
     let row = rows.get((at.y / grid.cell.height).floor() as usize)?;
     let run = row.runs.iter().find(|run| run.columns.contains(&column))?;
-    run.link.clone()
+    run.link.clone().filter(|link| openable(link))
+}
+
+/// Whether an OSC 8 link target may be handed to the OS to open: only `http`/`https` URLs with a host. Anything a
+/// program prints can carry such a link and its target is not shown, and the OS opens other schemes (`file:`, UNC
+/// paths, `ms-*`/`search-ms:` protocol handlers) by running something, so they are never opened.
+pub(super) fn openable(uri: &str) -> bool {
+    if uri
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    !host.is_empty()
 }
 
 /// The columns of `row` with a background, those side by side in one colour joined so no seam shows between them.

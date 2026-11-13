@@ -236,6 +236,15 @@ impl Pty {
                 .is_some_and(|master| unsafe { libc::tcgetpgrp(master.as_raw_fd()) } == self.shell)
     }
 
+    /// Whether a program the shell started is running (a build, an editor), so closing the terminal would end
+    /// it: another process group than the shell's has the terminal. Always while the shell runs a command and the
+    /// terminal is open.
+    pub fn program_running(&self) -> bool {
+        self.master.is_some()
+            && self.exit_code.get().is_none()
+            && (self.runs_command || !self.shell_in_front())
+    }
+
     /// The exit code of the command the shell ran, once it exited with one other than 0. Never
     /// for a shell at a prompt, as the user typed what made it exit.
     pub fn failed(&self) -> Option<i32> {

@@ -15,8 +15,22 @@ pub const AHEAD_BEHIND_CAP: u32 = 10_000;
 
 /// `status::status` with `StatusOptions::default()` but staged renames only (`RenameMode::IndexOnly`, like
 /// `git status`): tracking worktree renames repeats the index-worktree half and hashes every untracked file whenever
-/// a tracked file is deleted, seconds per watcher tick in a large repository.
+/// a tracked file is deleted, seconds per watcher tick in a large repository. A bare repository has no working tree
+/// and so no changes: its status is empty rather than the `BareRepository` error, which would show an Error toast on
+/// every reload.
 pub fn status(repo: &Repo, cancel: &CancelToken) -> Result<Status, GitError> {
+    if repo.workdir().is_none() {
+        return Ok(Status {
+            staged: Vec::new(),
+            unstaged: Vec::new(),
+            counts: Default::default(),
+            fingerprint: gitcthulhu_git::StatusFingerprint {
+                index: None,
+                head: None,
+            },
+            index_needs_refresh: false,
+        });
+    }
     let opts = StatusOptions {
         renames: RenameMode::IndexOnly,
         ..StatusOptions::default()

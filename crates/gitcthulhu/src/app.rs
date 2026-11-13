@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use gpui_kit::{
-    App, AppContext as _, Bounds, Global, TitlebarOptions, WindowBounds, WindowOptions, point, px,
-    size,
+    App, AppContext as _, Bounds, DisplayId, Global, Pixels, TitlebarOptions, WindowBounds,
+    WindowOptions, point, px, size,
 };
 
 use crate::app_view::AppView;
@@ -18,7 +18,7 @@ use crate::backend::prompt::UiRequestSender;
 use crate::backend::services::ServicesHandle;
 use crate::backend::{GitRuntime, GitStatus};
 use crate::notifications::ToastKind;
-use crate::settings::{self, Loaded, PlacementKind, RepoPrefs, Settings, UiState, WindowState};
+use crate::settings::{self, PlacementKind, RepoPrefs, Settings, UiState, WindowState};
 use crate::{actions, backend, fonts, logging, metrics, paths, theme};
 
 /// Process-wide application state.
@@ -87,6 +87,7 @@ pub fn install_state(
     repo_prefs: RepoPrefs,
 ) -> futures::channel::mpsc::UnboundedReceiver<crate::backend::prompt::UiRequest> {
     let (requests, receiver) = UiRequestSender::channel();
+    settings::set_base(cx, "repos", &repo_prefs);
     cx.set_global(AppState {
         git: GitStatus::Starting,
         services: None,
@@ -163,8 +164,7 @@ fn start_services(cx: &mut App, settings: Settings) {
 /// The window bounds of a saved placement; the never-saved default is a maximized window whose restore box is a
 /// centred 1280×720 box.
 pub fn window_bounds(placement: &WindowState, cx: &App) -> WindowBounds {
-    let never_saved = placement.x == 0. && placement.y == 0.;
-    let restore = if never_saved {
+    let restore = if !placement.is_saved() {
         Bounds::centered(
             None,
             size(
@@ -186,8 +186,8 @@ pub fn window_bounds(placement: &WindowState, cx: &App) -> WindowBounds {
     }
 }
 
-/// The saved form of a window's bounds.
-pub fn window_state(bounds: WindowBounds) -> WindowState {
+/// The saved form of a window's bounds on the display with UUID `display`.
+pub fn window_state(bounds: WindowBounds, display: Option<String>) -> WindowState {
     let (placement, b) = match bounds {
         WindowBounds::Windowed(b) => (PlacementKind::Floating, b),
         WindowBounds::Maximized(b) => (PlacementKind::Maximized, b),
@@ -199,7 +199,47 @@ pub fn window_state(bounds: WindowBounds) -> WindowState {
         y: b.origin.y.as_f32(),
         w: b.size.width.as_f32(),
         h: b.size.height.as_f32(),
+        saved: true,
+        display,
     }
+}
+
+/// The display a saved placement belongs on, among `displays` (id, UUID, bounds): the one with the saved UUID, else
+/// the one holding the centre of the restore box. `None` (the primary display) for a never-saved placement or when
+/// none matches, e.g. the display was unplugged.
+pub fn placement_display(
+    placement: &WindowState,
+    displays: impl IntoIterator<Item = (DisplayId, Option<String>, Bounds<Pixels>)>,
+) -> Option<DisplayId> {
+    if !placement.is_saved() {
+        return None;
+    }
+    let centre = point(
+        px(placement.x + placement.w / 2.),
+        px(placement.y + placement.h / 2.),
+    );
+    let mut holding_centre = None;
+    for (id, uuid, bounds) in displays {
+        if uuid.is_some() && uuid == placement.display {
+            return Some(id);
+        }
+        if holding_centre.is_none() && bounds.contains(&centre) {
+            holding_centre = Some(id);
+        }
+    }
+    holding_centre
+}
+
+/// The display of `placement` among the current displays (see [`placement_display`]).
+fn saved_display(placement: &WindowState, cx: &App) -> Option<DisplayId> {
+    let displays = cx.displays().into_iter().map(|display| {
+        (
+            display.id(),
+            display.uuid().ok().map(|uuid| uuid.to_string()),
+            display.bounds(),
+        )
+    });
+    placement_display(placement, displays)
 }
 
 /// The repository directory of the first command-line argument (`/.git` stripped), if any.
@@ -219,29 +259,54 @@ pub fn strip_git_dir(path: PathBuf) -> PathBuf {
     path
 }
 
-fn load_settings() -> (Settings, UiState, RepoPrefs) {
-    let settings = match Settings::load_from(&paths::settings_file()) {
-        Loaded::Corrupt { value, backup } => {
-            tracing::warn!("settings.json was corrupt; backup: {backup:?}");
-            value
-        }
-        loaded => loaded.into_value(),
-    };
-    let ui_state = match UiState::load_from(&paths::state_file()) {
-        Loaded::Corrupt { value, backup } => {
-            tracing::warn!("state.json was corrupt; backup: {backup:?}");
-            value
-        }
-        loaded => loaded.into_value(),
-    };
-    let repo_prefs = match RepoPrefs::load_from(&paths::repos_file()) {
-        Loaded::Corrupt { value, backup } => {
-            tracing::warn!("repos.json was corrupt; backup: {backup:?}");
-            value
-        }
-        loaded => loaded.into_value(),
-    };
-    (settings, ui_state, repo_prefs)
+/// What [`load_settings`] read: the three files, what the user is told about those that did not load as they were
+/// (a reset file or keys), and per save name the values that were reset (see `settings::io::note_rejected`).
+struct LoadedSettings {
+    settings: Settings,
+    ui_state: UiState,
+    repo_prefs: RepoPrefs,
+    notices: Vec<String>,
+    rejected: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)>,
+}
+
+fn load_settings() -> LoadedSettings {
+    let settings = Settings::load_from(&paths::settings_file());
+    let ui_state = UiState::load_from(&paths::state_file());
+    let repo_prefs = RepoPrefs::load_from(&paths::repos_file());
+    let notices = [
+        settings.notice("settings.json"),
+        ui_state.notice("state.json"),
+        repo_prefs.notice("repos.json"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let rejected = vec![
+        ("settings", settings.rejected()),
+        ("state", ui_state.rejected()),
+        ("repos", repo_prefs.rejected()),
+    ];
+    LoadedSettings {
+        settings: settings.into_value(),
+        ui_state: ui_state.into_value(),
+        repo_prefs: repo_prefs.into_value(),
+        notices,
+        rejected,
+    }
+}
+
+/// Writes `repos.json` now (on quit) if this process changed it, so a change still in its debounce is kept.
+fn flush_repo_prefs(cx: &App) {
+    if let Some(state) = cx.try_global::<AppState>() {
+        settings::io::flush_now(cx, "repos", &paths::repos_file(), &state.repo_prefs);
+    }
+}
+
+/// Shows what [`load_settings`] has to tell as Warning toasts (once the window's toast host exists).
+fn show_load_notices(cx: &mut App, notices: Vec<String>) {
+    for notice in notices {
+        crate::app_view::show_toast(cx, None, ToastKind::Warning, notice, None);
+    }
 }
 
 /// Starts the application and blocks until the last window is closed.
@@ -253,7 +318,13 @@ pub fn run() {
     if let Err(err) = paths::ensure_dirs() {
         tracing::warn!("cannot create the application directories: {err}");
     }
-    let (settings, ui_state, repo_prefs) = load_settings();
+    let LoadedSettings {
+        settings,
+        ui_state,
+        repo_prefs,
+        notices,
+        rejected,
+    } = load_settings();
 
     gpui_kit::application()
         .with_assets(AppAssets)
@@ -269,6 +340,9 @@ pub fn run() {
             actions::init(cx);
 
             let requests = install_state(cx, repo_prefs);
+            for (name, values) in rejected.clone() {
+                settings::io::note_rejected(cx, name, values);
+            }
             start_git_runtime(cx, settings.clone());
             start_services(cx, settings.clone());
 
@@ -279,6 +353,7 @@ pub fn run() {
                     ..Default::default()
                 }),
                 window_bounds: Some(window_bounds(&ui_state.window, cx)),
+                display_id: saved_display(&ui_state.window, cx),
                 app_id: Some("gitcthulhu".into()),
                 ..Default::default()
             };
@@ -286,6 +361,7 @@ pub fn run() {
             #[cfg(feature = "qa")]
             {
                 options.window_bounds = Some(crate::qa::window_bounds());
+                options.display_id = None;
                 options.focus = false;
             }
             // A qa run opens repositories only through its scenario (its arguments are not repository paths).
@@ -301,9 +377,11 @@ pub fn run() {
                 cx.quit();
                 return;
             }
+            show_load_notices(cx, notices.clone());
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     settings::flush(cx);
+                    flush_repo_prefs(cx);
                     cx.quit();
                 }
             })
@@ -322,6 +400,96 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::*;
+
+    fn display(id: u64, uuid: &str, x: f32) -> (DisplayId, Option<String>, Bounds<Pixels>) {
+        (
+            DisplayId::new(id),
+            Some(uuid.to_owned()),
+            Bounds {
+                origin: point(px(x), px(0.)),
+                size: size(px(1920.), px(1080.)),
+            },
+        )
+    }
+
+    #[test]
+    fn a_saved_window_reopens_on_its_display() {
+        let on_second = WindowState {
+            placement: PlacementKind::Maximized,
+            x: 2100.,
+            y: 100.,
+            w: 1280.,
+            h: 720.,
+            saved: true,
+            display: Some("second".into()),
+        };
+        let displays = || [display(1, "primary", 0.), display(2, "second", 1920.)];
+        assert_eq!(
+            placement_display(&on_second, displays()),
+            Some(DisplayId::new(2)),
+            "the display with the saved UUID"
+        );
+        let renamed = WindowState {
+            display: Some("gone".into()),
+            ..on_second
+        };
+        assert_eq!(
+            placement_display(&renamed, displays()),
+            Some(DisplayId::new(2)),
+            "else the display holding the centre of the restore box"
+        );
+        let unplugged = WindowState {
+            x: 5000.,
+            ..renamed
+        };
+        assert_eq!(
+            placement_display(&unplugged, displays()),
+            None,
+            "the primary display when none matches"
+        );
+        assert_eq!(
+            placement_display(&WindowState::default(), displays()),
+            None,
+            "a never-saved window opens on the primary display"
+        );
+    }
+
+    #[test]
+    fn a_window_saved_at_the_origin_is_saved() {
+        let at_origin = window_state(
+            WindowBounds::Windowed(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(900.), px(600.)),
+            }),
+            None,
+        );
+        assert!(
+            at_origin.is_saved(),
+            "a real floating window at (0, 0) is not the default"
+        );
+        assert!(!WindowState::default().is_saved(), "the default is not");
+        let old_file = WindowState {
+            x: 10.,
+            ..WindowState::default()
+        };
+        assert!(old_file.is_saved(), "files from before `saved` still count");
+    }
+
+    #[test]
+    fn a_minimized_window_is_recognised() {
+        let at = |x: f32, y: f32| Bounds {
+            origin: point(px(x), px(y)),
+            size: size(px(160.), px(28.)),
+        };
+        assert!(
+            crate::app_view::minimized(at(-32000., -32000.)),
+            "where Windows parks a minimized window"
+        );
+        assert!(
+            !crate::app_view::minimized(at(-1920., 0.)),
+            "a display left of the primary one"
+        );
+    }
 
     #[test]
     fn strip_git_dir_removes_only_a_trailing_dot_git() {

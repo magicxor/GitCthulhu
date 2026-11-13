@@ -310,7 +310,8 @@ impl NestedAgreed {
 /// The `prepare` step of every operation that deletes untracked files (discard, delete, `stash push -u`): asks
 /// first when the snapshot would not hold them. `preview_skipped` fails closed: a repository without an oplog,
 /// with undo history switched off, or whose probe failed holds nothing, so every path is reported as unrestorable
-/// (32 review, T6). The runner refuses to run such an operation when the snapshot itself then fails.
+/// (32 review, T6). The runner refuses to run such an operation when the snapshot itself then fails, and asks again
+/// about files the snapshot skips beyond the ones accepted here.
 ///
 /// `nested`: the operation deletes the nested repositories among the paths (discard, delete), which are always asked
 /// about, by name, also when the preview fails closed (undo history off, no oplog): they come from the same walk the
@@ -350,16 +351,16 @@ pub(crate) fn confirm_untracked_loss(
             Err(err) => tracing::warn!("cannot look for nested repositories: {err}"),
         },
     }
-    if skipped.is_empty() {
-        return Ok(Prepared::Continue { untracked: None });
-    }
-    if !asker.confirm(confirm_unrestorable(title, &skipped)) {
+    if !skipped.is_empty() && !asker.confirm(confirm_unrestorable(title, &skipped)) {
         return Ok(Prepared::Cancelled);
     }
     if let Some(nested) = nested
         && nested_named
+        && !skipped.is_empty()
     {
         nested.0.store(true, Ordering::Release);
     }
-    Ok(Prepared::Continue { untracked: None })
+    Ok(Prepared::DeletesUntracked {
+        accepted: skipped.into_iter().map(|s| s.path).collect(),
+    })
 }

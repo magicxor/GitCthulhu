@@ -307,6 +307,31 @@ pub fn open_failure(err: &GitError) -> ErrorDialogData {
     data
 }
 
+/// The one dialog about the tabs of the last session whose repositories could not be opened again (an unplugged
+/// drive): each path with the reason. Their paths are kept for the next start.
+pub fn restore_failures(failed: &[(PathBuf, String)]) -> ErrorDialogData {
+    let count = failed.len();
+    let message = if count == 1 {
+        "A repository of the last session could not be reopened. It is tried again at the next start."
+            .to_owned()
+    } else {
+        format!(
+            "{count} repositories of the last session could not be reopened. They are tried again at the next \
+             start."
+        )
+    };
+    let mut data = ErrorDialogData::new("Could not reopen repositories", message);
+    data.details = Some(
+        failed
+            .iter()
+            .map(|(path, why)| format!("{}: {why}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into(),
+    );
+    data
+}
+
 /// The warning toast text and the "Show output" dialog of a successful operation with warnings
 /// (`OpWarning::PostHookFailed`: "{success text} - the {hook} hook failed (exit code {n})"; `AutostashConflict`:
 /// "Your local changes conflicted when re-applied"), plus " (+N more)" for further warnings. `None` when

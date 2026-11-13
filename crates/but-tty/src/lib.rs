@@ -178,6 +178,19 @@ impl Terminal {
         self.shown.lock().status.clone()
     }
 
+    /// Whether a program the shell started is running, whether or not it reports a status (a build, an editor
+    /// with unsaved work): closing the terminal would end it. Asks the emulator's thread (a silent program
+    /// changes nothing it reads), waiting at most 200 ms, else the answer as of the last output it read.
+    pub fn program_running(&self) -> bool {
+        let (answer, answered) = std::sync::mpsc::channel();
+        self.run(move |emulator| {
+            answer.send(emulator.program_running()).ok();
+        });
+        answered
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap_or_else(|_| self.shown.lock().program_running)
+    }
+
     /// The status, if it changed since this was last asked: what the program running reported,
     /// or idle once it's gone without saying, as being at work or blocked lasts only as long as
     /// it does. A result is no news while the terminal has the keys, as the user is in it.
@@ -444,6 +457,29 @@ mod tests {
             &mut terminal,
             "the hold should end though nothing is drawn, or the UI is woken to redraw forever",
             |terminal| terminal.hold_left().is_none(),
+        );
+    }
+
+    #[test]
+    fn a_plain_program_counts_as_running_until_it_ends() {
+        let mut terminal = started();
+        until(&mut terminal, "the shell should start", |terminal| {
+            (terminal.frame().rows.iter()).any(|row| !row.text.trim().is_empty())
+        });
+        assert!(
+            !terminal.program_running(),
+            "at its prompt nothing the shell started runs"
+        );
+        terminal.input(b"sleep 2; printf 'slept-%s\\n' 1\n");
+        until(
+            &mut terminal,
+            "a program that reports nothing should count as running",
+            |terminal| terminal.program_running(),
+        );
+        until(
+            &mut terminal,
+            "once it ended, the shell is back",
+            |terminal| !terminal.program_running() && shows(terminal, "slept-1"),
         );
     }
 

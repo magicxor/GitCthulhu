@@ -50,6 +50,8 @@ pub(crate) struct Shown {
     pub(crate) stale: bool,
     pub(crate) title: String,
     pub(crate) status: Status,
+    /// A program the shell started is running, whatever it reports (closing the terminal would end it).
+    pub(crate) program_running: bool,
     pub(crate) tracks_mouse: bool,
     /// What the program running last copied, until the UI puts it on the clipboard.
     pub(crate) copied: Option<String>,
@@ -69,6 +71,9 @@ pub(crate) struct Emulator {
     ended: bool,
     /// A key was pressed after that.
     closing: bool,
+    /// The shell wrote something: it runs (a launcher such as Git Bash's has started it), so the processes of
+    /// its job can be counted against those it keeps at its prompt.
+    heard: bool,
 }
 
 /// What the UI talks to an emulator's thread with.
@@ -95,6 +100,7 @@ pub(crate) fn start(
         stale: false,
         title: String::new(),
         status,
+        program_running: false,
         tracks_mouse: false,
         copied: None,
         hold_until: None,
@@ -118,6 +124,7 @@ pub(crate) fn start(
                 unshown: true,
                 ended: false,
                 closing: false,
+                heard: false,
             };
             setup(&mut emulator);
             emulator.publish(&showing);
@@ -188,6 +195,7 @@ fn run(
 impl Emulator {
     /// Shows what the shell wrote, answering what it asked.
     pub(crate) fn feed(&mut self, output: &[u8]) {
+        self.heard = true;
         self.vt.write(output);
         let replies = self.vt.take_replies();
         self.send(&replies);
@@ -244,6 +252,13 @@ impl Emulator {
         }
     }
 
+    /// Whether a program the shell started is running (see `Pty::program_running`). Not asked before the shell
+    /// wrote anything: on Windows the fewest processes seen set what counts as the shell at its prompt, and a
+    /// launcher counted before it started the shell would make the shell itself count as a program.
+    pub(crate) fn program_running(&self) -> bool {
+        self.heard && !self.ended && self.pty.program_running()
+    }
+
     /// Updates what the UI reads, drawing a frame if something changed while the terminal is on
     /// screen, and returns whether anything it reads did. A program's status lasts only as long
     /// as it does: once the shell has the terminal back, or a failed command ended, being at work
@@ -254,6 +269,7 @@ impl Emulator {
         let title = self.vt.retitled();
         let reported = self.vt.reported();
         let program_gone = self.ended || self.pty.shell_in_front();
+        let program_running = self.program_running();
         if program_gone {
             self.vt.reporter_gone();
         }
@@ -273,6 +289,8 @@ impl Emulator {
             };
             changed |= shown.status != status;
             shown.status = status;
+            changed |= shown.program_running != program_running;
+            shown.program_running = program_running;
             changed |= shown.tracks_mouse != tracks_mouse;
             shown.tracks_mouse = tracks_mouse;
             if copied.is_some() {

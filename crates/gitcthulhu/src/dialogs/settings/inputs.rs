@@ -147,7 +147,9 @@ impl Render for NumberField {
             .border(dp(metrics::FIELD_BORDER))
             .border_color(border)
             .rounded(dp(metrics::RADIUS))
-            .px(dp(10.))
+            .px(dp(
+                crate::widgets::field::FIELD_TEXT_INSET - metrics::FIELD_BORDER
+            ))
             .text_body1()
             .text_color(if self.disabled {
                 tokens.field_border_disabled()
@@ -156,12 +158,14 @@ impl Render for NumberField {
             })
             .child(
                 div().flex_1().child(
-                    Input::new(&self.input)
-                        .appearance(false)
-                        .bordered(false)
-                        .focus_bordered(false)
-                        .disabled(self.disabled)
-                        .text_right(),
+                    crate::widgets::field::field_input(
+                        Input::new(&self.input)
+                            .appearance(false)
+                            .bordered(false)
+                            .focus_bordered(false)
+                            .disabled(self.disabled),
+                    )
+                    .text_right(),
                 ),
             )
     }

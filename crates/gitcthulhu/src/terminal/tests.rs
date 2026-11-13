@@ -325,6 +325,53 @@ fn the_link_under_a_point_is_the_one_its_cell_has() {
 }
 
 #[test]
+fn only_http_links_with_a_host_may_be_opened() {
+    for uri in [
+        "https://github.com/org/repo/pull/1",
+        "http://example.com",
+        "HTTPS://example.com:8443/a?b#c",
+        "https://user@[::1]:8080/x",
+    ] {
+        assert!(grid::openable(uri), "{uri} is a web link");
+    }
+    for uri in [
+        "file:///C:/Windows/System32/cmd.exe",
+        r"\\host\share\x.exe",
+        "ms-msdt:/id PCWDiagnostic",
+        "search-ms:query=x&crumb=location:\\\\host\\share",
+        "javascript:alert('http://x')",
+        r"C:\x.exe",
+        "https:///path-without-host",
+        "https://",
+        "http://host\\share",
+        "https://exa mple.com",
+        "https://example.com/\x07",
+        "",
+    ] {
+        assert!(
+            !grid::openable(uri),
+            "{uri:?} could run a program or is no web link"
+        );
+    }
+}
+
+#[test]
+fn a_link_that_may_not_be_opened_is_not_one_under_the_pointer() {
+    let grid = Grid {
+        origin: point(px(0.), px(0.)),
+        cell: size(px(8.), px(16.)),
+    };
+    let mut linked = row(&[("https://github.com/org/repo/pull/1", 34, PLAIN)]);
+    linked.runs[0].link = Some(Arc::from("file:///C:/Windows/System32/cmd.exe"));
+    let rows = [Arc::new(linked)];
+    assert_eq!(
+        grid::link_at(&rows, grid, point(px(4.), px(8.))),
+        None,
+        "a file: target dressed as a web link is neither underlined nor followed"
+    );
+}
+
+#[test]
 fn colours_come_from_the_theme_tokens() {
     for tokens in [
         crate::theme::builtin::dark(),
@@ -698,6 +745,22 @@ fn dropped_paths_are_quoted_for_the_shell() {
     );
 }
 
+#[test]
+fn powershell_quoting_doubles_typographic_single_quotes_too() {
+    assert_eq!(
+        shell::quoted(ShellKind::PowerShell, ["x\u{2019}; calc; \u{2019}.txt"]),
+        "'x\u{2019}\u{2019}; calc; \u{2019}\u{2019}.txt'",
+        "a right single quote would end the string and run `calc`"
+    );
+    for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+        assert_eq!(
+            shell::quoted(ShellKind::PowerShell, [format!("a{quote}b")]),
+            format!("'a{quote}{quote}b'"),
+            "PowerShell takes {quote:?} as a single quote, escaped by doubling it"
+        );
+    }
+}
+
 // ----- panel (21 §5.2, §8.2) -----
 
 #[gpui_kit::test]
@@ -731,17 +794,17 @@ fn panel_geometry_and_resize_clamp(cx: &mut TestAppContext) {
         assert_rect(window, ids::HIDE, 1280. - 8. - 8. - 34., top + 8., 34., 34.);
         assert_rect(window, ids::VIEW, 8., top + 42., 1264., height - 34.);
 
-        // Up past the limit: the split keeps 200 dp under the toolbar.
+        // Up past the limit: the split keeps the right pane's fixed content (276 dp) under the toolbar.
         let grab = bounds(window, ids::RESIZER).center();
         window.drag(grab, point(grab.x, px(1.)), cx);
         window.render_frame(cx);
-        let max = 720. - 36. - 64. - 200. - 16. - 1. - 32.;
-        assert_rect(window, ids::PANEL, 0., 36. + 64. + 200., 1280., max + 16.);
+        let max = 720. - 36. - 64. - 276. - 16. - 1. - 32.;
+        assert_rect(window, ids::PANEL, 0., 36. + 64. + 276., 1280., max + 16.);
     })
     .expect("window");
     let persisted = cx.update(|cx| crate::settings::state::get(cx).terminal_height);
     assert_eq!(
-        persisted, 371.,
+        persisted, 295.,
         "the height is persisted when the drag ends"
     );
     cx.update_window(handle, |_, window, cx| {
@@ -765,6 +828,62 @@ fn panel_geometry_and_resize_clamp(cx: &mut TestAppContext) {
             "down past the limit stops at the minimum"
         );
     });
+}
+
+#[gpui_kit::test]
+fn the_tallest_panel_leaves_the_status_headers_and_actions(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    fixture.write("README.md", "terminal\n");
+    fixture.write("b.txt", "b\n");
+    fixture.commit_all("init");
+    fixture.write("README.md", "staged\n");
+    fixture.git(&["add", "README.md"]);
+    fixture.write("b.txt", "unstaged\n");
+    // A maximized 1080p window at 150 %.
+    let (handle, _app, tab) =
+        mount_fixture(cx, &fixture, crate::test_support::window_size(1280., 668.));
+    cx.executor().allow_parking();
+    test_shell(cx);
+    let ctx = cx.update(|cx| tab.read(cx).ctx().clone());
+    let panel = cx
+        .update(|cx| panel_of(&ctx, cx))
+        .expect("a terminal panel");
+    show_and_wait(cx, handle, &tab, &panel);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let grab = bounds(window, ids::RESIZER).center();
+        window.drag(grab, point(grab.x, px(1.)), cx);
+        window.render_frame(cx);
+        let panel_top = bounds(window, ids::PANEL).top().as_f32();
+        assert!(
+            (panel_top - (36. + 64. + 276.)).abs() <= 0.5,
+            "the split keeps 276 dp, got the panel at {panel_top}"
+        );
+        let status = crate::status_pane::ids::STAGED;
+        let unstaged = crate::status_pane::ids::UNSTAGED;
+        for header in [status.header, unstaged.header] {
+            let b = bounds(window, header);
+            assert!(
+                (b.size.height.as_f32() - 34.).abs() <= 0.5,
+                "08 §0.5: the {header} bar keeps its 34 dp, got {b:?}"
+            );
+        }
+        for action in [status.action, unstaged.action] {
+            let b = bounds(window, action);
+            assert!(
+                b.size.height.as_f32() >= 20. && b.bottom().as_f32() <= panel_top,
+                "{action} (Unstage all / Stage all) is visible above the panel, got {b:?}"
+            );
+        }
+        let commit = bounds(window, crate::status_pane::commit_box::COMMIT_BOX);
+        assert!(
+            (commit.size.height.as_f32() - 192.).abs() <= 0.5
+                && commit.bottom().as_f32() <= panel_top,
+            "the commit box keeps its 192 dp above the panel, got {commit:?}"
+        );
+        window.click(unstaged.action, cx);
+    })
+    .expect("window");
 }
 
 #[gpui_kit::test]
@@ -1051,6 +1170,32 @@ fn working_command() -> String {
     } else {
         "sh -c \"printf '\\033]7501;state=working\\033\\\\'; sleep 60\"\r".to_owned()
     }
+}
+
+/// A long-running program that reports nothing, as a plain build or an editor.
+fn plain_long_command() -> String {
+    if cfg!(windows) {
+        "ping -n 60 127.0.0.1\r".to_owned()
+    } else {
+        "sleep 60\r".to_owned()
+    }
+}
+
+#[gpui_kit::test]
+fn close_tab_with_a_plain_long_program_confirms(cx: &mut TestAppContext) {
+    let (_fixture, handle, _app, tab, panel) = mount(cx);
+    let view = show_and_wait(cx, handle, &tab, &panel);
+    let ctx = cx.update(|cx| tab.read(cx).ctx().clone());
+    assert!(
+        cx.update(|cx| confirm_close(&ctx, cx)).is_none(),
+        "an idle shell closes without asking"
+    );
+    send(cx, handle, &view, &plain_long_command());
+    wait_until(
+        cx,
+        "a running program that reports no status still makes closing ask",
+        |cx| cx.update(|cx| confirm_close(&ctx, cx)).is_some(),
+    );
 }
 
 #[gpui_kit::test]

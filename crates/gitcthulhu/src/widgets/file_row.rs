@@ -18,6 +18,7 @@ use gpui_kit::{
 use crate::icons::{AppIcon, icon};
 use crate::metrics::{self, dp};
 use crate::theme::{ActiveTokens as _, TextStyleExt as _, Tokens};
+use crate::widgets::with_layer;
 
 /// Icon and colour of a change kind (08 §4.4 table). Untracked files show as added.
 pub fn status_icon(kind: ChangeKind, tokens: &Tokens) -> (AppIcon, Hsla) {
@@ -41,6 +42,16 @@ pub fn split_path(path: &[u8]) -> (String, String) {
             path[at + 1..].to_str_lossy().into_owned(),
         ),
         None => (String::new(), path.to_str_lossy().into_owned()),
+    }
+}
+
+/// The background of a hovered file row (08 §4.4): the state layer over the row's own background, so a selected
+/// row stays selected under the pointer.
+pub(crate) fn hover_background(selected: bool, tokens: &Tokens) -> Hsla {
+    if selected {
+        with_layer(tokens.background_selected, tokens.hover_layer())
+    } else {
+        tokens.hover_layer()
     }
 }
 
@@ -121,6 +132,7 @@ impl RenderOnce for FileRow {
         let on_click = self.on_click;
         let on_context_menu = self.on_context_menu;
         let show_parent = !self.tree_mode && !parent.is_empty();
+        let selected = self.selected;
         div()
             .id(self.id)
             .group("file-row")
@@ -130,7 +142,7 @@ impl RenderOnce for FileRow {
             .flex_none()
             .cursor_pointer()
             .when(self.selected, |r| r.bg(tokens.background_selected))
-            .hover(move |s| s.bg(tokens.hover_layer()))
+            .hover(move |s| s.bg(hover_background(selected, &tokens)))
             .when_some(on_click, |r, f| {
                 r.on_click(move |ev, window, cx| f(ev, window, cx))
             })

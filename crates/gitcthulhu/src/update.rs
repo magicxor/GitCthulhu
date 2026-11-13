@@ -98,6 +98,8 @@ pub struct UpdateState {
     fetcher: Option<crate::widgets::avatar::AvatarFetcher>,
     /// A re-install of the avatar downloader is scheduled (until then downloads answer from the disk cache only).
     avatar_retry_pending: bool,
+    /// Counts the avatar retries that fired: a download started before the newest one does not schedule another.
+    avatar_retry_generation: u64,
     /// Limits the avatar downloads running at once.
     avatar_gate: avatars::DownloadGate,
 }
@@ -439,6 +441,7 @@ fn install_avatar_fetcher(cx: &mut App) {
         let services = services.clone();
         let cache = cache.clone();
         let turn = cx.default_global::<UpdateState>().avatar_gate.enter();
+        let generation = cx.default_global::<UpdateState>().avatar_retry_generation;
         cx.spawn(async move |cx: &mut AsyncApp| {
             if let Some(turn) = turn {
                 // `Canceled` only when the gate itself is gone: go ahead then.
@@ -460,8 +463,12 @@ fn install_avatar_fetcher(cx: &mut App) {
             });
             let result = task.await;
             cx.update(|cx| {
-                cx.default_global::<UpdateState>().avatar_gate.leave();
-                if matches!(result, Err(avatars::AvatarMiss::Unreachable(_))) {
+                let state = cx.default_global::<UpdateState>();
+                state.avatar_gate.leave();
+                // A download answered "offline" before the last retry fired must not schedule one more.
+                if matches!(result, Err(avatars::AvatarMiss::Unreachable(_)))
+                    && state.avatar_retry_generation == generation
+                {
                     schedule_avatar_retry(cx);
                 }
             });
@@ -474,7 +481,7 @@ fn install_avatar_fetcher(cx: &mut App) {
 }
 
 /// After a download failed (offline, server error) the avatar widget shows the initial letter for the rest of the
-/// session; re-installing the downloader after [`AVATAR_RETRY`] makes it ask again (addresses known to have no
+/// session; `widgets::avatar::retry_missing` after [`AVATAR_RETRY`] makes it ask again (addresses known to have no
 /// picture are answered by the disk cache, so only the failed ones reach the network). While the retry is pending
 /// the downloader does not use the network at all.
 fn schedule_avatar_retry(cx: &mut App) {
@@ -488,9 +495,8 @@ fn schedule_avatar_retry(cx: &mut App) {
         cx.update(|cx| {
             let state = cx.default_global::<UpdateState>();
             state.avatar_retry_pending = false;
-            if let Some(fetcher) = state.fetcher.clone() {
-                crate::widgets::avatar::set_fetcher(cx, fetcher);
-            }
+            state.avatar_retry_generation += 1;
+            crate::widgets::avatar::retry_missing(cx);
         });
     })
     .detach();

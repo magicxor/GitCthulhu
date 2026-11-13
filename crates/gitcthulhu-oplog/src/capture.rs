@@ -352,9 +352,10 @@ fn probe_unreadable(path: &Path) -> bool {
 }
 
 /// Which of the untracked `paths` (directories expand to the untracked, non-ignored files below them) a capture
-/// would skip: `CaptureDisabled`, `TooLarge` or `Unreadable`, and untracked nested repositories at or below them
-/// (`NestedRepository`, whatever the options: no snapshot holds them). Stat and open probe only: no hashing, no
-/// object writes, no lock. Tracked, ignored and missing paths are not reported.
+/// of just these paths would skip: `CaptureDisabled`, `TooLarge`, `Unreadable`, and `OverBudget` for what the
+/// total budget leaves out when the smallest are admitted first (as `capture` does), plus untracked nested
+/// repositories at or below them (`NestedRepository`, whatever the options: no snapshot holds them). Stat and open
+/// probe only: no hashing, no object writes, no lock. Tracked, ignored and missing paths are not reported.
 pub(crate) fn preview_skipped(
     repo: &gix::Repository,
     paths: &[BString],
@@ -398,6 +399,7 @@ pub(crate) fn preview_skipped(
             reason: SkipReason::NestedRepository,
         })
         .collect();
+    let mut candidates = Vec::new();
     for rela in found.files {
         let full_path = workdir.join(gix::path::from_bstr(rela.as_bstr())?);
         let size = file_size(&full_path);
@@ -410,12 +412,26 @@ pub(crate) fn preview_skipped(
         } else {
             None
         };
-        if let Some(reason) = reason {
-            out.push(SkippedFile {
+        match reason {
+            Some(reason) => out.push(SkippedFile {
                 path: rela,
                 size,
                 reason,
-            });
+            }),
+            None => candidates.push((size, rela)),
+        }
+    }
+    // The same admission as `capture`: smallest first until the budget is used up.
+    candidates.sort();
+    let mut running = 0u64;
+    for (size, path) in candidates {
+        match running.checked_add(size) {
+            Some(total) if total <= limits.untracked_total_limit => running = total,
+            _ => out.push(SkippedFile {
+                path,
+                size,
+                reason: SkipReason::OverBudget,
+            }),
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));

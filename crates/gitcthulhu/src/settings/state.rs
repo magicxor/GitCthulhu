@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
 
-use super::io::{Loaded, load, schedule_save, write_atomic};
+use super::io::{Loaded, flush_now, load, schedule_save, set_base, write_atomic};
 use crate::metrics;
 
 /// Maximum number of remembered repositories.
@@ -25,9 +25,9 @@ pub enum PlacementKind {
 
 /// Saved window placement, in logical pixels.
 ///
-/// The default (never saved) is "maximized, restore box 1280 x 720 with `x == y == 0`"; the window code centres a
-/// box whose origin is `(0, 0)` on the primary display.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// The default (never saved) is "maximized, restore box 1280 x 720"; the window code centres it on the primary
+/// display. Files written before `saved` existed count as saved unless their box is at `(0, 0)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowState {
     pub placement: PlacementKind,
@@ -35,6 +35,17 @@ pub struct WindowState {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    /// The placement was saved from a real window (a window at `(0, 0)` is a real place).
+    pub saved: bool,
+    /// The UUID of the display the window was on, so it reopens there.
+    pub display: Option<String>,
+}
+
+impl WindowState {
+    /// Whether this placement came from a real window rather than the defaults.
+    pub fn is_saved(&self) -> bool {
+        self.saved || self.x != 0. || self.y != 0.
+    }
 }
 
 impl Default for WindowState {
@@ -45,6 +56,8 @@ impl Default for WindowState {
             y: 0.,
             w: metrics::WINDOW_DEFAULT_W,
             h: metrics::WINDOW_DEFAULT_H,
+            saved: false,
+            display: None,
         }
     }
 }
@@ -106,7 +119,7 @@ fn canonicalize_plain(path: &Path) -> Option<PathBuf> {
 }
 
 impl UiState {
-    /// Loads the state from `path`: defaults when missing, defaults plus a `*.bak` rename when corrupt.
+    /// Loads the state from `path`: defaults when missing, defaults plus a backup when corrupt (see [`load`]).
     pub fn load_from(path: &Path) -> Loaded<UiState> {
         load::<UiState>(path)
     }
@@ -151,8 +164,9 @@ pub struct UiStateGlobal(pub UiState);
 
 impl Global for UiStateGlobal {}
 
-/// Installs `state` as the global (without scheduling a save).
+/// Installs `state`, as read from `state.json`, as the global (without scheduling a save).
 pub fn init(cx: &mut App, state: UiState) {
+    set_base(cx, "state", &state);
     cx.set_global(UiStateGlobal(state));
 }
 
@@ -167,16 +181,18 @@ pub fn update(cx: &mut App, edit: impl FnOnce(&mut UiState)) {
         .try_global::<UiStateGlobal>()
         .map(|g| g.0.clone())
         .unwrap_or_default();
+    let before = next.clone();
     edit(&mut next);
+    if next == before && cx.has_global::<UiStateGlobal>() {
+        return;
+    }
     cx.set_global(UiStateGlobal(next.clone()));
     schedule_save(cx, "state", crate::paths::state_file(), next);
 }
 
-/// Writes the state immediately (on quit).
+/// Writes the state immediately (on quit), only if this process changed it, and then only the changed keys.
 pub fn flush(cx: &App) {
-    if let Some(s) = cx.try_global::<UiStateGlobal>()
-        && let Err(err) = s.0.save_to(&crate::paths::state_file())
-    {
-        tracing::error!("cannot save UI state: {err}");
+    if let Some(s) = cx.try_global::<UiStateGlobal>() {
+        flush_now(cx, "state", &crate::paths::state_file(), &s.0);
     }
 }

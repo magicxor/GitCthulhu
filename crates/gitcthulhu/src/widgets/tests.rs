@@ -331,6 +331,42 @@ fn outlined_field_border_states(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn outlined_field_text_starts_12_dp_from_the_edge(cx: &mut TestAppContext) {
+    init_visual(cx);
+    let slot: Rc<RefCell<Option<Entity<OutlinedField>>>> = Rc::default();
+    let build_slot = slot.clone();
+    let (handle, _) = open_probe(cx, 600., 200., move |window, cx| {
+        let field = build_slot
+            .borrow_mut()
+            .get_or_insert_with(|| cx.new(|cx| OutlinedField::new("field", window, cx)))
+            .clone();
+        div().p(dp(20.)).w(dp(340.)).child(field).into_any_element()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        let field = slot.borrow().clone().expect("field created");
+        field.update(cx, |f, cx| f.set_text("Title", window, cx));
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let frame = bounds(window, "field");
+        let text = field
+            .read(cx)
+            .text_bounds(cx)
+            .expect("the text was laid out");
+        let inset = (text.origin.x - frame.origin.x).as_f32();
+        assert!(
+            (inset - 12.).abs() <= 0.5,
+            "07 §10.1 / 09 §0.3: padding h12 with the 2 dp border drawn over it, got {inset}"
+        );
+        let end = (frame.right() - text.right()).as_f32();
+        assert!(
+            (end - 12.).abs() <= 0.5,
+            "the text ends 12 dp before the right edge too, got {end}"
+        );
+    })
+    .expect("window");
+}
+
+#[gpui_kit::test]
 fn outlined_field_reports_text_and_changes(cx: &mut TestAppContext) {
     init_visual(cx);
     let slot: Rc<RefCell<Option<Entity<OutlinedField>>>> = Rc::default();
@@ -553,6 +589,30 @@ fn file_row_height_follows_the_lists_spacing(cx: &mut TestAppContext) {
     .expect("window");
 }
 
+#[test]
+fn a_hovered_selected_file_row_keeps_its_selection_colour() {
+    for tokens in [
+        crate::theme::builtin::dark(),
+        crate::theme::builtin::light(),
+    ] {
+        assert_eq!(
+            super::file_row::hover_background(true, &tokens),
+            with_layer(tokens.background_selected, tokens.hover_layer()),
+            "08 §4.4: the state layer lies over backgroundSelected"
+        );
+        assert_ne!(
+            super::file_row::hover_background(true, &tokens),
+            tokens.hover_layer(),
+            "not the bare hover layer, which would look unselected"
+        );
+        assert_eq!(
+            super::file_row::hover_background(false, &tokens),
+            tokens.hover_layer(),
+            "an unselected row has no background of its own under the layer"
+        );
+    }
+}
+
 #[gpui_kit::test]
 fn filter_dropdown_selects_and_closes_on_outside_press(cx: &mut TestAppContext) {
     init_visual(cx);
@@ -638,6 +698,82 @@ fn filter_dropdown_selects_and_closes_on_outside_press(cx: &mut TestAppContext) 
         events.borrow().as_slice(),
         [super::dropdown::FilterDropdownEvent::Selected(1)],
         "one selection event"
+    );
+}
+
+#[gpui_kit::test]
+fn filter_dropdown_scrolls_to_every_option(cx: &mut TestAppContext) {
+    init_visual(cx);
+    let slot: Rc<RefCell<Option<Entity<FilterDropdown>>>> = Rc::default();
+    let build_slot = slot.clone();
+    let (handle, _) = open_probe(cx, 800., 720., move |window, cx| {
+        let dropdown = build_slot
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                cx.new(|cx| {
+                    let options = (0..60)
+                        .map(|i| gpui_kit::SharedString::from(format!("origin/branch-{i:02}")))
+                        .collect();
+                    FilterDropdown::new("upstream", options, None, window, cx)
+                })
+            })
+            .clone();
+        div()
+            .size_full()
+            .p(dp(20.))
+            .child(dropdown)
+            .into_any_element()
+    });
+    let dropdown = slot.borrow().clone().expect("dropdown created");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let log = events.clone();
+    cx.update(|cx| {
+        cx.subscribe(
+            &dropdown,
+            move |_, event: &super::dropdown::FilterDropdownEvent, _| {
+                log.borrow_mut().push(event.clone())
+            },
+        )
+        .detach();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("upstream-button", cx);
+        window.render_frame(cx);
+        let popup = bounds(window, "upstream-popup");
+        assert!(
+            popup.size.height.as_f32() <= 320.5,
+            "the card is at most 320 dp high (07 §10.3), got {popup:?}"
+        );
+        assert_height(window, "upstream-option-0", 48.);
+        assert!(
+            window.try_find("upstream-option-59").is_none(),
+            "rows out of view are not built"
+        );
+        window.scroll(
+            "upstream-option-0",
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        let last = bounds(window, "upstream-option-59");
+        assert!(
+            last.top() >= popup.top() && last.bottom() <= popup.bottom() + px(0.5),
+            "the last option scrolls into the card: {last:?} in {popup:?}"
+        );
+        window.click("upstream-option-59", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            dropdown.read(cx).selected(),
+            Some(59),
+            "the last option can be chosen"
+        );
+    })
+    .expect("window");
+    assert_eq!(
+        events.borrow().as_slice(),
+        [super::dropdown::FilterDropdownEvent::Selected(59)],
+        "choosing the last option emits its index"
     );
 }
 

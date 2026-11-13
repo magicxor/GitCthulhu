@@ -165,6 +165,8 @@ fn ui_state_roundtrip() {
             y: 20.,
             w: 900.,
             h: 700.,
+            saved: true,
+            display: Some("8f2c6a1e-0000-0000-0000-000000000002".into()),
         },
     };
     state.save_to(&path).expect("save");
@@ -270,4 +272,111 @@ fn settings_update_notifies_and_debounces_the_save(cx: &mut gpui_kit::TestAppCon
     cx.executor().advance_clock(io::SAVE_DEBOUNCE);
     cx.run_until_parked();
     assert!(target.exists(), "the file is written after the debounce");
+}
+
+#[test]
+fn a_wrong_value_resets_only_its_setting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("settings.json");
+    std::fs::write(
+        &path,
+        br#"{"theme":"Neon","proxy_port":70000,"undo_keep_days":7}"#,
+    )
+    .expect("write");
+    let loaded = Settings::load_from(&path);
+    let notice = loaded.notice("settings.json");
+    let Loaded::Partial {
+        value,
+        mut dropped,
+        backup,
+        ..
+    } = loaded
+    else {
+        panic!("wrong values are a partial load, got {loaded:?}");
+    };
+    assert_eq!(value.theme, ThemeKind::Dark, "an unknown theme falls back");
+    assert_eq!(value.proxy_port, 0, "an out-of-range port falls back");
+    assert_eq!(value.undo_keep_days, 7, "the good value is kept");
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        ["proxy_port", "theme"],
+        "both reset keys are named"
+    );
+    assert_eq!(
+        backup.as_deref(),
+        Some(dir.path().join("settings.json.bak").as_path()),
+        "the original is kept"
+    );
+    assert_eq!(
+        notice.as_deref(),
+        Some("settings.json: reset theme, proxy_port; the original is kept as settings.json.bak"),
+        "the user is told what was reset"
+    );
+}
+
+fn theme_and_host(path: &std::path::Path) -> (serde_json::Value, serde_json::Value) {
+    let file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("the file exists")).expect("JSON");
+    (file["theme"].clone(), file["proxy_host"].clone())
+}
+
+#[gpui_kit::test]
+fn a_flush_keeps_what_another_instance_saved(cx: &mut gpui_kit::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("settings.json");
+    Settings::default().save_to(&path).expect("write");
+    cx.update(|cx| set_base(cx, "flush-test", &Settings::default()));
+    // Another instance started from the same file saves a proxy host.
+    Settings {
+        proxy_host: "elsewhere".into(),
+        ..Settings::default()
+    }
+    .save_to(&path)
+    .expect("the other instance writes");
+
+    cx.update(|cx| io::flush_now(cx, "flush-test", &path, &Settings::default()));
+    assert_eq!(
+        theme_and_host(&path).1,
+        "elsewhere",
+        "a process that changed nothing writes nothing on quit"
+    );
+
+    let mine = Settings {
+        theme: ThemeKind::Light,
+        ..Settings::default()
+    };
+    cx.update(|cx| io::flush_now(cx, "flush-test", &path, &mine));
+    assert_eq!(
+        theme_and_host(&path),
+        (serde_json::json!("Light"), serde_json::json!("elsewhere")),
+        "only this process's change is written, over the other's"
+    );
+}
+
+#[gpui_kit::test]
+fn a_reset_value_is_written_back_so_the_next_start_loads_cleanly(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, br#"{"theme":"Neon","undo_keep_days":7}"#).expect("write");
+    let loaded = Settings::load_from(&path);
+    let rejected = loaded.rejected();
+    let value = loaded.into_value();
+    cx.update(|cx| {
+        set_base(cx, "repair-test", &value);
+        io::note_rejected(cx, "repair-test", rejected);
+        // Nothing else changed in this run: the quit flush still replaces the value that did not fit.
+        io::flush_now(cx, "repair-test", &path, &value);
+    });
+    let Loaded::Ok(again) = Settings::load_from(&path) else {
+        panic!("the repaired file loads as it is, without another warning or backup");
+    };
+    assert_eq!(again.theme, ThemeKind::Dark, "the default was written");
+    assert_eq!(again.undo_keep_days, 7, "the good value stays");
+    assert!(
+        !dir.path().join("settings.json.1.bak").exists(),
+        "a single backup of the original"
+    );
 }

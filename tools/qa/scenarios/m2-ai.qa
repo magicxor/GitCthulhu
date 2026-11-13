@@ -3,7 +3,8 @@
 # 21 section 5.3 (commit box) and 5.4 (Settings > AI).
 resize 1280x720
 set theme dark
-ai use fake provider 100
+# 400 ms per word: about 23 s for the canned message, so the shot after 1.5 s is mid-stream.
+ai use fake provider 400
 open repository linear
 wait idle
 ai prepare staged changes
@@ -13,7 +14,7 @@ ai set message wip: sign-up form
 ai generate
 wait 1500
 shot x3-02-streaming-stop
-wait idle
+wait idle 30000
 shot x3-03-generated
 open settings page ai
 wait idle

@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bstr::BString;
 use gpui_kit::{AppContext as _, Context, SharedString, Window};
 
 use super::{RepoTab, RepoTabEvent};
@@ -104,6 +105,11 @@ impl OpEnv<'_> {
 pub enum Prepared {
     /// Run the operation; `Some` replaces the snapshot's `UntrackedCapture`.
     Continue { untracked: Option<UntrackedCapture> },
+    /// Run the operation, which deletes the untracked files its snapshot captures (discard, delete, `stash push
+    /// -u`). The user already agreed to lose `accepted`, the files the preview found the snapshot cannot hold; any
+    /// other file the snapshot then skips (over the total budget, grown or locked meanwhile) is asked about before
+    /// the operation runs.
+    DeletesUntracked { accepted: Vec<BString> },
     /// The user declined: nothing runs.
     Cancelled,
 }
@@ -389,6 +395,8 @@ pub fn refresh_after<T>(
 /// The background sequence of `run_op` (spec 21 §2.5).
 fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker) -> BgResult<T> {
     let mut record = p.record;
+    // `Some` for an operation that deletes the untracked files of its snapshot: the files the user agreed to lose.
+    let mut accepted_loss = None;
     if let Some(prepare) = p.prepare {
         match prepare(h, &asker) {
             Ok(Prepared::Continue {
@@ -399,6 +407,7 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
                 }
             }
             Ok(Prepared::Continue { untracked: None }) => {}
+            Ok(Prepared::DeletesUntracked { accepted }) => accepted_loss = Some(accepted),
             Ok(Prepared::Cancelled) => {
                 return BgResult::failed(OpFailure::Cancelled, RefreshSet::empty());
             }
@@ -408,27 +417,28 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
     let (mut warning, mut recorded) = (None, false);
     let result = match p.guard {
         Guard::Exclusive => {
-            let Some(mut guard) = h.try_lock(LOCK_TIMEOUT) else {
-                return BgResult::failed(OpFailure::RepoBusy, RefreshSet::empty());
-            };
-            let _suppress = h.suppress_watcher();
-            let pending = match record {
-                Record::Snapshot(desc) => {
-                    let title = desc.title.clone();
-                    // Operations that delete untracked files (discard, delete, `stash push -u`) fail closed
-                    // when their snapshot cannot be taken: the files would be gone with no way back (T6).
-                    let captures_untracked = desc.untracked != UntrackedCapture::None;
-                    match h.oplog_prepare(desc, guard.write_permission()) {
-                        PrepareResult::Recording(pending) => Some((pending, title)),
-                        PrepareResult::Disabled => None,
-                        PrepareResult::Interrupted => {
-                            return BgResult::failed(
-                                OpFailure::InterruptedRestore,
-                                RefreshSet::UNDO,
-                            );
-                        }
-                        PrepareResult::Failed(err) if captures_untracked => {
-                            return BgResult::failed(
+            let (mut guard, _suppress, pending) = loop {
+                let Some(mut guard) = h.try_lock(LOCK_TIMEOUT) else {
+                    return BgResult::failed(OpFailure::RepoBusy, RefreshSet::empty());
+                };
+                let suppress = h.suppress_watcher();
+                let pending = match &record {
+                    Record::Snapshot(desc) => {
+                        let title = desc.title.clone();
+                        // Operations that delete untracked files (discard, delete, `stash push -u`) fail closed
+                        // when their snapshot cannot be taken: the files would be gone with no way back (T6).
+                        let captures_untracked = desc.untracked != UntrackedCapture::None;
+                        match h.oplog_prepare(desc.clone(), guard.write_permission()) {
+                            PrepareResult::Recording(pending) => Some((pending, title)),
+                            PrepareResult::Disabled => None,
+                            PrepareResult::Interrupted => {
+                                return BgResult::failed(
+                                    OpFailure::InterruptedRestore,
+                                    RefreshSet::UNDO,
+                                );
+                            }
+                            PrepareResult::Failed(err) if captures_untracked => {
+                                return BgResult::failed(
                                     OpFailure::Other(
                                         format!(
                                             "{title} was not run: the undo snapshot failed, so the files it \
@@ -438,14 +448,38 @@ fn execute<T: Send>(h: &RepoHandle, p: BgParts<T>, ctx: OpContext, asker: Asker)
                                     ),
                                     RefreshSet::empty(),
                                 );
-                        }
-                        PrepareResult::Failed(err) => {
-                            warning = Some(format!("{title} can't be undone: {err}"));
-                            None
+                            }
+                            PrepareResult::Failed(err) => {
+                                warning = Some(format!("{title} can't be undone: {err}"));
+                                None
+                            }
                         }
                     }
+                    Record::None | Record::Marker => None,
+                };
+                // The snapshot may skip files the preview did not predict (over the total budget, grown or locked
+                // meanwhile): they would be deleted for good. Ask about them without the guard, then take a fresh
+                // snapshot (T6).
+                let unasked: Vec<_> = match (&accepted_loss, &pending) {
+                    (Some(accepted), Some((pending, _))) => pending
+                        .skipped_untracked()
+                        .iter()
+                        .filter(|skipped| !accepted.contains(&skipped.path))
+                        .cloned()
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if unasked.is_empty() {
+                    break (guard, suppress, pending);
                 }
-                Record::None | Record::Marker => None,
+                let title = pending.map(|(_, title)| title).unwrap_or_default();
+                drop((suppress, guard));
+                if !asker.confirm(present::confirm_unrestorable(&title, &unasked)) {
+                    return BgResult::failed(OpFailure::Cancelled, RefreshSet::empty());
+                }
+                if let Some(accepted) = &mut accepted_loss {
+                    accepted.extend(unasked.into_iter().map(|skipped| skipped.path));
+                }
             };
             let r = (p.run)(&mut OpEnv {
                 repo: &h.repo,
@@ -571,6 +605,11 @@ impl RepoTab {
     /// The running operation, if any.
     pub fn busy(&self) -> Option<&BusyState> {
         self.busy.as_ref()
+    }
+
+    /// How the running operation, if any, may be cancelled.
+    pub fn busy_cancellable(&self) -> Option<Cancellable> {
+        self.busy.as_ref().map(|busy| busy.cancellable)
     }
 
     /// Starts an operation. `false` (with a Warning toast) when another one runs. Never blocks the UI thread.
@@ -716,13 +755,29 @@ impl RepoTab {
                     && let Some(busy) = &mut tab.busy
                 {
                     busy.overlay_visible = true;
-                    window.focus(&tab.overlay_focus, cx);
+                    tab.focus_overlay_if_free(window, cx);
                     cx.notify();
                 }
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Gives the keyboard to the visible processing overlay (Escape cancels, the frame's shortcuts are swallowed),
+    /// but only when it is free to take: never from an open dialog (a confirmation or credential prompt of this
+    /// very operation) and never from another tab or the window outside this tab's frame. Called when the overlay
+    /// appears and whenever the focus comes back into the frame (a dialog closed).
+    pub(crate) fn focus_overlay_if_free(&self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        if !self.busy.as_ref().is_some_and(|b| b.overlay_visible)
+            || self.overlay_focus.is_focused(window)
+            || window.has_active_dialog(cx)
+            || !self.focus.contains_focused(window, cx)
+        {
+            return;
+        }
+        window.focus(&self.overlay_focus, cx);
     }
 
     fn end_busy(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<BusyState> {

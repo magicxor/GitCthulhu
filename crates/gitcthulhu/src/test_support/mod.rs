@@ -195,6 +195,17 @@ pub fn mount_fixture_on(
     size: Size<Pixels>,
     asker_answer: bool,
 ) -> (AnyWindowHandle, Entity<AppView>, Entity<RepoTab>) {
+    mount_path_on(cx, fixture.path(), rt, size, asker_answer)
+}
+
+/// [`mount_fixture_on`] for the repository at `path` (e.g. a bare clone next to the fixture's repository).
+pub fn mount_path_on(
+    cx: &mut TestAppContext,
+    path: &std::path::Path,
+    rt: Arc<crate::backend::GitRuntime>,
+    size: Size<Pixels>,
+    asker_answer: bool,
+) -> (AnyWindowHandle, Entity<AppView>, Entity<RepoTab>) {
     init_app(cx);
     cx.update(|cx| {
         if let Some(state) = crate::app::state_mut(cx) {
@@ -202,8 +213,7 @@ pub fn mount_fixture_on(
         }
     });
     let undo = cx.update(|cx| crate::app::undo_settings(cx));
-    let repo_handle =
-        handle::open_repo(&rt, fixture.path(), &undo).expect("the fixture repository opens");
+    let repo_handle = handle::open_repo(&rt, path, &undo).expect("the repository opens");
     let (window_handle, app) = open_app(cx, size);
     let tab = cx
         .update_window(window_handle, |_, window, cx| {

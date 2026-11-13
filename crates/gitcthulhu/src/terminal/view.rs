@@ -179,6 +179,11 @@ impl TerminalView {
         self.tty.status()
     }
 
+    /// Whether a program the shell started runs, whatever it reports.
+    pub fn program_running(&self) -> bool {
+        self.tty.program_running()
+    }
+
     /// Whether the terminal is on screen.
     pub fn is_shown(&self) -> bool {
         self.shown

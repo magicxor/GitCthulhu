@@ -175,6 +175,12 @@ impl OutlinedField {
         cx.notify();
     }
 
+    /// Where the text is drawn, from the last frame.
+    #[cfg(test)]
+    pub(crate) fn text_bounds(&self, cx: &App) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+        self.input.read(cx).text_bounds()
+    }
+
     /// The border the field draws in its current state.
     pub fn border_state(&self, window: &Window, cx: &App) -> BorderState {
         let focused = self
@@ -205,8 +211,11 @@ impl Render for OutlinedField {
             .border(dp(metrics::FIELD_BORDER))
             .border_color(border)
             .rounded(dp(metrics::RADIUS))
-            .pl(dp(10.))
-            .pr(dp(10. + self.trailing_space))
+            // Gitnuro's h12 padding with the 2 dp border drawn over it (Compose); a GPUI border takes layout space.
+            .pl(dp(FIELD_TEXT_INSET - metrics::FIELD_BORDER))
+            .pr(dp(
+                FIELD_TEXT_INSET - metrics::FIELD_BORDER + self.trailing_space
+            ))
             .text_body1()
             .text_color(if self.disabled {
                 tokens.field_border_disabled()
@@ -214,15 +223,24 @@ impl Render for OutlinedField {
                 tokens.on_background
             })
             .child(
-                div().flex_1().child(
+                div().flex_1().child(field_input(
                     Input::new(&self.input)
                         .appearance(false)
                         .bordered(false)
                         .focus_bordered(false)
                         .disabled(self.disabled),
-                ),
+                )),
             )
     }
+}
+
+/// Where the text of an outlined field starts and ends, in dp from the field's outer edge (07 §10.1).
+pub const FIELD_TEXT_INSET: f32 = 12.;
+
+/// A kit `Input` inside one of Gitnuro's outlined frames: without the kit's own horizontal padding (the frame
+/// pads) and with body1 text instead of the kit's smaller default size.
+pub fn field_input(input: Input) -> Input {
+    input.px(dp(0.)).text_body1()
 }
 
 /// Material filled text area with a label (the commit message box, 08 §4.6).

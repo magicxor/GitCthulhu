@@ -284,6 +284,19 @@ impl RepoHandle {
         }
     }
 
+    /// Lowers the total size of the untracked files one snapshot captures (tests of the budget).
+    #[cfg(test)]
+    pub(crate) fn set_untracked_total_limit(&self, limit: u64) {
+        if let Some(oplog) = &self.oplog {
+            let mut oplog = oplog.write();
+            let options = super::OplogOptions {
+                untracked_total_limit: limit,
+                ..oplog.options().clone()
+            };
+            oplog.set_options(options);
+        }
+    }
+
     /// Whether the oplog records new operations.
     pub fn oplog_enabled(&self) -> bool {
         self.oplog

@@ -173,12 +173,15 @@ impl TerminalPanel {
         Status::most_urgent(self.terminals.iter().map(|entry| &entry.status)).cloned()
     }
 
-    /// The question asked before the tab closes while a program in a terminal reports that it is working.
-    pub fn confirm_close(&self, _cx: &App) -> Option<ConfirmRequest> {
+    /// The question asked before the tab closes while a program in a terminal reports that it is working, or a
+    /// program the shell started runs at all (a build, an editor with unsaved work).
+    pub fn confirm_close(&self, cx: &App) -> Option<ConfirmRequest> {
         let working = self
             .terminals
             .iter()
-            .filter(|entry| entry.status == Status::Working)
+            .filter(|entry| {
+                entry.status == Status::Working || entry.view.read(cx).program_running()
+            })
             .count();
         if working == 0 {
             return None;

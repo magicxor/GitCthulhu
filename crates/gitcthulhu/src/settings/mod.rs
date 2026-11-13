@@ -15,7 +15,7 @@ pub mod io;
 pub mod repo_prefs;
 pub mod state;
 
-pub use io::{Loaded, SAVE_DEBOUNCE, backup_path, load, schedule_save, write_atomic};
+pub use io::{Loaded, SAVE_DEBOUNCE, backup_path, load, schedule_save, set_base, write_atomic};
 pub use repo_prefs::{RepoPref, RepoPrefs, Signoff};
 pub use state::{PlacementKind, UiState, UiStateGlobal, WindowState};
 
@@ -206,14 +206,11 @@ impl Default for Settings {
 pub const SCALE_CHOICES: [f32; 8] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 
 impl Settings {
-    /// Loads settings from `path`: defaults when missing, defaults plus a `*.bak` rename when corrupt.
-    /// The scale is clamped to the supported range.
+    /// Loads settings from `path`: defaults when missing, defaults plus a backup when corrupt, the defaults of the
+    /// keys whose values do not fit plus a backup otherwise (see [`load`]). The scale is clamped to the supported
+    /// range.
     pub fn load_from(path: &Path) -> Loaded<Settings> {
-        match load::<Settings>(path) {
-            Loaded::Ok(s) => Loaded::Ok(s.sanitized()),
-            Loaded::Missing(s) => Loaded::Missing(s),
-            Loaded::Corrupt { value, backup } => Loaded::Corrupt { value, backup },
-        }
+        load::<Settings>(path).map(Settings::sanitized)
     }
 
     /// Writes the settings to `path` atomically.
@@ -237,8 +234,9 @@ pub struct SettingsGlobal(pub Settings);
 
 impl Global for SettingsGlobal {}
 
-/// Installs `settings` as the global (without scheduling a save).
+/// Installs `settings`, as read from `settings.json`, as the global (without scheduling a save).
 pub fn init(cx: &mut App, settings: Settings) {
+    set_base(cx, "settings", &settings);
     cx.set_global(SettingsGlobal(settings));
 }
 
@@ -268,12 +266,11 @@ pub fn update(cx: &mut App, edit: impl FnOnce(&mut Settings)) {
     schedule_save(cx, "settings", crate::paths::settings_file(), next);
 }
 
-/// Writes settings and UI state immediately (on quit).
+/// Writes settings and UI state immediately (on quit), each only if this process changed it, and then only the
+/// changed keys (another instance may have changed others).
 pub fn flush(cx: &App) {
-    if let Some(s) = cx.try_global::<SettingsGlobal>()
-        && let Err(err) = s.0.save_to(&crate::paths::settings_file())
-    {
-        tracing::error!("cannot save settings: {err}");
+    if let Some(s) = cx.try_global::<SettingsGlobal>() {
+        io::flush_now(cx, "settings", &crate::paths::settings_file(), &s.0);
     }
     state::flush(cx);
 }

@@ -612,13 +612,13 @@ mod terminal {
         with_window(cx, handle, |window, cx| {
             window.render_frame(cx);
             let grab = bounds(window, ids::RESIZER).center();
-            window.drag(grab, point(grab.x, grab.y - px(100.)), cx);
+            window.drag(grab, point(grab.x, grab.y - px(50.)), cx);
             window.render_frame(cx);
         });
         let dragged = cx.update(|cx| crate::settings::state::get(cx).terminal_height);
         assert_eq!(
             dragged,
-            metrics::TERMINAL_DEFAULT_H + 100.,
+            metrics::TERMINAL_DEFAULT_H + 50.,
             "the dragged height is persisted"
         );
 

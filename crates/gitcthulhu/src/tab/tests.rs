@@ -149,6 +149,221 @@ fn run_op_rejects_second_op(cx: &mut TestAppContext) {
     );
 }
 
+/// Starts a 5-second operation of `cancellable` on `tab` and returns its cancel token.
+fn start_long_op(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    tab: &Entity<RepoTab>,
+    cancellable: super::ops::Cancellable,
+) -> crate::backend::CancelToken {
+    cx.update(|cx| {
+        script_op(
+            tab,
+            cx,
+            Ok(outcome((), RefreshSet::empty())),
+            Duration::from_secs(5),
+        )
+    });
+    run(
+        cx,
+        handle,
+        tab,
+        noop_spec(OpKind::CheckoutBranch).cancellable(cancellable),
+    );
+    cx.update(|cx| tab.read(cx).busy().expect("running").cancel.clone())
+}
+
+fn tab_open(cx: &mut TestAppContext, app: &Entity<AppView>, tab: &Entity<RepoTab>) -> bool {
+    cx.update(|cx| {
+        app.read(cx)
+            .tabs()
+            .iter()
+            .any(|slot| slot.repo() == Some(tab))
+    })
+}
+
+fn has_dialog(cx: &mut TestAppContext, handle: AnyWindowHandle) -> bool {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        gpui_kit::component::WindowExt::has_active_dialog(window, cx)
+    })
+    .expect("window")
+}
+
+#[gpui_kit::test]
+fn closing_a_tab_asks_before_stopping_an_operation_half_way(cx: &mut TestAppContext) {
+    use super::ops::Cancellable;
+    let (handle, app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
+    let id = cx.update(|cx| tab.read(cx).id());
+    let token = start_long_op(cx, handle, &tab, Cancellable::WithWarning);
+    cx.update_window(handle, |_, window, cx| {
+        app.update(cx, |app, cx| app.close_tab(id, window, cx))
+    })
+    .expect("window");
+    assert!(has_dialog(cx, handle), "closing asks first");
+    assert!(tab_open(cx, &app, &tab), "the tab stays until answered");
+    assert!(!token.is_cancelled(), "nothing is killed before the answer");
+    cx.update_window(handle, |_, window, cx| window.click("dialog-cancel", cx))
+        .expect("window");
+    cx.run_until_parked();
+    assert!(
+        tab_open(cx, &app, &tab) && !token.is_cancelled(),
+        "Keep running leaves the tab and its operation alone"
+    );
+    cx.update_window(handle, |_, window, cx| {
+        app.update(cx, |app, cx| app.close_tab(id, window, cx))
+    })
+    .expect("window");
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dialog-primary", cx)
+    })
+    .expect("window");
+    cx.run_until_parked();
+    assert!(!tab_open(cx, &app, &tab), "Close closes the tab");
+    assert!(token.is_cancelled(), "and cancels the operation");
+}
+
+#[gpui_kit::test]
+fn closing_a_tab_leaves_an_uncancellable_operation_running(cx: &mut TestAppContext) {
+    use super::ops::Cancellable;
+    let (handle, app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
+    let id = cx.update(|cx| tab.read(cx).id());
+    let token = start_long_op(cx, handle, &tab, Cancellable::No);
+    cx.update_window(handle, |_, window, cx| {
+        app.update(cx, |app, cx| app.close_tab(id, window, cx))
+    })
+    .expect("window");
+    assert!(
+        !tab_open(cx, &app, &tab),
+        "the tab closes without a question"
+    );
+    assert!(
+        !token.is_cancelled(),
+        "an operation that may not be cancelled is not killed half-way"
+    );
+
+    let second = add_seeded_tab(cx, handle, &app, RepoSeed::linear(2));
+    let id = cx.update(|cx| second.read(cx).id());
+    let token = start_long_op(cx, handle, &second, Cancellable::Yes);
+    cx.update_window(handle, |_, window, cx| {
+        app.update(cx, |app, cx| app.close_tab(id, window, cx))
+    })
+    .expect("window");
+    assert!(!tab_open(cx, &app, &second), "closes at once");
+    assert!(
+        token.is_cancelled(),
+        "a safely cancellable operation is cancelled"
+    );
+}
+
+#[gpui_kit::test]
+fn closing_the_window_asks_while_an_operation_is_not_safe_to_kill(cx: &mut TestAppContext) {
+    use super::ops::Cancellable;
+    let (handle, app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
+    let close = |cx: &mut TestAppContext| {
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| app.should_close_window(window, cx))
+        })
+        .expect("window")
+    };
+    assert!(close(cx), "an idle window closes");
+    start_long_op(cx, handle, &tab, Cancellable::No);
+    assert!(!close(cx), "a running checkout keeps the window open");
+    assert!(has_dialog(cx, handle), "and asks whether to quit");
+}
+
+fn overlay_focused(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    tab: &Entity<RepoTab>,
+) -> bool {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        tab.read(cx).overlay_focus.is_focused(window)
+    })
+    .expect("window")
+}
+
+#[gpui_kit::test]
+fn the_overlay_does_not_take_the_focus_from_a_dialog(cx: &mut TestAppContext) {
+    use super::ops::Cancellable;
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
+    cx.update_window(handle, |_, window, cx| {
+        // Focus events are delivered to an active window only.
+        window.activate_window();
+        tab.update(cx, |t, cx| t.focus(window, cx));
+    })
+    .expect("window");
+    let token = start_long_op(cx, handle, &tab, Cancellable::Yes);
+    // A confirmation of the operation opens at once (a prepare-time question, a credential prompt).
+    let answers = Rc::new(RefCell::new(Vec::new()));
+    let sink = answers.clone();
+    cx.update_window(handle, |_, window, cx| {
+        crate::dialogs::confirm::open_with(
+            window,
+            cx,
+            ConfirmRequest::new("Clear the undo history?", "It cannot be undone."),
+            Box::new(move |yes, _, _| sink.borrow_mut().push(yes)),
+        );
+    })
+    .expect("window");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert!(has_dialog(cx, handle), "the dialog is still open");
+    assert!(
+        !overlay_focused(cx, handle, &tab),
+        "the overlay appearing does not take the keyboard from the dialog"
+    );
+    cx.update_window(handle, |_, window, cx| window.press("escape", cx))
+        .expect("window");
+    // The dialog hands the focus back when its closing animation ends.
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    assert!(
+        !has_dialog(cx, handle) && answers.borrow().is_empty(),
+        "Escape dismisses the dialog"
+    );
+    assert!(!token.is_cancelled(), "and does not cancel the operation");
+    assert!(
+        overlay_focused(cx, handle, &tab),
+        "with the dialog gone, the focus back in the frame goes to the overlay"
+    );
+    cx.update_window(handle, |_, window, cx| window.press("escape", cx))
+        .expect("window");
+    assert!(token.is_cancelled(), "now Escape cancels the operation");
+}
+
+#[gpui_kit::test]
+fn the_overlay_of_a_hidden_tab_does_not_take_the_focus(cx: &mut TestAppContext) {
+    use super::ops::Cancellable;
+    let (handle, app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
+    cx.update_window(handle, |_, window, cx| {
+        window.activate_window();
+        tab.update(cx, |t, cx| t.focus(window, cx));
+    })
+    .expect("window");
+    start_long_op(cx, handle, &tab, Cancellable::Yes);
+    let second = add_seeded_tab(cx, handle, &app, RepoSeed::linear(2));
+    cx.update_window(handle, |_, window, cx| {
+        second.update(cx, |t, cx| t.focus(window, cx));
+    })
+    .expect("window");
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert!(
+        !overlay_focused(cx, handle, &tab),
+        "the hidden tab's overlay leaves the shown tab's focus alone"
+    );
+    let shown_has_focus = cx
+        .update_window(handle, |_, window, cx| {
+            second.read(cx).focus.contains_focused(window, cx)
+        })
+        .expect("window");
+    assert!(shown_has_focus, "the shown tab keeps the keyboard");
+}
+
 #[gpui_kit::test]
 fn overlay_appears_after_300ms(cx: &mut TestAppContext) {
     let (handle, _app, tab) = mount_seeded(cx, RepoSeed::linear(3), DEFAULT_SIZE);
@@ -1405,6 +1620,97 @@ fn run_on<T>(
 }
 
 #[gpui_kit::test]
+fn a_bare_repository_has_an_empty_status_and_no_error(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    fx.write(
+        "a.txt", "one
+",
+    );
+    fx.commit_all("init");
+    let bare = fx.dir.path().join("remote.git");
+    fx.git(&[
+        "clone",
+        "-q",
+        "--bare",
+        ".",
+        bare.to_str().expect("a UTF-8 path"),
+    ]);
+    let (_handle, app, tab) =
+        crate::test_support::mount_path_on(cx, &bare, fx.runtime(), DEFAULT_SIZE, false);
+    for _ in 0..2 {
+        cx.update(|cx| tab.update(cx, |t, cx| t.reload(RefreshSet::ALL, cx)));
+        cx.run_until_parked();
+    }
+    let toasts = cx.update(|cx| toast_texts(&app, cx));
+    assert!(
+        toasts.iter().all(|t| !t.contains("failed")),
+        "loading a bare repository shows no error toast, got {toasts:?}"
+    );
+    let status = cx.update(|cx| tab.read(cx).ctx().model.read(cx).status.value.clone());
+    let status = status.expect("the status is loaded");
+    assert!(
+        status.staged.is_empty() && status.unstaged.is_empty(),
+        "a repository without a working tree has no changes"
+    );
+}
+
+#[gpui_kit::test]
+fn a_restored_tab_whose_repository_is_gone_is_kept_for_the_next_start(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    fx.write(
+        "a.txt", "one
+",
+    );
+    fx.commit_all("init");
+    let missing = fx.dir.path().join("unplugged");
+    crate::test_support::init_app(cx);
+    cx.update(|cx| {
+        if let Some(state) = crate::app::state_mut(cx) {
+            state.git = crate::backend::GitStatus::Ready(fx.runtime());
+        }
+        crate::settings::state::init(
+            cx,
+            crate::settings::UiState {
+                tabs_open: vec![missing.clone(), fx.path().to_owned()],
+                selected_tab: 1,
+                ..Default::default()
+            },
+        );
+    });
+    let (handle, app) = crate::test_support::open_app(cx, DEFAULT_SIZE);
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+            .expect("window");
+    }
+    cx.update(|cx| {
+        let view = app.read(cx);
+        assert_eq!(
+            view.tabs().len(),
+            1,
+            "no New tab in place of the missing one"
+        );
+        assert!(
+            view.tabs()[0].repo().is_some(),
+            "the repository that exists is open"
+        );
+        assert_eq!(view.active(), 0, "and selected, as it was");
+        assert_eq!(
+            view.errors_opened,
+            ["Could not reopen repositories"],
+            "one summary instead of a dialog per tab"
+        );
+        let open = &crate::settings::state::get(cx).tabs_open;
+        assert_eq!(open.len(), 2, "both paths stay in state.json: {open:?}");
+        assert_eq!(
+            open.last(),
+            Some(&missing),
+            "the missing one behind the open tabs"
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn fixture_stage_paths_records_nothing(cx: &mut TestAppContext) {
     let fx = Fixture::new();
     fx.write("a.txt", "one\n");
@@ -1462,6 +1768,62 @@ fn fixture_discard_untracked_records_snapshot_with_paths(cx: &mut TestAppContext
     assert!(
         undo.and_then(|u| u.undo).is_some(),
         "the UNDO reload sees the undoable entry"
+    );
+}
+
+/// Two 9-byte untracked files and a snapshot budget of 12 bytes: the preview (per file) finds nothing to warn
+/// about, the snapshot captures only one of them.
+fn over_budget_discard(cx: &mut TestAppContext, answer: bool) -> (Fixture, Entity<RepoTab>) {
+    let fx = Fixture::new();
+    fx.write(
+        "a.txt", "one
+",
+    );
+    fx.commit_all("init");
+    fx.write("u1.txt", "123456789");
+    fx.write("u2.txt", "123456789");
+    let (handle, _app, tab) = mount_fixture_with(cx, &fx, DEFAULT_SIZE, answer);
+    cx.update(|cx| {
+        tab.read(cx)
+            .ctx()
+            .backend
+            .handle()
+            .expect("a real repository")
+            .set_untracked_total_limit(12)
+    });
+    let paths: Vec<RelaPath> = vec!["u1.txt".into(), "u2.txt".into()];
+    run_on(cx, handle, &tab, move |t, w, cx| {
+        t.discard_paths(paths.clone(), DiscardMode::StagedAndUnstaged, paths, w, cx)
+    });
+    (fx, tab)
+}
+
+#[gpui_kit::test]
+fn files_over_the_snapshot_budget_are_not_deleted_unasked(cx: &mut TestAppContext) {
+    let (fx, tab) = over_budget_discard(cx, false);
+    assert!(
+        fx.path().join("u1.txt").exists() && fx.path().join("u2.txt").exists(),
+        "declining the question about the file the snapshot could not hold deletes nothing"
+    );
+    assert!(
+        oplog_entries(&tab, cx).is_empty(),
+        "nothing ran, nothing was recorded"
+    );
+}
+
+#[gpui_kit::test]
+fn files_over_the_snapshot_budget_are_deleted_once_accepted(cx: &mut TestAppContext) {
+    let (fx, tab) = over_budget_discard(cx, true);
+    assert!(
+        !fx.path().join("u1.txt").exists() && !fx.path().join("u2.txt").exists(),
+        "once accepted, the discard runs"
+    );
+    let entries = oplog_entries(&tab, cx);
+    assert_eq!(entries.len(), 1, "one snapshot entry");
+    assert_eq!(
+        entries[0].skipped_untracked.len(),
+        1,
+        "one file was over the budget: the user was told before it went"
     );
 }
 
@@ -1596,6 +1958,40 @@ fn fixture_push_rejection_records_marker(cx: &mut TestAppContext) {
             .iter()
             .all(|u| u.remote_ref.as_bstr() == "refs/tags/v1"),
         "only the accepted tag is in the marker: {network:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_log_reload_hands_the_previous_snapshot_back_to_be_freed(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    fx.write(
+        "a.txt", "one
+",
+    );
+    fx.commit_all("first");
+    let (_handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let previous = cx.update(|cx| {
+        let log = tab.read(cx).ctx().model.read(cx).log.value.clone();
+        Arc::downgrade(&log.expect("the log is loaded"))
+    });
+    fx.write(
+        "a.txt", "two
+",
+    );
+    fx.commit_all("second");
+    cx.update(|cx| tab.update(cx, |t, cx| t.reload(RefreshSet::LOG, cx)));
+    cx.run_until_parked();
+    let rows = cx.update(|cx| {
+        let log = tab.read(cx).ctx().model.read(cx).log.value.clone();
+        log.expect("the log is loaded").rows.len()
+    });
+    assert_eq!(
+        rows, 3,
+        "the new snapshot, built in the background, is applied"
+    );
+    assert!(
+        previous.upgrade().is_none(),
+        "the replaced snapshot was freed (on a background thread, as set_log hands it back)"
     );
 }
 

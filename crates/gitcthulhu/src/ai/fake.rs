@@ -164,6 +164,9 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
     if shared.stop.load(Ordering::SeqCst) {
         return;
     }
+    // Each streamed piece leaves at once: Nagle's algorithm would hold small writes back until an ACK, which
+    // Windows delays up to 200 ms, and send several pieces together.
+    let _ = stream.set_nodelay(true);
     let Some(request) = read_request(&mut stream) else {
         return;
     };
@@ -204,11 +207,12 @@ fn answer(
             stream.write_all(
                 b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
             )?;
+            // One piece per `delay`: written and flushed, then the pause.
             for piece in pieces {
-                std::thread::sleep(*delay);
                 let event = serde_json::json!({"choices": [{"delta": {"content": piece}}]});
                 stream.write_all(format!("data: {event}\n\n").as_bytes())?;
                 stream.flush()?;
+                std::thread::sleep(*delay);
             }
             stream.write_all(b"data: [DONE]\n\n")?;
             stream.flush()
@@ -229,4 +233,56 @@ fn json(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()>
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use core::prelude::v1::test;
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn a_streamed_reply_sends_one_piece_per_delay() {
+        let delay = Duration::from_millis(60);
+        let pieces: Vec<String> = ["one ", "two ", "three ", "four"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let fake = FakeProvider::start(Behavior::Reply {
+            pieces: pieces.clone(),
+            delay,
+        })
+        .expect("the fake starts");
+        let mut stream = TcpStream::connect(fake.addr).expect("connect");
+        let body = r#"{"stream":true,"messages":[{"role":"user","content":"x"}]}"#;
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("send the request");
+        let started = Instant::now();
+        let mut arrivals = Vec::new();
+        let mut seen = String::new();
+        let mut chunk = [0u8; 4096];
+        while !seen.contains("[DONE]") {
+            let n = stream.read(&mut chunk).expect("read");
+            assert!(n > 0, "the stream ended early: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            let events = seen.matches("data: {").count();
+            while arrivals.len() < events {
+                arrivals.push(started.elapsed());
+            }
+        }
+        assert_eq!(arrivals.len(), pieces.len(), "one event per piece");
+        for (i, pair) in arrivals.windows(2).enumerate() {
+            assert!(
+                pair[1] - pair[0] >= delay - Duration::from_millis(10),
+                "piece {} came {:?} after the one before it, not one delay ({delay:?}) later",
+                i + 1,
+                pair[1] - pair[0]
+            );
+        }
+    }
 }

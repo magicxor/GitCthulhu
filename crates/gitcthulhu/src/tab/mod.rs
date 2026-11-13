@@ -247,7 +247,7 @@ impl RepoTab {
                 None => (Asker::Auto(false), Arc::new(NoPrompter)),
             },
         };
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.observe(&ui, |_, _, cx| cx.notify()),
             undo_settings::observe(cx),
@@ -255,6 +255,11 @@ impl RepoTab {
                 tab.on_window_activation(window.is_window_active(), cx)
             }),
         ];
+        let focus = cx.focus_handle();
+        // A dialog that closes hands the focus back into the frame: the overlay of a running operation takes it.
+        subscriptions.push(cx.on_focus_in(&focus, window, |tab, window, cx| {
+            tab.focus_overlay_if_free(window, cx)
+        }));
         let mut tab = Self {
             ctx,
             name,
@@ -272,7 +277,7 @@ impl RepoTab {
                 &crate::settings::get_or_default(cx),
             )),
             views,
-            focus: cx.focus_handle(),
+            focus,
             overlay_focus: cx.focus_handle(),
             drag_widths: None,
             watcher_task: None,
@@ -327,6 +332,10 @@ impl RepoTab {
     }
 
     /// Stops the watcher and cancels every read and the running operation (tab closed). Idempotent.
+    ///
+    /// An operation that cannot be cancelled (`Cancellable::No`) is left to finish in the background: killing it
+    /// could leave the repository half-way through a checkout or rebase. A `WithWarning` one is cancelled, so the
+    /// caller asks first (`AppView::close_tab`).
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.closed {
             return;
@@ -337,7 +346,9 @@ impl RepoTab {
         }
         self.watcher_task = None;
         self.loader.cancel_all();
-        if let Some(busy) = &self.busy {
+        if let Some(busy) = &self.busy
+            && busy.cancellable != ops::Cancellable::No
+        {
             busy.cancel.cancel();
         }
         cx.notify();

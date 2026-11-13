@@ -2,6 +2,7 @@
 //! popup menu; `FilterDropdown` (upstream dialog) is an outlined button with a filter field and a list.
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -9,10 +10,12 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, EventEmitter,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Render,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    TestSupportExt as _, Window, anchored, deferred, div, point, px,
+    TestSupportExt as _, UniformListScrollHandle, Window, anchored, deferred, div, point, px,
+    uniform_list,
 };
 
 use super::field::{FieldEvent, OutlinedField};
+use super::scroll::list_scrollbar;
 use super::{BoundsCell, observed, track_bounds, with_layer};
 use crate::icons::{AppIcon, icon};
 use crate::menus::{self, MenuItem};
@@ -23,6 +26,10 @@ use crate::theme::{ActiveTokens as _, TextStyleExt as _};
 pub const DROPDOWN_W: f32 = 180.;
 /// Default width of a `FilterDropdown` in dp.
 pub const FILTER_DROPDOWN_W: f32 = 240.;
+/// Maximum height of a `FilterDropdown`'s popup card in dp; the options scroll below the filter field.
+const FILTER_POPUP_MAX_H: f32 = 320.;
+/// Height of one `FilterDropdown` option in dp (Material dropdown menu item).
+const FILTER_OPTION_H: f32 = 48.;
 
 /// Gitnuro `DropDownMenuText`: a 180 dp box with the current value and a chevron. Clicking opens `items` as a
 /// popup menu (without icon column) at the box's bottom-left corner.
@@ -112,10 +119,15 @@ pub enum FilterDropdownEvent {
 }
 
 /// Gitnuro `FilterDropdown`: an outlined button; the popup starts with an auto-focused filter field followed by
-/// the options that contain the filter text (case-insensitive).
+/// a scrolling list of the options that contain the filter text (case-insensitive).
 pub struct FilterDropdown {
     id: SharedString,
     options: Vec<SharedString>,
+    /// `options` in lower case, so filtering converts none of them per keystroke.
+    lowercased: Vec<String>,
+    /// Indices of the options matching the current filter text.
+    matches: Vec<usize>,
+    scroll: UniformListScrollHandle,
     selected: Option<usize>,
     open: bool,
     width: f32,
@@ -140,10 +152,19 @@ impl FilterDropdown {
         let filter_id = SharedString::from(format!("{id}-filter"));
         let filter = cx.new(|cx| OutlinedField::new(filter_id, window, cx));
         // Typing in the filter re-filters the options.
-        let filter_changes = cx.subscribe(&filter, |_, _, _: &FieldEvent, cx| cx.notify());
+        let filter_changes = cx.subscribe(&filter, |this, _, event: &FieldEvent, cx| {
+            if *event == FieldEvent::Changed {
+                this.refilter(cx);
+            }
+        });
+        let lowercased = lowercase(&options);
+        let matches = (0..options.len()).collect();
         Self {
             id,
             options,
+            lowercased,
+            matches,
+            scroll: UniformListScrollHandle::new(),
             selected,
             open: false,
             width: FILTER_DROPDOWN_W,
@@ -160,9 +181,10 @@ impl FilterDropdown {
         selected: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.lowercased = lowercase(&options);
         self.options = options;
         self.selected = selected;
-        cx.notify();
+        self.refilter(cx);
     }
 
     /// Sets the width of the button and the popup in dp (default 240).
@@ -181,15 +203,24 @@ impl FilterDropdown {
         self.open
     }
 
-    /// Indices of the options that match `filter` (case-insensitive `contains`; empty matches all).
-    pub fn matching(options: &[SharedString], filter: &str) -> Vec<usize> {
+    /// Indices of the options, given in lower case, that match `filter` (case-insensitive `contains`; empty
+    /// matches all).
+    pub fn matching(lowercased: &[String], filter: &str) -> Vec<usize> {
         let needle = filter.to_lowercase();
-        options
+        lowercased
             .iter()
             .enumerate()
-            .filter(|(_, o)| needle.is_empty() || o.to_lowercase().contains(&needle))
+            .filter(|(_, o)| needle.is_empty() || o.contains(&needle))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Filters the options again by the filter field's text, back at the top of the list.
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        let filter_text = self.filter.read(cx).text(cx);
+        self.matches = Self::matching(&self.lowercased, &filter_text);
+        self.scroll.scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
+        cx.notify();
     }
 
     fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -199,8 +230,38 @@ impl FilterDropdown {
                 f.set_text("", window, cx);
                 f.focus(window, cx);
             });
+            self.refilter(cx);
         }
         cx.notify();
+    }
+
+    /// The option rows of the matching options at `range`.
+    fn rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let tokens = *cx.tokens();
+        range
+            .filter_map(|row| self.matches.get(row).copied())
+            .map(|index| {
+                let selected = self.selected == Some(index);
+                div()
+                    .id(SharedString::from(format!("{}-option-{index}", self.id)))
+                    .w_full()
+                    .h(dp(FILTER_OPTION_H))
+                    .px(dp(16.))
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_body2()
+                    .text_color(tokens.on_background)
+                    .when(selected, |r| r.bg(tokens.background_selected))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(tokens.hover_layer()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose(index, cx)))
+                    .child(self.options[index].clone())
+                    .test_support()
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn choose(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -247,33 +308,31 @@ impl Render for FilterDropdown {
             .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx)))
             .test_support();
         let popup: Option<AnyElement> = self.open.then(|| {
-            let filter_text = self.filter.read(cx).text(cx);
-            let rows: Vec<AnyElement> = Self::matching(&self.options, &filter_text)
-                .into_iter()
-                .map(|index| {
-                    let selected = self.selected == Some(index);
-                    div()
-                        .id(SharedString::from(format!("{}-option-{index}", self.id)))
-                        .w_full()
-                        .min_h(dp(48.))
-                        .px(dp(16.))
-                        .flex()
-                        .items_center()
-                        .text_body2()
-                        .text_color(tokens.on_background)
-                        .when(selected, |r| r.bg(tokens.background_selected))
-                        .cursor_pointer()
-                        .hover(move |s| s.bg(tokens.hover_layer()))
-                        .on_click(cx.listener(move |this, _, _, cx| this.choose(index, cx)))
-                        .child(self.options[index].clone())
-                        .test_support()
-                        .into_any_element()
-                })
-                .collect();
+            let count = self.matches.len();
+            // Only the rows in view are built. The list is as tall as its rows, shrunk to what the card leaves
+            // below the filter field, and scrolls beyond.
+            let list = uniform_list(
+                SharedString::from(format!("{}-options", self.id)),
+                count,
+                cx.processor(|this, range: Range<usize>, _, cx| this.rows(range, cx)),
+            )
+            .track_scroll(&self.scroll)
+            .size_full();
+            let options = div()
+                .relative()
+                .w_full()
+                .h(dp(FILTER_OPTION_H * count as f32))
+                .flex_shrink(1.)
+                .min_h_0()
+                .child(list)
+                .child(list_scrollbar(
+                    SharedString::from(format!("{}-scrollbar", self.id)),
+                    &self.scroll,
+                ));
             let at = self.bounds.get().bottom_left();
             let card = observed(SharedString::from(format!("{}-popup", self.id)))
                 .w(dp(self.width))
-                .max_h(dp(320.))
+                .max_h(dp(FILTER_POPUP_MAX_H))
                 .overflow_hidden()
                 .flex()
                 .flex_col()
@@ -281,8 +340,8 @@ impl Render for FilterDropdown {
                 .bg(tokens.background)
                 .border(dp(1.))
                 .border_color(tokens.popup_border())
-                .child(div().p(dp(4.)).child(self.filter.clone()))
-                .children(rows);
+                .child(div().flex_none().p(dp(4.)).child(self.filter.clone()))
+                .child(options);
             // The backdrop covers the whole window (an `absolute().size_full()` layer would only cover this
             // widget's own box); presses inside the card must not reach it, or the popup would close on mouse-down
             // and the option's click would never arrive.
@@ -325,6 +384,10 @@ impl Render for FilterDropdown {
     }
 }
 
+fn lowercase(options: &[SharedString]) -> Vec<String> {
+    options.iter().map(|o| o.to_lowercase()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use core::prelude::v1::test;
@@ -337,6 +400,7 @@ mod tests {
             .into_iter()
             .map(SharedString::from)
             .collect();
+        let options = lowercase(&options);
         assert_eq!(
             FilterDropdown::matching(&options, ""),
             [0, 1, 2],

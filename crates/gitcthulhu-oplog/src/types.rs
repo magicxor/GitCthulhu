@@ -218,7 +218,8 @@ impl PendingOperation {
     }
 
     /// Requested untracked files that are NOT in the before-snapshot (too large, over budget, unreadable, capture
-    /// disabled). Informational: the GUI asked the user before taking the guard (`Oplog::preview_skipped`).
+    /// disabled). The GUI asked about the predicted ones before taking the guard (`Oplog::preview_skipped`) and asks
+    /// again about any other before an operation deletes them.
     pub fn skipped_untracked(&self) -> &[SkippedFile] {
         &self.before.skipped_untracked
     }

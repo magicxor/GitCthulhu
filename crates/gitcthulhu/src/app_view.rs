@@ -21,7 +21,7 @@ use crate::actions::{
 };
 use crate::backend::handle::{self, RepoHandle, TabBackend};
 use crate::backend::present::{self, ErrorDialogData};
-use crate::backend::prompt::UiRequest;
+use crate::backend::prompt::{ConfirmRequest, UiRequest};
 use crate::backend::{CancelToken, CloneOptions, GitError, GitErrorKind, GitStatus};
 use crate::ids;
 use crate::menus::MenuHost;
@@ -29,6 +29,7 @@ use crate::notifications::{ToastAction, ToastHost, ToastKind};
 use crate::settings::state;
 use crate::shell::tab_strip::TabStripView;
 use crate::shell::welcome::WelcomeView;
+use crate::tab::ops::Cancellable;
 use crate::tab::{RepoTab, TabId, TabOptions};
 use crate::theme::ActiveTokens as _;
 use crate::widgets::observed;
@@ -142,6 +143,13 @@ pub struct AppView {
     error_slot: ErrorSlot,
     /// Slots a clone added next to a repository tab: removed again when the clone fails.
     clone_slots: Vec<TabId>,
+    /// Slots still opening a tab restored from the last session.
+    restoring: Vec<TabId>,
+    /// Restored tabs whose repository could not be opened (an unplugged drive): kept in `state.json` behind the
+    /// open tabs until the user opens another repository or closes the last tab, with the reasons for the summary.
+    unrestored: Vec<(PathBuf, String)>,
+    /// The user agreed to close the window although an operation runs (`should_close_window`).
+    close_confirmed: bool,
     focus: FocusHandle,
     _request_pump: Task<()>,
     _bounds_save: Option<Task<()>>,
@@ -185,6 +193,10 @@ impl AppView {
         let subscriptions = vec![cx.observe_window_bounds(window, |view, window, cx| {
             view.schedule_bounds_save(window, cx)
         })];
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |view, cx| view.should_close_window(window, cx))
+                .unwrap_or(true)
+        });
         let mut view = Self {
             tabs: Vec::new(),
             active: 0,
@@ -194,6 +206,9 @@ impl AppView {
             error_queue: VecDeque::new(),
             error_slot: ErrorSlot::Idle,
             clone_slots: Vec::new(),
+            restoring: Vec::new(),
+            unrestored: Vec::new(),
+            close_confirmed: false,
             focus: cx.focus_handle(),
             _request_pump: request_pump,
             _bounds_save: None,
@@ -208,7 +223,10 @@ impl AppView {
             .map(|s| (s.0.tabs_open.clone(), s.0.selected_tab_index()))
             .unwrap_or_default();
         for path in restore.0 {
-            view.open_repository(path, false, window, cx);
+            let path = crate::app::strip_git_dir(path);
+            let ix = view.target_slot(false, window, cx);
+            view.restoring.push(view.tabs[ix].id);
+            view.start_open(ix, path, OpenKind::Open, None, window, cx);
         }
         if let Some(path) = cli {
             view.open_repository(path, true, window, cx);
@@ -322,6 +340,8 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let path = crate::app::strip_git_dir(path);
+        // The user moved on: the tabs of the last session that could not be reopened are forgotten.
+        self.unrestored.clear();
         let ix = self.target_slot(select, window, cx);
         self.start_open(ix, path, OpenKind::Open, None, window, cx);
     }
@@ -339,26 +359,81 @@ impl AppView {
         let Some(ix) = self.tabs.iter().position(|s| s.id == id) else {
             return;
         };
-        let confirm = self.tabs[ix]
-            .repo()
-            .and_then(|tab| crate::terminal::confirm_close(tab.read(cx).ctx(), cx));
-        match confirm {
-            Some(request) => {
-                let weak = cx.weak_entity();
-                crate::dialogs::confirm::open_with(
-                    window,
-                    cx,
-                    request,
-                    Box::new(move |yes, window, cx| {
-                        if yes {
-                            weak.update(cx, |view, cx| view.start_replace(id, path, window, cx))
-                                .ok();
-                        }
-                    }),
-                );
-            }
-            None => self.start_replace(id, path, window, cx),
+        let questions = self.close_questions(ix, cx);
+        if questions.is_empty() {
+            self.start_replace(id, path, window, cx);
+            return;
         }
+        let weak = cx.weak_entity();
+        ask_all(
+            questions,
+            window,
+            cx,
+            Box::new(move |window, cx| {
+                weak.update(cx, |view, cx| view.start_replace(id, path, window, cx))
+                    .ok();
+            }),
+        );
+    }
+
+    /// The questions asked before the repository tab in slot `ix` goes away, in order: a running operation that
+    /// may stop half-way (an operation that cannot be cancelled is left to finish, see `RepoTab::close`), then a
+    /// program working in its terminal.
+    fn close_questions(&self, ix: usize, cx: &App) -> Vec<ConfirmRequest> {
+        let Some(tab) = self.tabs.get(ix).and_then(TabSlot::repo) else {
+            return Vec::new();
+        };
+        let tab = tab.read(cx);
+        let mut questions = Vec::new();
+        if tab.busy_cancellable() == Some(Cancellable::WithWarning) {
+            let mut request = ConfirmRequest::new(
+                "Close the tab?",
+                "The operation may stop half-way. Close anyway?",
+            );
+            request.confirm_label = "Close".into();
+            request.cancel_label = "Keep running".into();
+            request.destructive = true;
+            questions.push(request);
+        }
+        questions.extend(crate::terminal::confirm_close(tab.ctx(), cx));
+        questions
+    }
+
+    /// Asked when the window is about to close: `false` keeps it open and asks first when an operation that is not
+    /// safe to kill is running (the process exit ends every Git it started). Closes the window itself once the
+    /// user agrees.
+    pub fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.close_confirmed {
+            return true;
+        }
+        let running = self.tabs.iter().filter_map(TabSlot::repo).any(|tab| {
+            tab.read(cx)
+                .busy_cancellable()
+                .is_some_and(|c| c != Cancellable::Yes)
+        });
+        if !running {
+            return true;
+        }
+        let mut request = ConfirmRequest::new(
+            "Quit GitCthulhu?",
+            "An operation is still running. It may stop half-way. Quit anyway?",
+        );
+        request.confirm_label = "Quit".into();
+        request.cancel_label = "Keep running".into();
+        request.destructive = true;
+        let weak = cx.weak_entity();
+        crate::dialogs::confirm::open_with(
+            window,
+            cx,
+            request,
+            Box::new(move |yes, window, cx| {
+                if yes {
+                    weak.update(cx, |view, _| view.close_confirmed = true).ok();
+                    window.remove_window();
+                }
+            }),
+        );
+        false
     }
 
     fn start_replace(
@@ -457,7 +532,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let restoring = self.restoring.contains(&id);
+        self.restoring.retain(|slot| *slot != id);
         let Some(ix) = self.tabs.iter().position(|s| s.id == id) else {
+            self.restore_finished(restoring, cx);
             if let Some(on_done) = on_done {
                 on_done(result.map(drop), window, cx);
             }
@@ -487,6 +565,26 @@ impl AppView {
         }
         match result {
             Ok(handle) => self.install_repo(ix, id, path, handle, window, cx),
+            Err(err)
+                if restoring
+                    && !matches!(
+                        err.kind(),
+                        GitErrorKind::UnsafeRepository
+                            | GitErrorKind::Cancelled
+                            | GitErrorKind::AuthCancelled
+                    ) =>
+            {
+                // A tab of the last session whose repository is gone (for now): no "New tab" in its place, no
+                // dialog of its own, and its path stays in `state.json` (see `persist_tabs`).
+                self.tabs.remove(ix);
+                if ix < self.active {
+                    self.active -= 1;
+                }
+                if self.tabs.is_empty() {
+                    self.push_welcome(window, cx);
+                }
+                self.unrestored.push((path, err.to_string()));
+            }
             Err(err) if err.kind() == GitErrorKind::UnsafeRepository => {
                 self.tabs[ix].content = self.welcome_content(window, cx);
                 self.ask_trust(path, window, cx);
@@ -501,7 +599,16 @@ impl AppView {
                 }
             }
         }
+        self.restore_finished(restoring, cx);
         self.after_tabs_changed(window, cx);
+    }
+
+    /// After a slot of the last session finished opening: once the last one did, one dialog names the repositories
+    /// that could not be reopened.
+    fn restore_finished(&self, was_restoring: bool, cx: &mut App) {
+        if was_restoring && self.restoring.is_empty() && !self.unrestored.is_empty() {
+            show_error(cx, present::restore_failures(&self.unrestored));
+        }
     }
 
     /// Puts an opened repository into slot `ix` as a loading `RepoTab` and records it as recent.
@@ -600,32 +707,28 @@ impl AppView {
         self.after_tabs_changed(window, cx);
     }
 
-    /// Closes the tab `id`; asks first when its terminal reports a working shell (`terminal::confirm_close`). The
-    /// tab to its left becomes selected; the last tab is replaced by an empty one.
+    /// Closes the tab `id`; asks first when its running operation may stop half-way or its terminal reports a
+    /// working shell (`close_questions`). The tab to its left becomes selected; the last tab is replaced by an empty
+    /// one.
     pub fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|s| s.id == id) else {
             return;
         };
-        let confirm = self.tabs[ix]
-            .repo()
-            .and_then(|tab| crate::terminal::confirm_close(tab.read(cx).ctx(), cx));
-        match confirm {
-            Some(request) => {
-                let weak = cx.weak_entity();
-                crate::dialogs::confirm::open_with(
-                    window,
-                    cx,
-                    request,
-                    Box::new(move |yes, window, cx| {
-                        if yes {
-                            weak.update(cx, |view, cx| view.remove_tab(id, window, cx))
-                                .ok();
-                        }
-                    }),
-                );
-            }
-            None => self.remove_tab(id, window, cx),
+        let questions = self.close_questions(ix, cx);
+        if questions.is_empty() {
+            self.remove_tab(id, window, cx);
+            return;
         }
+        let weak = cx.weak_entity();
+        ask_all(
+            questions,
+            window,
+            cx,
+            Box::new(move |window, cx| {
+                weak.update(cx, |view, cx| view.remove_tab(id, window, cx))
+                    .ok();
+            }),
+        );
     }
 
     fn remove_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
@@ -638,6 +741,7 @@ impl AppView {
         }
         self.toasts.update(cx, |t, cx| t.clear_tab(id, cx));
         if self.tabs.is_empty() {
+            self.unrestored.clear();
             self.push_welcome(window, cx);
             self.active = 0;
         } else if ix < self.active || (ix == self.active && self.active > 0) {
@@ -684,6 +788,7 @@ impl AppView {
                 open.push(path);
             }
         }
+        open.extend(self.unrestored.iter().map(|(path, _)| path.clone()));
         let unchanged = cx
             .try_global::<state::UiStateGlobal>()
             .is_some_and(|s| s.0.tabs_open == open && s.0.selected_tab == selected);
@@ -710,7 +815,17 @@ impl AppView {
     }
 
     fn schedule_bounds_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let placement = crate::app::window_state(window.window_bounds());
+        // Windows parks a minimized window far off screen and reports its restore box as a floating window: saving
+        // that would bring a maximized window back floating.
+        if minimized(window.bounds()) {
+            self._bounds_save = None;
+            return;
+        }
+        let display = window
+            .display(cx)
+            .and_then(|display| display.uuid().ok())
+            .map(|uuid| uuid.to_string());
+        let placement = crate::app::window_state(window.window_bounds(), display);
         self._bounds_save = Some(cx.spawn(async move |_, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
@@ -834,6 +949,37 @@ impl AppView {
             None => div().into_any_element(),
         }
     }
+}
+
+/// Whether a window at `bounds` is minimized (Windows moves a minimized window to -32000, -32000).
+pub(crate) fn minimized(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> bool {
+    bounds.origin.x.as_f32() <= -30_000. && bounds.origin.y.as_f32() <= -30_000.
+}
+
+/// Asks `questions` one after the other and runs `then` once every one was confirmed (at once without questions,
+/// so a caller inside an entity's update runs its own action directly instead).
+fn ask_all(
+    mut questions: Vec<ConfirmRequest>,
+    window: &mut Window,
+    cx: &mut App,
+    then: Box<dyn FnOnce(&mut Window, &mut App)>,
+) {
+    if questions.is_empty() {
+        then(window, cx);
+        return;
+    }
+    let first = questions.remove(0);
+    crate::dialogs::confirm::open_with(
+        window,
+        cx,
+        first,
+        Box::new(move |yes, window, cx| {
+            if yes {
+                // The answered dialog closes in this update: the next one opens after it.
+                window.defer(cx, move |window, cx| ask_all(questions, window, cx, then));
+            }
+        }),
+    );
 }
 
 /// How a slot gets its repository.

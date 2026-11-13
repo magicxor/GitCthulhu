@@ -261,11 +261,13 @@ fn closing_a_layer_by_id_leaves_the_dialog_above_it_open(cx: &mut TestAppContext
     .expect("window");
 }
 
-/// Whether the registry still counts the layer `id` as open.
-fn registered(cx: &mut App, id: LayerId) -> bool {
-    let layers = cx.default_global::<Layers>();
-    layers.prune();
-    layers.stack.iter().any(|layer| layer.id == id)
+/// Whether the registry still counts the layer `id` of `window` as open.
+fn registered(window: &Window, cx: &mut App, id: LayerId) -> bool {
+    let window_id = window.window_handle().window_id();
+    cx.default_global::<Layers>()
+        .stack(window_id)
+        .iter()
+        .any(|layer| layer.id == id)
 }
 
 #[gpui_kit::test]
@@ -279,20 +281,66 @@ fn the_registry_notices_layers_the_kit_closed_itself(cx: &mut TestAppContext) {
         // Escape closes the top layer behind the registry's back.
         window.press("escape", cx);
         window.render_frame(cx);
-        assert!(!registered(cx, top), "Escape closed the top layer");
-        assert!(registered(cx, middle) && registered(cx, bottom));
+        assert!(!registered(window, cx, top), "Escape closed the top layer");
+        assert!(registered(window, cx, middle) && registered(window, cx, bottom));
 
         // Closing the middle layer by id now pops it (it is the top one) and does not touch the bottom layer.
         close_layer(window, cx, middle);
         window.render_frame(cx);
-        assert!(!registered(cx, middle));
+        assert!(!registered(window, cx, middle));
         assert!(
-            bottom_alive.get() && registered(cx, bottom),
+            bottom_alive.get() && registered(window, cx, bottom),
             "the bottom layer is untouched"
         );
         close_layer(window, cx, bottom);
         window.render_frame(cx);
         assert!(!window.has_active_dialog(cx), "no layer is left");
+    })
+    .expect("window");
+}
+
+#[gpui_kit::test]
+fn closing_a_lower_layer_keeps_the_focus_in_the_dialog_above(cx: &mut TestAppContext) {
+    let handle = mount(cx);
+    let state = cx
+        .update_window(handle, |_, window, cx| {
+            window.activate_window();
+            let (below, below_alive) = open_probe_layer(window, cx, "below");
+            let field = cx.new(|cx| OutlinedField::new("above-field", window, cx));
+            let content = field.clone();
+            let above = DialogFrame::open(
+                window,
+                cx,
+                DialogSpec {
+                    width: 300.,
+                    est_height: 100.,
+                },
+                move |_, _| div().child(content.clone()).into_any_element(),
+            );
+            window.render_frame(cx);
+            field.update(cx, |f, cx| f.focus(window, cx));
+            window.render_frame(cx);
+            window.input("ab", cx);
+            close_layer(window, cx, below);
+            (field, above, below_alive)
+        })
+        .expect("window");
+    let (field, above, below_alive) = state;
+    cx.run_until_parked();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!below_alive.get(), "the lower layer is closed");
+        assert!(registered(window, cx, above), "the dialog above stays open");
+        assert!(
+            field.read(cx).border_state(window, cx) == crate::widgets::field::BorderState::Focused,
+            "and its field keeps the keyboard"
+        );
+        window.input("c", cx);
+        assert_eq!(
+            field.read(cx).text(cx).as_ref(),
+            "abc",
+            "typing goes on where it was"
+        );
     })
     .expect("window");
 }

@@ -1091,32 +1091,26 @@ fn windows_chords_copy_paste(cx: &mut TestAppContext) {
         clipboard(cx).is_some_and(|text| text.contains("copy-me")),
         "Ctrl+Insert copies the selection too"
     );
-    cx.update(|cx| {
-        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(echo("pasted-by-chord")))
-    });
-    cx.update_window(handle, |_, window, cx| window.press("ctrl-shift-v", cx))
-        .expect("window");
-    wait_until(
-        cx,
-        "Ctrl+Shift+V pastes the clipboard into the shell",
-        |cx| {
-            screen(cx, &view)
-                .lines()
-                .any(|line| line.trim() == "pasted-by-chord")
-        },
-    );
-    cx.update(|cx| {
-        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(echo(
-            "pasted-by-insert",
-        )))
-    });
-    cx.update_window(handle, |_, window, cx| window.press("shift-insert", cx))
-        .expect("window");
-    wait_until(cx, "Shift+Insert pastes too", |cx| {
-        screen(cx, &view)
-            .lines()
-            .any(|line| line.trim() == "pasted-by-insert")
-    });
+    // The clipboard holds a command without Enter: a shell with line editing (bash 5.1+, zsh) turns bracketed paste
+    // on, and a pasted line is then inserted, not run. So the pasted command must show on the prompt line first;
+    // Enter then runs it, which proves the shell got the text as its input.
+    let paste_and_run = |cx: &mut TestAppContext, key: &str, word: &str| {
+        let command = format!("echo {word}");
+        cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(command.clone())));
+        cx.update_window(handle, |_, window, cx| window.press(key, cx))
+            .expect("window");
+        wait_until(
+            cx,
+            &format!("{key} pastes the clipboard into the shell"),
+            |cx| screen(cx, &view).contains(&command),
+        );
+        send(cx, handle, &view, "\r");
+        wait_until(cx, &format!("the command pasted by {key} runs"), |cx| {
+            screen(cx, &view).lines().any(|line| line.trim() == word)
+        });
+    };
+    paste_and_run(cx, "ctrl-shift-v", "pasted-by-chord");
+    paste_and_run(cx, "shift-insert", "pasted-by-insert");
 }
 
 #[gpui_kit::test]

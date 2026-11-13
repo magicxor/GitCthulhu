@@ -207,7 +207,13 @@ impl RenderOnce for Avatar {
             .map_shape(self.shape);
         match image {
             Some(image) => frame
-                .child(img(image).size_full().object_fit(ObjectFit::Cover))
+                // `overflow_hidden` clips to a rectangle only: the image needs its own corner radii.
+                .child(
+                    img(image)
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .map_shape(self.shape),
+                )
                 .into_any_element(),
             None => frame
                 .flex()

@@ -171,6 +171,39 @@ Features of the `gitcthulhu` crate:
 | `test-support` | gpui-kit test support, tests only |
 | `gpui-fast` | gpui-kit benchmark passthrough only |
 
+## Releasing
+
+`.github/workflows/release.yaml` builds and publishes a release when a version tag is pushed.
+
+1. Set the new version in `crates/gitcthulhu/Cargo.toml` (run `cargo check -p gitcthulhu` so `Cargo.lock` follows) and
+   merge that to `master`. The application shows this version, so the workflow refuses a tag that differs from it.
+2. Tag that commit with the version itself, a [Semantic Versioning 2.0.0](https://semver.org) version without a
+   leading `v`, and push the tag: `git tag 0.2.0 && git push origin 0.2.0`. A version with a pre-release part
+   (`0.2.0-rc.1`) is published as a pre-release.
+
+The workflow builds `cargo build --release --locked -p gitcthulhu` on Windows (x86_64), Linux (x86_64, on the oldest
+Ubuntu runner, so the binaries need glibc 2.35 or newer) and macOS (Apple silicon), and publishes a GitHub release
+with generated notes, a `SHA256SUMS` file and one archive per platform:
+
+| Archive | Contents |
+| --- | --- |
+| `gitcthulhu-<version>-windows-x86_64.zip` | `gitcthulhu.exe` with its helpers `gitcthulhu-askpass.exe` and `gitcthulhu-editor.exe`, which must stay next to it |
+| `gitcthulhu-<version>-linux-x86_64.tar.gz` | the same three binaries |
+| `gitcthulhu-<version>-macos-aarch64.tar.gz` | `GitCthulhu.app`, ad-hoc signed |
+
+The macOS build is optional: when it fails or GitHub has no macOS runner to give, the release is published with
+the Windows and Linux archives only and says so in its notes. To add it later, re-run the macOS job from the
+run's page: `publish` then runs again and uploads the archive to the same release (the sentence in the release
+notes has to be removed by hand).
+
+Nothing is code-signed: Windows SmartScreen warns, and macOS Gatekeeper blocks a downloaded copy until the user
+allows it (System Settings > Privacy & Security, or `xattr -dr com.apple.quarantine GitCthulhu.app`).
+
+The compile-time variables of the section above are taken from the repository's Actions *variables*
+(`GITCTHULHU_GITHUB_CLIENT_ID`, `GITCTHULHU_UPDATE_MANIFEST_URL`); unset, the release has no GitHub device-flow
+sign-in and no update checks. A pull request that changes the workflow file runs it as a dry run: everything is
+built and packaged, the archives are kept as workflow artifacts for a week, and nothing is published.
+
 ## Installer and updater
 
 `but-installer` (with `scripts/install.sh`) and `but-update` have no built-in endpoints. The installer needs
@@ -178,5 +211,6 @@ Features of the `gitcthulhu` crate:
 the bootstrap script additionally `GITCTHULHU_INSTALLER_URL`; release information is only accepted from the
 configured host, downloads also from its subdomains, always over HTTPS. The macOS installer expects a
 `GitCthulhu.app` bundle with `Contents/MacOS/{gitcthulhu,gitcthulhu-askpass,gitcthulhu-editor}`, the Linux one a
-`gitcthulhu` binary (plus `gitcthulhu.sig`) next to the platform download. The release pipeline that publishes these
-does not exist yet, and the bootstrap script downloads the installer without a signature check.
+`gitcthulhu` binary (plus `gitcthulhu.sig`) next to the platform download. The release workflow publishes the
+application archives only: the release information, the signatures and the installer binary these two need are
+not published yet, and the bootstrap script downloads the installer without a signature check.

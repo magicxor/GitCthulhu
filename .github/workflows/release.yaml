@@ -1,0 +1,262 @@
+name: Release
+
+# Pushing a tag that is a Semantic Versioning 2.0.0 version without a leading "v" (1.2.3, 1.2.3-rc.1)
+# builds the application for Windows, Linux and macOS and publishes the archives as a GitHub release.
+# The tag must equal the version in crates/gitcthulhu/Cargo.toml: the application shows that version.
+# The builds are not code-signed. See DEVELOPMENT.md, section "Releasing".
+on:
+  push:
+    tags:
+      # A coarse filter (these are globs, not regular expressions); the `check` job validates exactly.
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+      - '[0-9]+.[0-9]+.[0-9]+\+*'
+  # A dry run for changes to this file: everything is built and packaged, nothing is published.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # A newer push replaces a dry run; a release that started is never cancelled halfway.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version of the release
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/ s/^version *= *"\(.*\)"/\1/p' crates/gitcthulhu/Cargo.toml | head -n 1)"
+          if [ -z "${cargo_version}" ]; then
+            echo "::error::No version found in crates/gitcthulhu/Cargo.toml."
+            exit 1
+          fi
+          if [ "${EVENT_NAME}" = "push" ] && [ "${REF_TYPE}" = "tag" ]; then
+            version="${REF_NAME}"
+            publish=true
+          else
+            version="${cargo_version}"
+            publish=false
+          fi
+          # The regular expression semver.org gives for a valid version.
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          if ! printf '%s\n' "${version}" | grep -Eq "${semver}"; then
+            echo "::error::'${version}' is not a Semantic Versioning 2.0.0 version (no leading 'v')."
+            exit 1
+          fi
+          if [ "${version}" != "${cargo_version}" ]; then
+            echo "::error::The tag '${version}' differs from the version '${cargo_version}' in crates/gitcthulhu/Cargo.toml. Set the version there first: it is the one the application shows."
+            exit 1
+          fi
+          # A version with a pre-release part (before any build metadata) is published as a pre-release.
+          case "${version%%+*}" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          {
+            echo "version=${version}"
+            echo "prerelease=${prerelease}"
+            echo "publish=${publish}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Version ${version} (pre-release: ${prerelease}, publish: ${publish})"
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    # An optional platform does not hold the release back: `publish` goes on without its archive.
+    continue-on-error: ${{ matrix.optional == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          # The oldest Ubuntu runner: the binaries then need only its glibc (2.35) or newer.
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          # Optional: hosted macOS runners are at times not to be had, and the job is then cancelled.
+          - os: macos-latest
+            platform: macos-aarch64
+            optional: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        uses: $/.github/actions/setup-zig
+        # The download picks a community mirror at random; one that hangs must not eat the job's time.
+        timeout-minutes: 10
+      - name: Linux dependencies
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          # The list of the CI workflow: libdbus for the keyring, the rest for the gpui-kit GUI.
+          sudo ./scripts/install-minimal-debian-dependencies.sh
+          sudo timeout 300 apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 libssl-dev libxcb1-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libfreetype-dev
+      - name: Build
+        env:
+          # Compile-time configuration (DEVELOPMENT.md, "Build configuration"); repository variables, not
+          # secrets: both end up readable in the binary. Unset, the build has no GitHub device-flow
+          # sign-in and no update checks.
+          GITCTHULHU_GITHUB_CLIENT_ID: ${{ vars.GITCTHULHU_GITHUB_CLIENT_ID }}
+          GITCTHULHU_UPDATE_MANIFEST_URL: ${{ vars.GITCTHULHU_UPDATE_MANIFEST_URL }}
+          GITCTHULHU_CHANNEL: release
+        run: cargo build --release --locked -p gitcthulhu
+      - name: Package
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          name="gitcthulhu-${VERSION}-${PLATFORM}"
+          fonts="crates/gitcthulhu/assets/fonts"
+          mkdir -p dist
+          case "${RUNNER_OS}" in
+            Windows)
+              # The helpers must lie next to the application: it starts them for Git's prompts and editor.
+              mkdir -p "stage/${name}"
+              cp target/release/gitcthulhu.exe target/release/gitcthulhu-askpass.exe target/release/gitcthulhu-editor.exe "stage/${name}/"
+              cp LICENSE.md README.md "${fonts}/LICENSE-Inter.txt" "${fonts}/LICENSE-GeistMonoNerdFont.txt" "stage/${name}/"
+              (cd stage && 7z a -tzip "../dist/${name}.zip" "${name}")
+              ;;
+            Linux)
+              mkdir -p "stage/${name}"
+              cp target/release/gitcthulhu target/release/gitcthulhu-askpass target/release/gitcthulhu-editor "stage/${name}/"
+              cp LICENSE.md README.md "${fonts}/LICENSE-Inter.txt" "${fonts}/LICENSE-GeistMonoNerdFont.txt" "stage/${name}/"
+              tar -C stage -czf "dist/${name}.tar.gz" "${name}"
+              ;;
+            macOS)
+              # An application bundle at the top of the archive, which is what but-installer unpacks.
+              app="stage/GitCthulhu.app"
+              mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
+              cp target/release/gitcthulhu target/release/gitcthulhu-askpass target/release/gitcthulhu-editor "${app}/Contents/MacOS/"
+              cp crates/gitcthulhu/assets/app-icon/release/icon.icns "${app}/Contents/Resources/icon.icns"
+              cp LICENSE.md "${fonts}/LICENSE-Inter.txt" "${fonts}/LICENSE-GeistMonoNerdFont.txt" "${app}/Contents/Resources/"
+              # Apple wants three plain numbers here; a pre-release part stays in the archive name.
+              plain_version="${VERSION%%[-+]*}"
+              cat > "${app}/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>GitCthulhu</string>
+            <key>CFBundleDisplayName</key><string>GitCthulhu</string>
+            <key>CFBundleIdentifier</key><string>io.github.magicxor.gitcthulhu</string>
+            <key>CFBundleExecutable</key><string>gitcthulhu</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleShortVersionString</key><string>${plain_version}</string>
+            <key>CFBundleVersion</key><string>${plain_version}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+              plutil -lint "${app}/Contents/Info.plist"
+              # An ad-hoc signature (no certificate): Apple silicon runs nothing unsigned. This is not a
+              # Developer ID signature, so Gatekeeper still asks the user to allow a downloaded copy.
+              codesign --force --deep --sign - "${app}"
+              codesign --verify --deep --strict "${app}"
+              COPYFILE_DISABLE=1 tar -C stage -czf "dist/${name}.tar.gz" GitCthulhu.app
+              ;;
+            *)
+              echo "::error::No packaging for ${RUNNER_OS}."
+              exit 1
+              ;;
+          esac
+          ls -l dist
+      - name: Upload the archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitcthulhu-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [check, build]
+    # Also after an optional build failed or was cancelled; the required archives are checked below.
+    if: ${{ !cancelled() && needs.check.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # To create the release and upload its files; the build jobs above run without it.
+      contents: write
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: gitcthulhu-*
+          merge-multiple: true
+      - name: Required archives
+        id: archives
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          ls -l dist
+          for archive in "gitcthulhu-${VERSION}-windows-x86_64.zip" "gitcthulhu-${VERSION}-linux-x86_64.tar.gz"; do
+            if [ ! -s "dist/${archive}" ]; then
+              echo "::error::${archive} was not built; nothing is published."
+              exit 1
+            fi
+          done
+          if [ -s "dist/gitcthulhu-${VERSION}-macos-aarch64.tar.gz" ]; then
+            echo "macos=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::warning::The macOS archive was not built; the release is published without it."
+            echo "macos=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+          MACOS: ${{ steps.archives.outputs.macos }}
+        run: |
+          # Re-running the job after a partial failure replaces the files of the release it made.
+          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release upload "${VERSION}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+            exit 0
+          fi
+          flags=(--verify-tag --title "GitCthulhu ${VERSION}" --generate-notes)
+          if [ "${PRERELEASE}" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          if [ "${MACOS}" != "true" ]; then
+            # Goes above the generated notes.
+            flags+=(--notes "This release has no macOS build: it could not be built when the release was made.")
+          fi
+          gh release create "${VERSION}" dist/* --repo "${GITHUB_REPOSITORY}" "${flags[@]}"

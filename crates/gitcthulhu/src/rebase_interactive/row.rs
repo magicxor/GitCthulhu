@@ -123,6 +123,7 @@ pub(super) fn render(
         // Presses inside the text area must not reach the row: its click would pull the focus out of the input,
         // and its drag would reorder the steps while the user selects text.
         field
+            .px(dp(m::MESSAGE_EDIT_PAD_H))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(

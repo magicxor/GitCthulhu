@@ -432,6 +432,7 @@ impl Render for CommitIdentityDialog {
                     self.save,
                     "Save identity in the .gitconfig file",
                 )
+                .body2()
                 .on_toggle(move |checked, _, cx| {
                     toggle
                         .update(cx, |d, cx| {

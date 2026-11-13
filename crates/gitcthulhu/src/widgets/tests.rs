@@ -262,6 +262,37 @@ fn checkbox_hit_area_is_content_width(cx: &mut TestAppContext) {
     .expect("window");
 }
 
+/// `.body2()` draws the label in 13 sp (Gitnuro's dialogs, 09 §3.1) against the caption's 11 sp: the label widths
+/// (row minus the 28 dp slot) are in that ratio.
+#[gpui_kit::test]
+fn checkbox_label_is_caption_or_body2(cx: &mut TestAppContext) {
+    let handle = probe(cx, (800., 300.), || {
+        observed("parent")
+            .w(dp(400.))
+            .flex()
+            .flex_col()
+            .child(CheckboxText::new(
+                "caption",
+                false,
+                "Save identity in the .gitconfig file",
+            ))
+            .child(
+                CheckboxText::new("body2", false, "Save identity in the .gitconfig file").body2(),
+            )
+            .into_any_element()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let label = |id: &'static str| bounds(window, id).size.width.as_f32() - 28.;
+        let ratio = label("body2") / label("caption");
+        assert!(
+            (ratio - 13. / 11.).abs() < 0.03,
+            "the body2 label is 13/11 of the caption label: {ratio}"
+        );
+    })
+    .expect("window");
+}
+
 #[gpui_kit::test]
 fn outlined_field_border_states(cx: &mut TestAppContext) {
     init_visual(cx);

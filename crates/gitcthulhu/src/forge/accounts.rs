@@ -368,6 +368,12 @@ impl AccountOffer {
         format!("Use {} account {}", self.forge, self.user)
     }
 
+    /// Whether `name` (the user name a password prompt repeats from its URL) is this account's: its login, or the
+    /// user name Git is answered with.
+    pub fn is_named(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case(&self.user) || name.eq_ignore_ascii_case(&self.username)
+    }
+
     /// The answer to a user name prompt (no keychain access).
     pub fn username(&self) -> &str {
         &self.username
@@ -393,8 +399,33 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
+/// Whether the stored token may answer a prompt for `url`: only over HTTPS (Git would send the token as HTTP Basic
+/// auth, in clear over plain `http://`), or to a loopback host (the local test servers).
+fn offer_scheme_ok(url: &str) -> bool {
+    if url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
+        return true;
+    }
+    if !url
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+    {
+        return false;
+    }
+    let Some(host) = host_of(url) else {
+        return false;
+    };
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
 /// The account to offer for an HTTPS username/password prompt: the connected account of the prompt's host, unless
-/// the user turned the offer off or the URL names another user.
+/// the user turned the offer off, the URL is plain `http://` (to a non-loopback host) or names another user.
 pub fn https_offer(req: &CredentialRequest, cx: &App) -> Option<AccountOffer> {
     if !crate::settings::get_or_default(cx).forge_https_answers {
         return None;
@@ -404,6 +435,9 @@ pub fn https_offer(req: &CredentialRequest, cx: &App) -> Option<AccountOffer> {
         PromptKind::HttpsPassword { url, username } => (url, username.as_deref()),
         _ => return None,
     };
+    if !offer_scheme_ok(url) {
+        return None;
+    }
     let services = crate::app::services(cx)?;
     let account = backend_forge::account_for_host(&services, &host_of(url)?)?;
     let username = match account.forge {
@@ -461,4 +495,25 @@ pub fn explain_missing_account(window: &mut Window, cx: &mut App, tab: &TabCtx) 
             }),
         }),
     );
+}
+
+#[cfg(test)]
+mod scheme_tests {
+    use super::offer_scheme_ok;
+
+    #[test]
+    fn the_token_is_only_offered_over_https_or_to_loopback() {
+        assert!(offer_scheme_ok("https://github.com/o/r.git"));
+        assert!(offer_scheme_ok("HTTPS://alice@github.com"));
+        assert!(!offer_scheme_ok("http://github.com"));
+        assert!(!offer_scheme_ok("http://alice@github.com"));
+        assert!(!offer_scheme_ok("HTTP://github.com/o/r"));
+        assert!(!offer_scheme_ok("github.com/o/r"));
+        assert!(!offer_scheme_ok("git://github.com/o/r"));
+        assert!(!offer_scheme_ok("http://localhost.evil.example/x"));
+        assert!(!offer_scheme_ok("http://127.0.0.1.evil.example/x"));
+        assert!(offer_scheme_ok("http://127.0.0.1:8080/acme/widgets.git"));
+        assert!(offer_scheme_ok("http://localhost:3000/x"));
+        assert!(offer_scheme_ok("http://[::1]:3000/x"));
+    }
 }

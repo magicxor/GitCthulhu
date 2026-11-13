@@ -245,6 +245,27 @@ fn status_pane_bounds_in_literal_dp(cx: &mut TestAppContext) {
     .expect("window");
 }
 
+/// 21 §4.6 / 08 §4.6: the label and the first glyph of the message share the 16 dp start inset (the kit pads the
+/// editor by another 10 dp, which the field's inset makes up for): pane x 950 + 16.
+#[gpui_kit::test]
+fn message_text_starts_at_the_label_inset(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(
+        cx,
+        seed(&[], &[("c.txt", ChangeKind::Modified)]),
+        DEFAULT_SIZE,
+    );
+    type_message(cx, handle, &tab, "Subject");
+    render(cx, handle);
+    let commit_box = cx.update(|cx| box_of(&tab, cx));
+    let (text, _caret) = cx.update(|cx| commit_box.read(cx).text_geometry(cx));
+    let text = text.expect("the message text was laid out");
+    assert!(
+        (text.origin.x.as_f32() - (950. + 16.)).abs() <= 0.5,
+        "the message text starts at {:?}, expected x 966",
+        text.origin.x
+    );
+}
+
 /// Merge layout in literal dp: one 8 dp + 36 dp row of two equal buttons with 4 + 4 dp between them.
 #[gpui_kit::test]
 fn merge_button_row_in_literal_dp(cx: &mut TestAppContext) {

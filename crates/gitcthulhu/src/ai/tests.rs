@@ -736,7 +736,7 @@ fn consent_once_for_hosted(cx: &mut TestAppContext) {
     click(cx, handle, "dialog-cancel");
     assert_eq!(ran.get(), 1, "declined");
     assert_eq!(declined.get(), 1, "the caller learns about the refusal");
-    assert!(!cx.update(|cx| settings::get_or_default(cx).ai_hosted_consent));
+    assert!(cx.update(|cx| settings::get_or_default(cx).ai_hosted_consent.is_empty()));
 
     // Closing the confirmation without an answer counts as declining.
     ask(cx);
@@ -753,14 +753,48 @@ fn consent_once_for_hosted(cx: &mut TestAppContext) {
     click(cx, handle, "dialog-primary");
     assert_eq!(ran.get(), 2, "confirmed: runs");
     assert_eq!(declined.get(), 2);
-    assert!(
+    assert_eq!(
         cx.update(|cx| settings::get_or_default(cx).ai_hosted_consent),
-        "remembered"
+        "OpenAI@api.openai.com",
+        "the provider and host are remembered"
     );
 
     ask(cx);
-    assert_eq!(ran.get(), 3, "never asked again");
+    assert_eq!(ran.get(), 3, "not asked again for the same provider");
     assert!(!found(cx, handle, "dialog-primary"));
+
+    // Another provider asks again; so does the same provider at another host; going back to the confirmed one
+    // does not.
+    set_ai(
+        cx,
+        &AiSettings {
+            provider: Some(AiProvider::Anthropic),
+            ..AiSettings::default()
+        },
+    );
+    ask(cx);
+    assert_eq!(ran.get(), 3, "another provider waits for the answer");
+    assert!(found(cx, handle, "dialog-primary"), "and asks");
+    click(cx, handle, "dialog-cancel");
+    assert_eq!(
+        cx.update(|cx| settings::get_or_default(cx).ai_hosted_consent),
+        "OpenAI@api.openai.com",
+        "declining keeps the old confirmation"
+    );
+    let mut custom = AiSettings {
+        provider: Some(AiProvider::OpenAi),
+        ..AiSettings::default()
+    };
+    custom.openai.custom_endpoint = Some("https://llm.example.org/v1".into());
+    set_ai(cx, &custom);
+    ask(cx);
+    assert!(found(cx, handle, "dialog-primary"), "another host asks");
+    click(cx, handle, "dialog-primary");
+    assert_eq!(ran.get(), 4);
+    assert_eq!(
+        cx.update(|cx| settings::get_or_default(cx).ai_hosted_consent),
+        "OpenAI@llm.example.org"
+    );
 }
 
 #[gpui_kit::test]
@@ -1389,5 +1423,74 @@ fn failures_read_as_one_sentence() {
     assert_eq!(
         AiFailure::from(AiError::EmptyAnswer).message(),
         "The AI provider answered with nothing"
+    );
+}
+
+// ── the New branch dialog's "Suggest" link (16 A8/A9) ────────────────────────────────────────────
+
+#[gpui_kit::test]
+fn new_branch_dialog_suggests_a_name_only_into_the_field(cx: &mut TestAppContext) {
+    let fake = FakeProvider::start(reply(&["Feat/Add Search"])).expect("the fake provider starts");
+    let fx = Fixture::new();
+    fx.write("a.txt", "one\n");
+    fx.commit_all("Add search to the log");
+    let (handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
+    let ctx = cx.update(|cx| tab.read(cx).ctx().clone());
+    let open = |cx: &mut TestAppContext| {
+        let ctx = ctx.clone();
+        cx.update_window(handle, |_, window, cx| {
+            crate::dialogs::branch::open_new_branch(
+                window,
+                cx,
+                ctx,
+                crate::backend::StartPoint::Head,
+            )
+        })
+        .expect("window");
+        render(cx, handle);
+    };
+
+    // No provider: no link.
+    start_services(cx);
+    open(cx);
+    assert!(!found(cx, handle, crate::dialogs::branch::ids::SUGGEST));
+    cx.update_window(handle, |_, window, cx| {
+        use gpui_kit::component::WindowExt as _;
+        window.close_dialog(cx)
+    })
+    .expect("window");
+    render(cx, handle);
+
+    // A ready provider: the link shows; clicking it fills the name and creates nothing.
+    set_ai(cx, &lm_studio_at(&fake.endpoint()));
+    reconfigure(cx);
+    open(cx);
+    assert!(found(cx, handle, crate::dialogs::branch::ids::SUGGEST));
+    click(cx, handle, crate::dialogs::branch::ids::SUGGEST);
+    advance(cx, 50);
+    render(cx, handle);
+    assert!(
+        fx.git(&["branch", "--list", "feat/add-search"])
+            .trim()
+            .is_empty(),
+        "the suggestion never creates the branch"
+    );
+    cx.update_window(handle, |_, window, cx| window.press("enter", cx))
+        .expect("window");
+    for _ in 0..50 {
+        advance(cx, 20);
+        if !fx
+            .git(&["branch", "--list", "feat/add-search"])
+            .trim()
+            .is_empty()
+        {
+            break;
+        }
+    }
+    assert!(
+        !fx.git(&["branch", "--list", "feat/add-search"])
+            .trim()
+            .is_empty(),
+        "accepting the dialog creates the suggested name"
     );
 }

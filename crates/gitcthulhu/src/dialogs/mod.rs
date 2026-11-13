@@ -13,9 +13,9 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, Global, IntoElement, ParentElement as _,
-    Render, RenderOnce, SharedString, Styled as _, Subscription, Window, WindowId, div, px,
-    transparent_black,
+    AnyElement, AnyView, App, AppContext as _, Context, Entity, Global, IntoElement,
+    ParentElement as _, Render, RenderOnce, SharedString, Styled as _, Subscription, Window,
+    WindowId, div, px, transparent_black,
 };
 
 use crate::icons::{AppIcon, icon};
@@ -397,7 +397,13 @@ pub struct SingleFieldConfig {
     pub is_valid: Rc<dyn Fn(&str) -> bool>,
     /// Receives the accepted text after the dialog was closed.
     pub on_accept: Rc<dyn Fn(String, &mut Window, &mut App)>,
+    /// An extra view right below the field, made once when the dialog opens from the dialog's field (the New
+    /// branch dialog puts the AI "Suggest" link there); `None` from the factory shows nothing.
+    pub extra: Option<ExtraView>,
 }
+
+/// Makes the [`SingleFieldConfig::extra`] view of a dialog from its field.
+pub type ExtraView = Rc<dyn Fn(&Entity<OutlinedField>, &mut Window, &mut App) -> Option<AnyView>>;
 
 impl SingleFieldConfig {
     /// A configuration whose primary button needs non-blank text.
@@ -416,6 +422,7 @@ impl SingleFieldConfig {
             initial_text: String::new(),
             is_valid: Rc::new(|text| !text.trim().is_empty()),
             on_accept: Rc::new(on_accept),
+            extra: None,
         }
     }
 }
@@ -425,6 +432,7 @@ impl SingleFieldConfig {
 pub struct SingleTextFieldDialog {
     config: SingleFieldConfig,
     field: Entity<OutlinedField>,
+    extra: Option<AnyView>,
     focused: bool,
     _subscription: Subscription,
 }
@@ -453,9 +461,14 @@ impl SingleTextFieldDialog {
                 FieldEvent::Enter => this.accept(window, cx),
             },
         );
+        let extra = config
+            .extra
+            .clone()
+            .and_then(|make| make(&field, window, cx));
         Self {
             config,
             field,
+            extra,
             focused: false,
             _subscription: subscription,
         }
@@ -516,7 +529,8 @@ impl Render for SingleTextFieldDialog {
         .content(
             div()
                 .w(dp(metrics::SINGLE_FIELD_W))
-                .child(self.field.clone()),
+                .child(self.field.clone())
+                .children(self.extra.clone()),
         )
     }
 }

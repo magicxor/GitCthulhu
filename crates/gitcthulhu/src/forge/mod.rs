@@ -5,8 +5,8 @@
 //! (no network), refreshes the review and check caches in the background (one tick per minute, every 5th tick
 //! while the window is inactive, back-off after failures, a stop after errors only the user can fix) and then
 //! computes the `branch -> badge` map from the caches, again in the background. Rows and chips only read that map.
-//! Without a connected account, without a forge, offline, or while the services start, the map stays as it was
-//! (empty at first) and nothing is shown.
+//! Offline, or while the services start, the map stays as it was (empty at first). Once the detected forge has no
+//! reviews or no connected account serves the repository (the account was forgotten), the map is cleared.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +77,9 @@ pub struct ForgeController {
     recompute: ReadSlot,
     /// Another recompute was requested while one was running.
     recompute_dirty: bool,
+    /// A refresh was asked for (by the user, a push or an account change) while one was running: run another when it
+    /// ends, so the answer reflects what happened after the running one started. The poll loop does not set it.
+    refresh_dirty: bool,
     /// The accounts changed: refresh after the next detection even when the facts stay the same (a token was
     /// replaced after the forge rejected the old one).
     refresh_after_detect: bool,
@@ -180,6 +183,7 @@ impl ForgeController {
             refresh: ReadSlot::default(),
             recompute: ReadSlot::default(),
             recompute_dirty: false,
+            refresh_dirty: false,
             refresh_after_detect: false,
             _loop: Some(task),
             _subscriptions: subscriptions,
@@ -251,7 +255,7 @@ impl ForgeController {
     /// The user asked for fresh data (or did something about the accounts): ask the forge now.
     pub fn refresh_now(&mut self, cx: &mut Context<Self>) {
         self.poller.user_acted();
-        self.start_refresh(cx);
+        self.request_refresh(cx);
     }
 
     /// Replaces the badge map (QA scenarios and tests inject data without a forge).
@@ -319,7 +323,7 @@ impl ForgeController {
                     self.start_recompute(cx);
                 }
                 if refresh {
-                    self.start_refresh(cx);
+                    self.request_refresh(cx);
                 }
             }
             Err(failure) => {
@@ -331,21 +335,38 @@ impl ForgeController {
         cx.refresh_windows();
     }
 
+    /// A refresh somebody asked for: when one is running it may predate what they did (a push, a new token), so
+    /// another one follows it instead of the request being dropped.
+    fn request_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refresh.is_running() {
+            tracing::debug!("forge refresh requested while one runs: queued");
+            self.refresh_dirty = true;
+            return;
+        }
+        self.start_refresh(cx);
+    }
+
     fn start_refresh(&mut self, cx: &mut Context<Self>) {
         if self.refresh.is_running() {
             return;
         }
         let Some(handle) = self.handle.clone() else {
+            tracing::debug!("forge refresh skipped: no detected forge yet");
             return;
         };
         if !handle.facts().reviews {
+            tracing::debug!("forge refresh skipped: the forge has no reviews");
             return;
         }
         if !matches!(handle.facts().account, AccountMatch::Matching(_)) {
+            tracing::debug!("forge refresh skipped: no connected account serves the repository");
             self.status = ForgeStatus::NoAccount;
+            self.refresh_dirty = false;
+            self.drop_badges(cx);
             return;
         }
         let Some(repo) = self.ctx.backend.repo().cloned() else {
+            tracing::debug!("forge refresh skipped: no repository");
             return;
         };
         let queries = self.queries(cx);
@@ -392,8 +413,21 @@ impl ForgeController {
         }
         // Whatever the answer, the cache may have changed (or is all there is while offline).
         self.start_recompute(cx);
+        // A request made during this refresh runs now, except after a rate limit (the poller waits for the reset).
+        if std::mem::take(&mut self.refresh_dirty) && self.status != ForgeStatus::RateLimited {
+            self.start_refresh(cx);
+        }
         cx.notify();
         cx.refresh_windows();
+    }
+
+    /// Forgets the badges and what is running for them: without a connected account the cached pull requests of the
+    /// forge must not stay on the branches.
+    fn drop_badges(&mut self, cx: &mut Context<Self>) {
+        self.refresh.cancel();
+        self.recompute.cancel();
+        self.recompute_dirty = false;
+        self.set_badges(BadgeMap::new(), cx);
     }
 
     fn start_recompute(&mut self, cx: &mut Context<Self>) {
@@ -404,7 +438,8 @@ impl ForgeController {
         let Some(handle) = self.handle.clone() else {
             return;
         };
-        if !handle.facts().reviews {
+        if !handle.facts().reviews || !matches!(handle.facts().account, AccountMatch::Matching(_)) {
+            self.drop_badges(cx);
             return;
         }
         let Some(repo) = self.ctx.backend.repo().cloned() else {
@@ -498,7 +533,7 @@ impl ForgeController {
         } = event
         {
             // A pushed branch may have a pull request now (or a new head commit with new checks).
-            self.start_refresh(cx);
+            self.request_refresh(cx);
         }
     }
 

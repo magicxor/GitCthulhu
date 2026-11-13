@@ -307,6 +307,7 @@ impl CloneDialog {
                         self.recursive,
                         "Clone submodules recursively",
                     )
+                    .body2()
                     .on_toggle(move |checked, _, cx| {
                         recursive
                             .update(cx, |d, cx| {

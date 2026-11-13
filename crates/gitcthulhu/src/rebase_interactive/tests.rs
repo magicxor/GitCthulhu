@@ -391,6 +391,42 @@ fn single_line_rows_are_56_high(cx: &mut TestAppContext) {
     .expect("window");
 }
 
+/// Opening the Reword editor keeps the first glyph where the static text was: field border 2 + padding 10 dp (the
+/// kit pads the text area by its own 10 dp, which `MESSAGE_EDIT_PAD_H` makes up for).
+#[gpui_kit::test]
+fn reword_editor_text_starts_where_the_static_text_was(cx: &mut TestAppContext) {
+    let (handle, tab) = show_plan(
+        cx,
+        plan_of(&[RebaseAction::Pick, RebaseAction::Reword, RebaseAction::Pick]),
+    );
+    click(cx, handle, (ids::MESSAGE, 1usize));
+    render(cx, handle);
+    let field_x = cx
+        .update_window(handle, |_, window, _| {
+            bounds(window, (ids::MESSAGE, 1usize)).origin.x.as_f32()
+        })
+        .expect("window");
+    let text = cx.update(|cx| {
+        let view = tab
+            .read(cx)
+            .views
+            .rebase
+            .clone()
+            .expect("the rebase editor is shown");
+        let view = view.read(cx);
+        assert!(view.editing.is_some(), "the click opened the editor");
+        view.editor.read(cx).text_bounds()
+    });
+    let text = text.expect("the edited message was laid out");
+    let expected =
+        field_x + crate::metrics::rebase::MESSAGE_BORDER + crate::metrics::rebase::MESSAGE_PAD_H;
+    assert!(
+        (text.origin.x.as_f32() - expected).abs() <= 0.5,
+        "the edited text starts at {:?}, the static text at {expected}",
+        text.origin.x
+    );
+}
+
 #[gpui_kit::test]
 fn dropdown_offers_the_limited_set_on_the_first_line(cx: &mut TestAppContext) {
     let (handle, _tab) = show_plan(cx, picks(3));

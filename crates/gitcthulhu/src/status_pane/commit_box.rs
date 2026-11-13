@@ -339,6 +339,22 @@ impl CommitBox {
         tabs::restore(&self.input.read(cx).value(), &self.tabs)
     }
 
+    /// The area the field's text is laid out in and the caret of the last prepaint (tests).
+    #[cfg(test)]
+    pub(super) fn text_geometry(
+        &self,
+        cx: &App,
+    ) -> (
+        Option<gpui_kit::Bounds<gpui_kit::Pixels>>,
+        Option<gpui_kit::Bounds<gpui_kit::Pixels>>,
+    ) {
+        let input = self.input.read(cx);
+        (
+            input.text_bounds(),
+            input.prepaint_caret_geometry().map(|g| g.cursor_bounds()),
+        )
+    }
+
     /// The text as the field shows it (tabs expanded).
     #[cfg(test)]
     pub(super) fn shown_text(&self, cx: &App) -> String {
@@ -738,7 +754,6 @@ impl CommitBox {
         let focus = self.input.read(cx).focus_handle(cx);
         let focused = focus.contains_focused(window, cx);
         let floating = focused || !blank;
-        let fill = tokens.background.blend(tokens.on_background.alpha(0.04));
         let indicator = if focused {
             tokens.primary_variant
         } else {
@@ -752,7 +767,7 @@ impl CommitBox {
             .flex_1()
             .min_h_0()
             .w_full()
-            .bg(fill)
+            .bg(tokens.background)
             .rounded_t(dp(metrics::RADIUS))
             .border_b(dp(if focused { 2. } else { 1. }))
             .border_color(indicator)
@@ -778,8 +793,8 @@ impl CommitBox {
             .child(
                 div()
                     .absolute()
-                    .left(dp(m::MESSAGE_PAD_H))
-                    .right(dp(m::MESSAGE_PAD_H))
+                    .left(dp(m::MESSAGE_TEXT_INSET))
+                    .right(dp(m::MESSAGE_TEXT_INSET))
                     .top(dp(m::MESSAGE_TEXT_TOP))
                     .bottom(dp(8.))
                     .text_body1()

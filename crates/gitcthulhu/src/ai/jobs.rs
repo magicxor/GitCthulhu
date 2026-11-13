@@ -154,16 +154,24 @@ pub(crate) fn offline_refusal(cx: &App) -> Option<String> {
     }
 }
 
-/// Whether the one-time privacy confirmation is due:the selected provider is not on this machine and the user
-/// has not confirmed yet.
-pub(crate) fn needs_consent(cx: &App) -> bool {
-    let current = settings::get_or_default(cx);
-    !current.ai_hosted_consent
-        && backend_ai::hosted_target(&backend_ai::parse_settings(&current.ai)).is_some()
+/// The `{provider}@{host}` the selected provider would receive code at, when that is not this machine and the user
+/// has not confirmed exactly that yet; `None` when no confirmation is due.
+fn consent_due(current: &settings::Settings) -> Option<(String, String)> {
+    let settings = backend_ai::parse_settings(&current.ai);
+    let target = backend_ai::hosted_target(&settings)?;
+    (backend_ai::consent_key(&settings).as_deref() != Some(current.ai_hosted_consent.as_str()))
+        .then_some(target)
 }
 
-/// Opens the one-time privacy confirmation if the selected provider is not on this machine and the user has not
-/// confirmed yet, then runs `then` (at once when no confirmation is due, else on the turn after the answer).
+/// Whether the privacy confirmation is due: the selected provider is not on this machine and the user has not
+/// confirmed this provider at this host yet (changing either asks again).
+pub(crate) fn needs_consent(cx: &App) -> bool {
+    consent_due(&settings::get_or_default(cx)).is_some()
+}
+
+/// Opens the privacy confirmation if the selected provider is not on this machine and the user has not confirmed
+/// this provider at this host yet, then runs `then` (at once when no confirmation is due, else on the turn after the
+/// answer).
 /// Declining, or closing the confirmation without an answer, runs `declined` instead.
 pub(crate) fn with_consent(
     window: &mut Window,
@@ -172,17 +180,18 @@ pub(crate) fn with_consent(
     declined: impl FnOnce(&mut Window, &mut App) + 'static,
 ) {
     let current = settings::get_or_default(cx);
-    let target = backend_ai::hosted_target(&backend_ai::parse_settings(&current.ai));
-    let Some((provider, host)) = target.filter(|_| !current.ai_hosted_consent) else {
+    let Some((provider, host)) = consent_due(&current) else {
         then(window, cx);
         return;
     };
+    let confirmed = backend_ai::consent_key(&backend_ai::parse_settings(&current.ai));
     let mut request = backend::prompt::ConfirmRequest::new(
         format!("Send your changes to {provider}?"),
         format!(
             "AI features send your changes (file names and changed lines of the staged changes, within a size \
              budget), commit messages and the text you already wrote to {provider}. That text leaves this computer \
-             for {host}. Continue only if you may share this code with that service. You are asked only once."
+             for {host}. Continue only if you may share this code with that service. You are asked again if you change \
+             the provider or its host."
         ),
     );
     request.confirm_label = "Send".into();
@@ -195,7 +204,9 @@ pub(crate) fn with_consent(
         request,
         Box::new(move |yes, _, cx| {
             if yes {
-                settings::update(cx, |s| s.ai_hosted_consent = true);
+                settings::update(cx, |s| {
+                    s.ai_hosted_consent = confirmed.clone().unwrap_or_default();
+                });
             }
             let _ = answer.send(yes);
         }),

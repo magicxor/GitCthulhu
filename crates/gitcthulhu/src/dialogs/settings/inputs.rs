@@ -103,11 +103,11 @@ impl NumberField {
             .take(MAX_DIGITS)
             .collect();
         if digits != text.as_ref() {
-            // Drop the rejected input; the edit re-enters here with the clean text.
+            // Drop the rejected input. `set_value` raises no change event, so the clean value is reported here (a
+            // paste of ` 3128` would otherwise show `3128` but never store it).
             self.input
-                .update(cx, |input, cx| input.set_value(digits, window, cx));
+                .update(cx, |input, cx| input.set_value(digits.clone(), window, cx));
             self.flash_error(cx);
-            return;
         }
         cx.emit(NumberEvent::Changed(digits.parse().ok()));
     }

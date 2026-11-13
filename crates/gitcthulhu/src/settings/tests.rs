@@ -108,6 +108,37 @@ fn settings_scale_is_clamped_on_load() {
     );
 }
 
+/// The old bool consent becomes the `{provider}@{host}` selected at load time; a text is kept as it is.
+#[cfg(feature = "services")]
+#[test]
+fn the_old_ai_consent_bool_becomes_the_selected_provider() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("settings.json");
+    std::fs::write(
+        &path,
+        br#"{"ai": {"provider": "anthropic"}, "ai_hosted_consent": true}"#,
+    )
+    .expect("write");
+    let read = Settings::load_from(&path).into_value();
+    assert_eq!(read.ai_hosted_consent, "Anthropic@api.anthropic.com");
+    // `true` without a hosted provider confirms nothing; `false` and a missing key are empty.
+    std::fs::write(&path, br#"{"ai_hosted_consent": true}"#).expect("write");
+    assert_eq!(
+        Settings::load_from(&path).into_value().ai_hosted_consent,
+        ""
+    );
+    std::fs::write(&path, br#"{"ai_hosted_consent": false}"#).expect("write");
+    assert_eq!(
+        Settings::load_from(&path).into_value().ai_hosted_consent,
+        ""
+    );
+    std::fs::write(&path, br#"{"ai_hosted_consent": "OpenAI@api.openai.com"}"#).expect("write");
+    assert_eq!(
+        Settings::load_from(&path).into_value().ai_hosted_consent,
+        "OpenAI@api.openai.com"
+    );
+}
+
 #[test]
 fn corrupt_settings_renamed_bak() {
     let dir = tempfile::tempdir().expect("temp dir");

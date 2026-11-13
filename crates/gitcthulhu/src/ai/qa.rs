@@ -224,7 +224,7 @@ fn use_fake_provider(cx: &mut App, args: &Args) -> StepResult {
     let value = backend_ai::settings_value(&ai);
     settings::update(cx, |s| {
         s.ai = value;
-        s.ai_hosted_consent = false;
+        s.ai_hosted_consent = String::new();
     });
     ensure_services(cx);
     hub::keys_changed(cx);
@@ -242,7 +242,7 @@ fn use_hosted_provider(cx: &mut App) -> StepResult {
     let value = backend_ai::settings_value(&ai);
     settings::update(cx, |s| {
         s.ai = value;
-        s.ai_hosted_consent = false;
+        s.ai_hosted_consent = String::new();
     });
     ensure_services(cx);
     hub::keys_changed(cx);
@@ -259,7 +259,7 @@ fn reset(cx: &mut App) -> StepResult {
     }
     settings::update(cx, |s| {
         s.ai = serde_json::Value::Null;
-        s.ai_hosted_consent = false;
+        s.ai_hosted_consent = String::new();
     });
     hub::keys_changed(cx);
     Ok(String::new())

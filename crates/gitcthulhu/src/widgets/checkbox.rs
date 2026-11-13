@@ -1,4 +1,4 @@
-//! `CheckboxText` (Gitnuro 07 §10.5, 09 §0.3): a Material checkbox with a caption.
+//! `CheckboxText` (Gitnuro 07 §10.5, 09 §0.3): a Material checkbox with a caption (or a body2 label).
 //!
 //! The Material checkbox is 12 dp with 8 dp padding (a 28 dp slot) but draws a 20 dp box that overflows the slot.
 //! The whole row is the click target, and the row is exactly as wide as its content (it never stretches to the
@@ -13,7 +13,7 @@ use gpui_kit::{
 use std::rc::Rc;
 
 use crate::metrics::{self, dp};
-use crate::theme::{ActiveTokens as _, TextStyleExt as _};
+use crate::theme::{ActiveTokens as _, TextKind, TextStyleExt as _};
 
 /// Checkbox box size drawn by Material (the slot is 28 dp including padding).
 const BOX: f32 = 20.;
@@ -25,6 +25,7 @@ pub struct CheckboxText {
     checked: bool,
     label: SharedString,
     enabled: bool,
+    text: TextKind,
     on_toggle: Option<Rc<dyn Fn(bool, &mut Window, &mut App)>>,
 }
 
@@ -36,8 +37,16 @@ impl CheckboxText {
             checked,
             label: label.into(),
             enabled: true,
+            text: TextKind::Caption,
             on_toggle: None,
         }
+    }
+
+    /// Draws the label in body2 (13 sp) like Gitnuro's dialogs that put a raw checkbox next to a `body2` text
+    /// (09 §3.1, §3.11, §3.12); the default is the caption of a `CheckboxText`.
+    pub fn body2(mut self) -> Self {
+        self.text = TextKind::Body2;
+        self
     }
 
     /// Enables or disables the checkbox.
@@ -108,7 +117,7 @@ impl RenderOnce for CheckboxText {
                 )
                 .child(
                     div()
-                        .text_caption()
+                        .text_kind(self.text)
                         .text_color(tokens.on_background.opacity(alpha))
                         .whitespace_nowrap()
                         .child(self.label),

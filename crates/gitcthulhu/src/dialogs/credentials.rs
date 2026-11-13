@@ -201,6 +201,18 @@ pub fn open(
     let texts = prompt_texts(&request);
     // A connected forge account of the prompt's host can answer instead of the user (20 §6.3, X4).
     let offer = crate::forge::accounts::https_offer(&request, cx);
+    // The user name of the prompt's URL is the account (it answered the user name prompt before): the token is
+    // the likely answer to the password too, so the box starts checked.
+    let use_account = match (&offer, &request.kind) {
+        (
+            Some(offer),
+            PromptKind::HttpsPassword {
+                username: Some(named),
+                ..
+            },
+        ) => offer.is_named(named),
+        _ => false,
+    };
     let field = texts.hint.map(|hint| {
         cx.new(|cx| {
             let field = if texts.masked {
@@ -237,7 +249,7 @@ pub fn open(
             reply: Rc::new(RefCell::new(Some(reply))),
             field,
             offer,
-            use_account: false,
+            use_account,
             typed: false,
             shown: false,
             focus: FocusOnce::default(),

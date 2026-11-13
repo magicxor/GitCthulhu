@@ -22,6 +22,9 @@ pub const MESSAGE_BORDER: f32 = 2.;
 /// Horizontal text padding inside the message field's border (the border itself is drawn over the 12 dp content
 /// padding of the outlined field, 07 §10.1).
 pub const MESSAGE_PAD_H: f32 = 10.;
+/// Horizontal padding of the field while the Reword editor is open: the kit pads a multi-line `Textarea` by
+/// `Size::Medium.input_px()` (10 dp) itself, so the first glyph stays where the static text was.
+pub const MESSAGE_EDIT_PAD_H: f32 = MESSAGE_PAD_H - 10.;
 /// Vertical text padding inside the message field's border (Gitnuro's 8 dp with the 2 dp border drawn over it,
 /// 07 §10.1); single lines are centred in the 40 dp minimum height.
 pub const MESSAGE_PAD_V: f32 = 6.;

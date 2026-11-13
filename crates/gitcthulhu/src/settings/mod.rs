@@ -147,7 +147,10 @@ pub struct Settings {
     /// Opaque AI provider settings; `null` means no provider.
     pub ai: serde_json::Value,
     pub ai_commit_style: AiCommitStyle,
-    pub ai_hosted_consent: bool,
+    /// The `{provider}@{host}` the user confirmed sending code to (empty: none); a different provider or host asks
+    /// again. Files of earlier versions hold a bool: `true` is read as the provider selected at load time.
+    #[serde(deserialize_with = "consent_from_bool_or_text")]
+    pub ai_hosted_consent: String,
     pub forge_https_answers: bool,
     /// Check for updates every 24 hours.
     pub update_check: bool,
@@ -194,12 +197,31 @@ impl Default for Settings {
             terminal_font_size: 13.0,
             ai: serde_json::Value::Null,
             ai_commit_style: AiCommitStyle::Conventional,
-            ai_hosted_consent: false,
+            ai_hosted_consent: String::new(),
             forge_https_answers: true,
             update_check: true,
             update_channel: UpdateChannel::Release,
         }
     }
+}
+
+/// What a `true` of the old boolean consent is read as until [`Settings::load_from`] knows the provider.
+const LEGACY_CONSENT: &str = "*";
+
+fn consent_from_bool_or_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrText {
+        Bool(bool),
+        Text(String),
+    }
+    Ok(match BoolOrText::deserialize(deserializer)? {
+        BoolOrText::Bool(true) => LEGACY_CONSENT.to_owned(),
+        BoolOrText::Bool(false) => String::new(),
+        BoolOrText::Text(text) => text,
+    })
 }
 
 /// The scale factors offered in Appearance.
@@ -219,6 +241,17 @@ impl Settings {
     }
 
     fn sanitized(mut self) -> Self {
+        if self.ai_hosted_consent == LEGACY_CONSENT {
+            // The old bool confirmed the provider that was selected then, which is the one selected now.
+            #[cfg(feature = "services")]
+            {
+                self.ai_hosted_consent =
+                    crate::backend::ai::consent_key(&crate::backend::ai::parse_settings(&self.ai))
+                        .unwrap_or_default();
+            }
+            #[cfg(not(feature = "services"))]
+            self.ai_hosted_consent.clear();
+        }
         let (lo, hi) = (SCALE_CHOICES[0], SCALE_CHOICES[SCALE_CHOICES.len() - 1]);
         self.scale = if self.scale.is_finite() {
             self.scale.clamp(lo, hi)

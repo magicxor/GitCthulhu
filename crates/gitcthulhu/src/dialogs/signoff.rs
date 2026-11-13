@@ -85,6 +85,7 @@ impl Render for SignoffDialog {
                         self.enabled,
                         "Enable sign-off for this repository",
                     )
+                    .body2()
                     .on_toggle(move |checked, _, cx| {
                         toggle
                             .update(cx, |d, cx| {

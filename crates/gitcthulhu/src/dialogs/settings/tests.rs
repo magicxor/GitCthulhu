@@ -972,6 +972,41 @@ fn number_fields_take_digits_only_and_flash_on_invalid_input(cx: &mut TestAppCon
     assert!(cx.update(|cx| days.read(cx).is_flashing()), "and flashes");
 }
 
+/// A paste with a non-digit is cleaned on screen and the clean value is stored (`set_value` emits no change event).
+#[gpui_kit::test]
+fn a_pasted_number_with_junk_is_cleaned_and_stored(cx: &mut TestAppContext) {
+    let (handle, _) = open_settings(cx, DEFAULT_SIZE, Some(SettingsPage::Proxy));
+    let v = view(cx);
+    let port = cx.update(|cx| v.read(cx).fields.proxy_port.clone());
+    click(cx, handle, ids::switch("use-proxy"));
+    cx.update_window(handle, |_, window, cx| {
+        port.update(cx, |f, cx| f.focus(window, cx));
+        window.render_frame(cx);
+        window.press("ctrl-a", cx);
+    })
+    .expect("window");
+    cx.update(|cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            " 3128
+"
+            .into(),
+        ))
+    });
+    cx.update_window(handle, |_, window, cx| window.press("ctrl-v", cx))
+        .expect("window");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| port.read(cx).text(cx).to_string()), "3128");
+    assert_eq!(
+        settings_of(cx).proxy_port,
+        3128,
+        "the clean value is stored"
+    );
+    assert!(
+        cx.update(|cx| port.read(cx).is_flashing()),
+        "and it flashes"
+    );
+}
+
 #[gpui_kit::test]
 fn the_proxy_port_is_limited_to_65535(cx: &mut TestAppContext) {
     let (handle, _) = open_settings(cx, DEFAULT_SIZE, Some(SettingsPage::Proxy));

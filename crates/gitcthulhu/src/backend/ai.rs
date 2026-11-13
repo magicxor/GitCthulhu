@@ -168,6 +168,11 @@ mod service {
         }
     }
 
+    /// The `{provider}@{host}` key of [`hosted_target`], what the privacy confirmation is remembered for.
+    pub fn consent_key(settings: &AiSettings) -> Option<String> {
+        hosted_target(settings).map(|(provider, host)| format!("{provider}@{host}"))
+    }
+
     /// Where the active provider sends the text, for the privacy confirmation: `Some((provider name, host))` when
     /// the provider is not on this machine (the hosted APIs, and local-server providers pointed at another host).
     pub fn hosted_target(settings: &AiSettings) -> Option<(String, String)> {

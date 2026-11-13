@@ -36,6 +36,10 @@ pub const STATE_ROW_PAD_TOP: f32 = 8.; // 08 §4.6
 pub const STATE_BUTTON_PAD: f32 = 4.; // 08 §4.6
 /// Start padding of the message field's label and text (21 §4.6).
 pub const MESSAGE_PAD_H: f32 = 16.; // 21 §4.6
+/// Horizontal inset of the message `Textarea` inside the field: the kit pads a multi-line editor by
+/// `Size::Medium.input_px()` (10 dp) even without its appearance, so the first glyph lands on the label's
+/// `MESSAGE_PAD_H` (21 §4.6, 08 §4.6).
+pub const MESSAGE_TEXT_INSET: f32 = MESSAGE_PAD_H - 10.;
 /// Y offset of the label while it floats above the text (21 §4.6).
 pub const MESSAGE_LABEL_TOP_FLOATING: f32 = 8.; // 21 §4.6
 /// Y offset of the label while the field is empty and unfocused (21 §4.6).

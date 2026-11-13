@@ -28,6 +28,10 @@ pub mod ids {
     pub const UPSTREAM_REMOTE: &str = "upstream-remote";
     /// The branch dropdown.
     pub const UPSTREAM_BRANCH: &str = "upstream-branch";
+    /// The AI "Suggest" link of the New branch dialog.
+    pub const SUGGEST: &str = "branch-suggest";
+    /// The reason a suggestion failed.
+    pub const SUGGEST_ERROR: &str = "branch-suggest-error";
 }
 
 /// The short name of `full` (`refs/heads/feature/x` -> `feature/x`).
@@ -51,13 +55,183 @@ pub fn new_branch_config(
 
 /// Opens the New branch dialog for a branch starting at `start`. Accepting creates the branch and checks it out.
 pub fn open_new_branch(window: &mut Window, cx: &mut App, tab: TabCtx, start: StartPoint) {
-    let config = new_branch_config(move |name, window, cx| {
-        let start = start.clone();
-        tab.with_tab(window, cx, move |t, window, cx| {
+    let (create_tab, create_start) = (tab.clone(), start.clone());
+    #[cfg_attr(not(feature = "services"), allow(unused_mut))]
+    let mut config = new_branch_config(move |name, window, cx| {
+        let start = create_start.clone();
+        create_tab.with_tab(window, cx, move |t, window, cx| {
             t.create_branch(name, start, true, window, cx);
         });
     });
+    #[cfg(feature = "services")]
+    {
+        config.extra = Some(Rc::new(move |field, _, cx| {
+            // Only while an AI provider is ready (16 A8/A9); the link fills the name field and never creates.
+            crate::ai::is_ready(cx).then(|| {
+                cx.new(|_| suggest::SuggestLink::new(field.clone(), tab.clone(), start.clone()))
+                    .into()
+            })
+        }));
+    }
+    #[cfg(not(feature = "services"))]
+    let _ = (tab, start);
     SingleTextFieldDialog::open(window, cx, config);
+}
+
+/// The AI "Suggest" link of the New branch dialog (16 A8/A9).
+#[cfg(feature = "services")]
+mod suggest {
+    use gpui_kit::{
+        App, Context, Entity, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+        Window, div,
+    };
+
+    use super::ids;
+    use crate::ai::{AiHandle, BranchNameSource};
+    use crate::backend::ai::AiFailure;
+    use crate::backend::{HeadState, StartPoint};
+    use crate::dialogs::register::common;
+    use crate::metrics::dp;
+    use crate::tab::TabCtx;
+    use crate::theme::ActiveTokens as _;
+    use crate::widgets::field::OutlinedField;
+    use crate::widgets::{TextLink, observed};
+
+    /// The link below the name field: asks the AI provider for a name and puts it into the field.
+    pub(super) struct SuggestLink {
+        field: Entity<OutlinedField>,
+        tab: TabCtx,
+        start: StartPoint,
+        /// The running request; dropping the dialog drops it and cancels the request.
+        running: Option<AiHandle>,
+        error: Option<SharedString>,
+    }
+
+    impl SuggestLink {
+        pub(super) fn new(field: Entity<OutlinedField>, tab: TabCtx, start: StartPoint) -> Self {
+            Self {
+                field,
+                tab,
+                start,
+                running: None,
+                error: None,
+            }
+        }
+
+        /// What the name is suggested from: the staged changes when branching from HEAD with some, else the
+        /// summary of the commit the branch starts at.
+        fn source(&self, cx: &App) -> Option<BranchNameSource> {
+            let model = self.tab.model.read(cx);
+            let staged = model
+                .status
+                .value
+                .as_ref()
+                .is_some_and(|status| !status.staged.is_empty());
+            if staged
+                && matches!(self.start, StartPoint::Head)
+                && let Some(repo) = self.tab.backend.repo()
+            {
+                return Some(BranchNameSource::Staged(repo.clone()));
+            }
+            let id = match &self.start {
+                StartPoint::Commit(id) => *id,
+                // Also on a detached HEAD (no local branch is the head then).
+                StartPoint::Head => match &model.refs.value.as_ref()?.head {
+                    HeadState::Branch { target, .. } | HeadState::Detached { target } => *target,
+                    HeadState::Unborn { .. } => return None,
+                },
+                StartPoint::Ref(name) => {
+                    let refs = model.refs.value.as_ref()?;
+                    refs.local
+                        .iter()
+                        .find(|branch| &branch.full == name)
+                        .map(|branch| branch.target)
+                        .or_else(|| {
+                            refs.remotes
+                                .iter()
+                                .flat_map(|remote| &remote.branches)
+                                .find(|branch| &branch.full == name)
+                                .map(|branch| branch.target)
+                        })?
+                }
+            };
+            let summary = model
+                .log
+                .value
+                .as_ref()?
+                .rows
+                .iter()
+                .filter_map(|row| row.commit.as_ref())
+                .find(|commit| commit.id == id)?
+                .summary
+                .to_string();
+            Some(BranchNameSource::CommitMessage(summary))
+        }
+
+        fn suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if self.running.is_some() {
+                return;
+            }
+            self.error = None;
+            let Some(source) = self.source(cx) else {
+                self.error = Some("There is nothing to suggest a name from".into());
+                cx.notify();
+                return;
+            };
+            let this = cx.weak_entity();
+            let handle =
+                crate::ai::suggest_branch_name(window, cx, source, move |result, window, cx| {
+                    this.update(cx, |link, cx| {
+                        link.running = None;
+                        match result {
+                            Ok(name) if !name.trim().is_empty() => link
+                                .field
+                                .update(cx, |field, cx| field.set_text(name.trim(), window, cx)),
+                            Ok(_) => link.error = Some("The AI provider suggested no name".into()),
+                            Err(AiFailure::Cancelled) => {}
+                            Err(failure) => link.error = Some(failure.message().into()),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                });
+            self.running = Some(handle);
+            cx.notify();
+        }
+    }
+
+    impl Drop for SuggestLink {
+        fn drop(&mut self) {
+            if let Some(handle) = &self.running {
+                handle.cancel();
+            }
+        }
+    }
+
+    impl Render for SuggestLink {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let tokens = *cx.tokens();
+            let this = cx.weak_entity();
+            let label = if self.running.is_some() {
+                "Suggesting…"
+            } else {
+                "Suggest a name"
+            };
+            div()
+                .flex()
+                .flex_col()
+                .child(div().pt(dp(8.)).flex().flex_row().justify_end().child(
+                    TextLink::new(ids::SUGGEST, label).on_click(move |window, cx| {
+                        this.update(cx, |link, cx| link.suggest(window, cx)).ok();
+                    }),
+                ))
+                .children(self.error.clone().map(|error| {
+                    observed(ids::SUGGEST_ERROR)
+                        .pt(dp(8.))
+                        .child(common::error_banner(error, &tokens))
+                }))
+        }
+    }
 }
 
 /// The configuration of the Rename branch dialog for `branch`; `on_accept` receives the trimmed new name (only

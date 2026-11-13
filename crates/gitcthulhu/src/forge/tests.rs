@@ -1032,6 +1032,43 @@ fn an_account_change_after_a_rejected_token_refreshes_at_once(cx: &mut TestAppCo
 }
 
 #[gpui_kit::test]
+fn a_refresh_requested_during_a_refresh_runs_after_it(cx: &mut TestAppContext) {
+    let w = world(cx, &[("feature", false, passing())], true);
+    let before = cx.update(|cx| w.controller.read(cx).refresh_count());
+    // Two requests back to back (the second arrives while the first runs): both run.
+    cx.update(|cx| {
+        w.controller.update(cx, |c, cx| {
+            c.refresh_now(cx);
+            c.refresh_now(cx);
+        })
+    });
+    settle(cx, &w.controller);
+    let after = cx.update(|cx| w.controller.read(cx).refresh_count());
+    assert_eq!(after - before, 2, "the second request is not dropped");
+}
+
+#[gpui_kit::test]
+fn forgetting_the_account_removes_the_cached_badges(cx: &mut TestAppContext) {
+    let w = world(cx, &[("feature", false, passing())], true);
+    assert!(badge_of(cx, &w, "feature").is_some(), "signed in: a badge");
+    let services = cx.update(|cx| crate::app::services(cx)).expect("services");
+    for account in crate::backend::forge::accounts(&services).expect("the accounts") {
+        crate::backend::forge::forget_account(&services, &account.id).expect("forget");
+    }
+    cx.update(|cx| {
+        accounts::installed(cx)
+            .expect("the accounts model")
+            .update(cx, |model, cx| model.added(cx));
+    });
+    settle(cx, &w.controller);
+    assert!(
+        cx.update(|cx| w.controller.read(cx).badges().is_empty()),
+        "no account, no badges"
+    );
+    assert!(badge_of(cx, &w, "feature").is_none());
+}
+
+#[gpui_kit::test]
 fn inactive_window_polls_every_fifth_tick(cx: &mut TestAppContext) {
     let w = world(cx, &[("feature", false, passing())], true);
     let active = cx.update(|cx| cx.global::<ActivityOverride>().0.clone());
@@ -1722,6 +1759,40 @@ fn https_prompt_offers_account(cx: &mut TestAppContext) {
             );
         }
         _ => panic!("the dialog should have answered with the account's token"),
+    }
+    // A password prompt whose URL names the account's login starts with the box checked; one without a user
+    // name does not. Plain Enter-through is enough to answer with the token.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let named = request(PromptKind::HttpsPassword {
+        url: url.clone(),
+        username: Some("octocat".into()),
+    });
+    cx.update_window(w.handle, |_, window, cx| {
+        credentials::open(window, cx, named, tx)
+    })
+    .expect("window");
+    cx.run_until_parked();
+    cx.update_window(w.handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(ids::CREDENTIAL_USE_ACCOUNT).is_some(),
+            "the offer is a checkbox"
+        );
+        window.click("dialog-primary", cx);
+    })
+    .expect("window");
+    for _ in 0..5 {
+        cx.run_until_parked();
+    }
+    match rx.try_recv() {
+        Ok(crate::backend::CredentialResponse::Answer(token)) => {
+            assert_eq!(
+                token.expose(),
+                "secret-token",
+                "pre-checked: the token answers"
+            );
+        }
+        _ => panic!("the pre-checked box should answer with the account's token"),
     }
     // The user name prompt: the account's login.
     let (tx, rx) = std::sync::mpsc::sync_channel(1);

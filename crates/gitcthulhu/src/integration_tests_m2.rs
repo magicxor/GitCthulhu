@@ -855,7 +855,11 @@ mod services {
         wait_until(cx, "the message from the confirmed provider", |cx| {
             !generating(cx, &tab) && message(cx, &tab).starts_with("feat: add the b file")
         });
-        assert!(cx.update(|cx| crate::settings::get_or_default(cx).ai_hosted_consent));
+        assert!(!cx.update(|cx| {
+            crate::settings::get_or_default(cx)
+                .ai_hosted_consent
+                .is_empty()
+        }));
 
         // Commit the generated message and undo the commit from the toolbar.
         click(cx, handle, crate::status_pane::commit_box::ids::PRIMARY);
@@ -1485,7 +1489,7 @@ fn milestone_1_settings_file_loads_with_milestone_2_defaults(cx: &mut TestAppCon
     assert_eq!(s.terminal_font_size, d.terminal_font_size);
     assert!(s.ai.is_null(), "no AI provider");
     assert_eq!(s.ai_commit_style, AiCommitStyle::Conventional);
-    assert!(!s.ai_hosted_consent, "consent is never assumed");
+    assert!(s.ai_hosted_consent.is_empty(), "consent is never assumed");
     assert!(s.forge_https_answers);
     assert!(s.update_check);
     assert_eq!(s.update_channel, UpdateChannel::Release);

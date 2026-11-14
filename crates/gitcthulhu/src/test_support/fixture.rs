@@ -2,7 +2,7 @@
 //! developer's configuration (`GIT_CONFIG_GLOBAL` / `GIT_CONFIG_NOSYSTEM`, own HOME), like the backend's tests (20 §10).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use gitcthulhu_git::repo::TestIsolation;
@@ -109,6 +109,32 @@ impl Fixture {
 
     /// Runs `git <args>` in the worktree and returns its stdout. Panics with stderr when git fails.
     pub fn git(&self, args: &[&str]) -> String {
+        let output = self.command(args).output().expect("git can be started");
+        Self::stdout(args, &output)
+    }
+
+    /// [`Fixture::git`] with `input` on git's standard input (e.g. a `git fast-import` stream, which builds a long
+    /// history in one process instead of one `git commit` per commit).
+    pub fn git_stdin(&self, args: &[&str], input: &str) -> String {
+        use std::io::Write as _;
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git can be started");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .expect("git reads its input");
+        let output = child.wait_with_output().expect("git finishes");
+        Self::stdout(args, &output)
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.repo)
             .args(args)
@@ -120,7 +146,10 @@ impl Fixture {
         for var in SCRUBBED_ENV {
             cmd.env_remove(var);
         }
-        let output = cmd.output().expect("git can be started");
+        cmd
+    }
+
+    fn stdout(args: &[&str], output: &Output) -> String {
         assert!(
             output.status.success(),
             "git {} failed: {}",

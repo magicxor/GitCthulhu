@@ -761,15 +761,22 @@ fn fixture_with_cut_log(
     generation: u64,
 ) -> (Fixture, AnyWindowHandle, Entity<RepoTab>) {
     let fx = Fixture::new();
+    // One `git fast-import` instead of `n` processes (each `git commit` costs tens of ms on Windows).
+    let mut stream = String::new();
     for i in 0..n {
-        fx.git(&[
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            &format!("Commit {i}"),
-        ]);
+        let message = format!("Commit {i}");
+        stream.push_str(&format!(
+            "commit refs/heads/main
+committer Test User <test@example.com> {} +0000
+data {}
+{message}
+
+",
+            1_700_000_000 + i,
+            message.len()
+        ));
     }
+    fx.git_stdin(&["fast-import", "--quiet"], &stream);
     let (handle, _app, tab) = mount_fixture(cx, &fx, DEFAULT_SIZE);
     let model = model_of(&tab, cx);
     let repo = cx.update(|cx| {
@@ -1481,6 +1488,92 @@ fn arrow_keys_after_a_chip_click_stop_at_the_first_commit(cx: &mut TestAppContex
         commit_selection(oid(10)),
         "the hidden uncommitted row is not selectable"
     );
+}
+
+/// The commit of layout row `ix` of the current log snapshot.
+fn commit_at(tab: &Entity<RepoTab>, ix: usize, cx: &mut TestAppContext) -> ObjectId {
+    let model = model_of(tab, cx);
+    cx.update(|cx| {
+        let log = model.read(cx).log.value.clone().expect("log");
+        log.rows
+            .get(ix)
+            .and_then(|r| r.commit.as_ref())
+            .expect("a commit row")
+            .id
+    })
+}
+
+/// Whether layout row `ix` lies entirely inside the list's viewport.
+fn row_visible(cx: &mut TestAppContext, handle: AnyWindowHandle, ix: usize) -> bool {
+    frame(cx, handle, |window, _| {
+        let area = bounds(window, ids::LIST_AREA);
+        window.try_find((ids::LOG_ROW, ix)).is_some_and(|_| {
+            let row = bounds(window, (ids::LOG_ROW, ix));
+            row.top() >= area.top() && row.bottom() <= area.bottom()
+        })
+    })
+}
+
+/// Arrows past the viewport's edge scroll the selected row into view, in both directions.
+#[gpui_kit::test]
+fn arrow_keys_keep_the_selection_visible(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::linear(200), DEFAULT_SIZE);
+    let ui = ui_of(&tab, cx);
+    let view = view_of(&tab, cx);
+    frame(cx, handle, |window, cx| {
+        window.click((ids::MESSAGE, 1usize), cx)
+    });
+    assert!(
+        !row_visible(cx, handle, 40),
+        "row 40 starts below the viewport"
+    );
+    for _ in 0..39 {
+        press(cx, handle, "down");
+    }
+    assert_eq!(
+        cx.update(|cx| ui.read(cx).selection.clone()),
+        commit_selection(commit_at(&tab, 40, cx))
+    );
+    assert!(
+        row_visible(cx, handle, 40),
+        "the selected row scrolled into view"
+    );
+    assert!(cx.update(|cx| view.read(cx).first_visible()) > 0);
+    for _ in 0..39 {
+        press(cx, handle, "up");
+    }
+    assert!(
+        row_visible(cx, handle, 1),
+        "back up: the first row is visible"
+    );
+    assert_eq!(cx.update(|cx| view.read(cx).first_visible()), 0);
+}
+
+/// Walking down with the arrows loads the next page once fewer than `PAGE_THRESHOLD` loaded rows remain below the
+/// viewport (the cut snapshot is long enough not to page right away).
+#[gpui_kit::test]
+fn arrow_keys_load_the_next_page(cx: &mut TestAppContext) {
+    let (_fx, handle, tab) = fixture_with_cut_log(cx, 260, 230, 77);
+    let model = model_of(&tab, cx);
+    let loaded = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let log = model.read(cx).log.value.clone().expect("log");
+            (log.rows.len(), log.exhausted)
+        })
+    };
+    frame(cx, handle, |_, _| {});
+    cx.run_until_parked();
+    assert_eq!(loaded(cx), (1 + 230, false), "no page at the top");
+    frame(cx, handle, |window, cx| {
+        window.click((ids::MESSAGE, 1usize), cx)
+    });
+    for _ in 0..40 {
+        press(cx, handle, "down");
+    }
+    frame(cx, handle, |_, _| {});
+    cx.run_until_parked();
+    assert_eq!(loaded(cx), (1 + 260, true), "the arrows paged in the rest");
+    assert!(row_visible(cx, handle, 41));
 }
 
 /// The arrows do nothing while the list does not have the focus.

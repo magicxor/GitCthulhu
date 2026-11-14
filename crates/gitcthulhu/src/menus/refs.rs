@@ -24,7 +24,7 @@ use crate::backend::{
 use crate::icons::AppIcon;
 use crate::notifications::ToastKind;
 use crate::tab::ops::branch::short_name;
-use crate::tab::ops::network::upstream_label;
+use crate::tab::ops::network::{push_destination_label, upstream_label};
 use crate::tab::{RepoTab, TabCtx};
 
 type TabCall = Rc<dyn Fn(&mut RepoTab, &mut Window, &mut Context<RepoTab>)>;
@@ -316,7 +316,7 @@ pub fn local_branch(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
 /// Pull and Push of a local branch, named after its upstream when it has one. The current branch gets the toolbar's
 /// Pull and Push (without an upstream they ask for one). Another branch needs an upstream: Pull fetches it and
 /// fast-forwards the branch without checking it out (not offered when another worktree has the branch checked out:
-/// Git refuses), Push pushes the branch to it (needs its remote-tracking ref).
+/// Git refuses), Push pushes the branch to it (not to an upstream in the local repository).
 fn push_pull_group(menu: &mut Vec<MenuItem>, target: &MenuTarget, full: &FullName, cx: &App) {
     let tab = &target.tab;
     let upstream = {
@@ -328,16 +328,14 @@ fn push_pull_group(menu: &mut Vec<MenuItem>, target: &MenuTarget, full: &FullNam
             .and_then(|refs| refs.local.iter().find(|b| &b.full == full))
             .and_then(|b| b.upstream.clone())
     };
-    let shown = upstream.as_ref().map(upstream_label);
+    // Pull names the upstream as the UI shows it (its remote-tracking ref), Push where it actually goes.
+    let pulled = upstream.as_ref().map(upstream_label);
+    let pushed = upstream.as_ref().and_then(push_destination_label);
     let mut items = Vec::new();
     if target.is_current {
-        let (pull, push) = match &shown {
-            Some(shown) => (
-                format!("Pull from \"{shown}\""),
-                format!("Push to \"{shown}\""),
-            ),
-            None => ("Pull".to_owned(), "Push".to_owned()),
-        };
+        let pull = pulled.map_or_else(|| "Pull".to_owned(), |p| format!("Pull from \"{p}\""));
+        // Without an upstream on a remote, the toolbar's Push picks the remote itself.
+        let push = pushed.map_or_else(|| "Push".to_owned(), |p| format!("Push to \"{p}\""));
         items.push(
             on_tab("branch-pull", pull, tab, |t, w, c| {
                 t.pull(None, w, c);
@@ -350,13 +348,13 @@ fn push_pull_group(menu: &mut Vec<MenuItem>, target: &MenuTarget, full: &FullNam
             })
             .with_icon(AppIcon::Upload),
         );
-    } else if let (Some(upstream), Some(shown)) = (upstream, shown) {
+    } else if let (Some(upstream), Some(pulled)) = (upstream, pulled) {
         if !target.checked_out_elsewhere {
             let f = full.clone();
             items.push(
                 on_tab(
                     "branch-pull",
-                    format!("Pull from \"{shown}\" (fast-forward only)"),
+                    format!("Pull from \"{pulled}\" (fast-forward only)"),
                     tab,
                     move |t, w, c| {
                         t.pull_fast_forward(f.clone(), w, c);
@@ -365,16 +363,15 @@ fn push_pull_group(menu: &mut Vec<MenuItem>, target: &MenuTarget, full: &FullNam
                 .with_icon(AppIcon::Download),
             );
         }
-        // `push_branch_to` names the remote branch by its remote-tracking ref.
-        if let Some(tracking) = upstream.tracking.filter(|_| upstream.remote != ".") {
-            let f = full.clone();
+        if let Some(pushed) = pushed {
+            let (f, remote, merge) = (full.clone(), upstream.remote, upstream.merge);
             items.push(
                 on_tab(
                     "branch-push",
-                    format!("Push to \"{shown}\""),
+                    format!("Push to \"{pushed}\""),
                     tab,
                     move |t, w, c| {
-                        t.push_branch_to(f.clone(), tracking.clone(), false, w, c);
+                        t.push_branch_to_upstream(f.clone(), remote.clone(), merge.clone(), w, c);
                     },
                 )
                 .with_icon(AppIcon::Upload),

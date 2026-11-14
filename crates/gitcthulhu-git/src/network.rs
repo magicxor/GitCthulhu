@@ -446,7 +446,10 @@ pub fn fetch_fast_forward(
     drop(local);
 
     let refspec = format!("{}:{}", upstream.merge, branch);
+    // `fetch.output=compact` would print the rejected destination as `team/*`: the rejection is parsed by name.
     let cmd = GitCommand::new(repo, CommandKind::Network)
+        .arg("-c")
+        .arg("fetch.output=full")
         .arg("fetch")
         .arg("--progress")
         .with_progress()
@@ -468,7 +471,7 @@ pub fn fetch_fast_forward(
             };
             Ok(outcome(value, refresh, &[out]))
         }
-        Err(err) if is_rejected_non_fast_forward(err.stderr().unwrap_or_default(), &short) => {
+        Err(err) if only_branch_rejected(err.stderr().unwrap_or_default(), &short) => {
             let local = repo.local();
             let upstream_tip = match &upstream.tracking {
                 Some(tracking) => tip(&local, tracking)?,
@@ -497,16 +500,29 @@ pub fn fetch_fast_forward(
     }
 }
 
-/// `git fetch` reports a refused update of a local branch as ` ! [rejected]  main -> main  (non-fast-forward)`.
-fn is_rejected_non_fast_forward(stderr: &str, branch: &str) -> bool {
-    stderr.split(['\r', '\n']).map(str::trim).any(|line| {
-        line.starts_with('!')
-            && line.contains("[rejected]")
+/// Whether the only thing that failed in a fetch is the non-fast-forward update of the local branch `branch`, which
+/// `git fetch` reports as ` ! [rejected]  main -> main  (non-fast-forward)`. Any other rejected ref (a tag that would
+/// be clobbered, say) or error line keeps the fetch a failure.
+fn only_branch_rejected(stderr: &str, branch: &str) -> bool {
+    let mut branch_rejected = false;
+    for line in stderr.split(['\r', '\n']).map(str::trim) {
+        if line.starts_with("error:") || line.starts_with("fatal:") {
+            return false;
+        }
+        if !line.starts_with('!') {
+            continue;
+        }
+        let ours = line.contains("[rejected]")
             && line.contains("(non-fast-forward)")
             && line
                 .split_once(" -> ")
-                .is_some_and(|(_, dst)| dst.split_whitespace().next() == Some(branch))
-    })
+                .is_some_and(|(_, dst)| dst.split_whitespace().next() == Some(branch));
+        if !ours {
+            return false;
+        }
+        branch_rejected = true;
+    }
+    branch_rejected
 }
 
 fn no_upstream(branch: Option<String>) -> GitError {

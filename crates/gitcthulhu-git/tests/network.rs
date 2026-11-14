@@ -596,11 +596,7 @@ fn feature_world() -> (World, TestRepo) {
 }
 
 fn commit_and_push_feature(other: &TestRepo) {
-    other.write(
-        "o.txt",
-        "from other
-",
-    );
+    other.write("o.txt", "from other\n");
     other.commit_all("other");
     other.git(&["push", "-q", "origin", "feature"]);
 }
@@ -608,11 +604,7 @@ fn commit_and_push_feature(other: &TestRepo) {
 /// A commit on the work repository's `feature` while HEAD stays on `main`.
 fn commit_on_local_feature(w: &World) {
     w.work.git(&["checkout", "-q", "feature"]);
-    w.work.write(
-        "w.txt",
-        "from work
-",
-    );
+    w.work.write("w.txt", "from work\n");
     w.work.commit_all("work");
     w.work.git(&["checkout", "-q", "main"]);
 }
@@ -734,6 +726,52 @@ fn fetch_fast_forward_diverged_fetches_but_leaves_the_branch() {
         rev(&w.work, "origin/feature"),
         rev(&other, "feature"),
         "the remote's commits were fetched all the same"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_diverged_with_compact_output_and_another_local_name() {
+    let (w, other) = feature_world();
+    // A local branch named differently from its remote branch: compact output would print `team/*`.
+    w.work.git(&["config", "fetch.output", "compact"]);
+    w.work
+        .git(&["branch", "-q", "--track", "team/feature", "origin/feature"]);
+    w.work.git(&["checkout", "-q", "team/feature"]);
+    w.work.write("w.txt", "from work\n");
+    w.work.commit_all("work");
+    w.work.git(&["checkout", "-q", "main"]);
+    commit_and_push_feature(&other);
+    let before = rev(&w.work, "team/feature");
+    let out = fetch_fast_forward(&w, "refs/heads/team/feature")
+        .expect("the rejection is recognised whatever fetch.output says");
+    assert_eq!(
+        out.value,
+        FastForwardOutcome::Diverged,
+        "both sides have commits"
+    );
+    assert_eq!(
+        rev(&w.work, "team/feature"),
+        before,
+        "the branch stayed where it was"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_keeps_other_failures() {
+    let (w, other) = feature_world();
+    // The remote moves a tag the work repository has, and every fetch of origin fetches all tags.
+    w.work.git(&["tag", "v1"]);
+    w.work.git(&["config", "remote.origin.tagOpt", "--tags"]);
+    commit_and_push_feature(&other);
+    other.git(&["tag", "v1"]);
+    other.git(&["push", "-q", "origin", "v1"]);
+    commit_on_local_feature(&w);
+    let result = fetch_fast_forward(&w, "refs/heads/feature");
+    let err = result.expect_err("a rejected tag is a failure even when the branch only diverged");
+    assert!(
+        err.stderr()
+            .is_some_and(|stderr| stderr.contains("would clobber existing tag")),
+        "the tag's rejection is reported: {err:?}"
     );
 }
 

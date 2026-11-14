@@ -59,6 +59,18 @@ pub(crate) fn upstream_label(upstream: &Upstream) -> String {
     }
 }
 
+/// Where a push of a branch to its upstream goes, `<remote>/<branch>` (`branch.<b>.remote` and `.merge`); `None` for
+/// an upstream in the local repository (`.`), which a push does not go to.
+pub(crate) fn push_destination_label(upstream: &Upstream) -> Option<String> {
+    (upstream.remote != ".").then(|| {
+        format!(
+            "{}/{}",
+            upstream.remote,
+            upstream.merge.shorten().to_str_lossy()
+        )
+    })
+}
+
 /// The report of a successful push or of one of the three rejections (they carry the full report).
 fn report_of<'a>(result: Result<&'a PushReport, &'a GitError>) -> Option<&'a PushReport> {
     match result {
@@ -723,12 +735,51 @@ impl RepoTab {
                 return false;
             }
         };
+        self.push_ref(
+            local,
+            remote,
+            destination,
+            force,
+            set_upstream,
+            skip_hooks,
+            window,
+            cx,
+        )
+    }
+
+    /// Pushes the local branch `local` to its upstream, the branch `merge` (`refs/heads/x`) on `remote`, as
+    /// configured (a custom fetch refspec may name its remote-tracking ref differently). Unguarded, marker `Push`.
+    /// Refresh: REMOTES | BRANCHES | LOG.
+    pub fn push_branch_to_upstream(
+        &mut self,
+        local: FullName,
+        remote: String,
+        merge: FullName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.push_ref(local, remote, merge, false, false, false, window, cx)
+    }
+
+    /// Pushes `local` to `destination` (`refs/heads/x`) on `remote`, forced per "Push with lease".
+    #[allow(clippy::too_many_arguments)]
+    fn push_ref(
+        &mut self,
+        local: FullName,
+        remote: String,
+        destination: FullName,
+        force: bool,
+        set_upstream: bool,
+        skip_hooks: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let force_mode = self.force_mode(force, cx);
         let options = PushOptions {
             remote: remote.clone(),
             refspecs: vec![PushRefSpec {
                 src: Some(local.clone()),
-                dst: destination,
+                dst: destination.clone(),
                 expected_remote: None,
             }],
             force: force_mode,
@@ -737,16 +788,26 @@ impl RepoTab {
             push_options: Vec::new(),
             skip_hooks,
         };
+        let label = format!("Push to {remote}");
         let spec = OpSpec::new(OpKind::Push, move |env| {
             git::network::push(env.repo, env.ctx, &options)
         })
         .unguarded()
         .marker(|result| marker_of(OperationKind::Push, push_title, result))
         .cancellable(Cancellable::Yes)
-        .label(format!("Push to {remote}"))
+        .label(label)
         .base_refresh(RefreshSet::REMOTES | RefreshSet::BRANCHES | RefreshSet::LOG)
         .retry_without_hooks(move |tab, window, cx| {
-            tab.push_branch_to_with(local, remote_branch, force, set_upstream, true, window, cx);
+            tab.push_ref(
+                local,
+                remote,
+                destination,
+                force,
+                set_upstream,
+                true,
+                window,
+                cx,
+            );
         });
         self.run_op(spec, window, cx)
     }

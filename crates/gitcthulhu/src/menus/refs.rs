@@ -24,6 +24,7 @@ use crate::backend::{
 use crate::icons::AppIcon;
 use crate::notifications::ToastKind;
 use crate::tab::ops::branch::short_name;
+use crate::tab::ops::network::upstream_label;
 use crate::tab::{RepoTab, TabCtx};
 
 type TabCall = Rc<dyn Fn(&mut RepoTab, &mut Window, &mut Context<RepoTab>)>;
@@ -228,7 +229,8 @@ fn confirm_delete_submodule(tab: &TabCtx, path: &RelaPath, window: &mut Window, 
 // ---- builders --------------------------------------------------------------------------------------------------
 
 /// The local-branch menu (slots `AfterCheckout`, `AfterRenameGroup`): Checkout, Merge and Rebase (when HEAD is a
-/// branch), Rename, Change default upstream, Delete (not the current branch) and Copy branch name.
+/// branch), Pull and Push (see [`push_pull_group`]), Rename, Change default upstream, Delete (not the current branch)
+/// and Copy branch name.
 pub fn local_branch(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
     let mut items = Vec::new();
     let Some(full) = target.branch.clone() else {
@@ -278,6 +280,7 @@ pub fn local_branch(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
         // 08 §2.13: this separator exists only with Merge/Rebase (a detached HEAD goes Checkout -> Rename).
         separator(&mut items);
     }
+    push_pull_group(&mut items, target, &full, cx);
 
     let (t1, f1) = (tab.clone(), full.clone());
     items.push(
@@ -308,6 +311,82 @@ pub fn local_branch(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
     }
     push_copy_name(&mut items, tab, rev);
     items
+}
+
+/// Pull and Push of a local branch, named after its upstream when it has one. The current branch gets the toolbar's
+/// Pull and Push (without an upstream they ask for one). Another branch needs an upstream: Pull fetches it and
+/// fast-forwards the branch without checking it out (not offered when another worktree has the branch checked out:
+/// Git refuses), Push pushes the branch to it (needs its remote-tracking ref).
+fn push_pull_group(menu: &mut Vec<MenuItem>, target: &MenuTarget, full: &FullName, cx: &App) {
+    let tab = &target.tab;
+    let upstream = {
+        let model = tab.model.read(cx);
+        model
+            .refs
+            .value
+            .as_ref()
+            .and_then(|refs| refs.local.iter().find(|b| &b.full == full))
+            .and_then(|b| b.upstream.clone())
+    };
+    let shown = upstream.as_ref().map(upstream_label);
+    let mut items = Vec::new();
+    if target.is_current {
+        let (pull, push) = match &shown {
+            Some(shown) => (
+                format!("Pull from \"{shown}\""),
+                format!("Push to \"{shown}\""),
+            ),
+            None => ("Pull".to_owned(), "Push".to_owned()),
+        };
+        items.push(
+            on_tab("branch-pull", pull, tab, |t, w, c| {
+                t.pull(None, w, c);
+            })
+            .with_icon(AppIcon::Download),
+        );
+        items.push(
+            on_tab("branch-push", push, tab, |t, w, c| {
+                t.push_current(false, false, w, c);
+            })
+            .with_icon(AppIcon::Upload),
+        );
+    } else if let (Some(upstream), Some(shown)) = (upstream, shown) {
+        if !target.checked_out_elsewhere {
+            let f = full.clone();
+            items.push(
+                on_tab(
+                    "branch-pull",
+                    format!("Pull from \"{shown}\" (fast-forward only)"),
+                    tab,
+                    move |t, w, c| {
+                        t.pull_fast_forward(f.clone(), w, c);
+                    },
+                )
+                .with_icon(AppIcon::Download),
+            );
+        }
+        // `push_branch_to` names the remote branch by its remote-tracking ref.
+        if let Some(tracking) = upstream.tracking.filter(|_| upstream.remote != ".") {
+            let f = full.clone();
+            items.push(
+                on_tab(
+                    "branch-push",
+                    format!("Push to \"{shown}\""),
+                    tab,
+                    move |t, w, c| {
+                        t.push_branch_to(f.clone(), tracking.clone(), false, w, c);
+                    },
+                )
+                .with_icon(AppIcon::Upload),
+            );
+        }
+    }
+    // A group of its own, also right after Checkout's group (a detached HEAD has no Merge/Rebase group between).
+    if !items.is_empty() {
+        separator(menu);
+        menu.append(&mut items);
+        separator(menu);
+    }
 }
 
 fn push_copy_name(items: &mut Vec<MenuItem>, tab: &TabCtx, name: String) {

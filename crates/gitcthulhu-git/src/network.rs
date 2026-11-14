@@ -14,10 +14,10 @@ use std::{
 use gix::{ObjectId, refs::FullName};
 
 use crate::{
-    CloneOptions, FetchOptions, FetchReport, FetchTarget, ForceMode, GitError, GitErrorKind,
-    GitRuntime, MergeOutcome, MergeOutcomeOrRebase, OpClass, OpContext, OpOutcome, OpWarning,
-    PullMode, PullOptions, PushOptions, PushRefSpec, PushReport, PushedRefUpdate, RebaseOutcome,
-    RefreshSet, Repo, RepoExclusive, Result, TagFetch, TagPush,
+    CloneOptions, FastForwardOutcome, FetchOptions, FetchReport, FetchTarget, ForceMode, GitError,
+    GitErrorKind, GitRuntime, MergeOutcome, MergeOutcomeOrRebase, OpClass, OpContext, OpOutcome,
+    OpWarning, PullMode, PullOptions, PushOptions, PushRefSpec, PushReport, PushedRefUpdate,
+    RebaseOutcome, RefreshSet, Repo, RepoExclusive, Result, TagFetch, TagPush,
     cli::{self, CommandKind, GitCommand, GitOutput, porcelain},
     error::{classify, combined_output},
     internal::{errors::gix_error, outcome::Collected, post_state},
@@ -409,6 +409,104 @@ pub fn pull(
         });
     }
     Ok(collected.finish(value, RefreshSet::OPERATION_STATE | RefreshSet::REMOTES))
+}
+
+/// Pulls the upstream of the local branch `branch` without checking it out: `git fetch -- <remote>
+/// <merge>:<branch>`. Git moves the branch only when that is a fast-forward and refuses a branch that a worktree has
+/// checked out (that error is returned as is); the fetch also updates the upstream's remote-tracking ref.
+///
+/// When the branch cannot be fast-forwarded the call still succeeds: the upstream was fetched, and the outcome tells
+/// whether the branch is merely ahead of it or has diverged (an upstream without a remote-tracking ref, which Git
+/// cannot record, counts as diverged). `NoUpstream` when the branch has none.
+pub fn fetch_fast_forward(
+    repo: &Repo,
+    perm: &mut RepoExclusive,
+    ctx: &OpContext,
+    branch: &FullName,
+) -> Result<OpOutcome<FastForwardOutcome>> {
+    let _ = perm;
+    ctx.cancel.check()?;
+    let local = repo.local();
+    let short = branch.shorten().to_string();
+    let upstream = crate::refs::upstream_of(&local, branch, &short)?
+        .ok_or_else(|| no_upstream(Some(short.clone())))?;
+    if upstream.remote != "." {
+        require_remote(&local, &upstream.remote)?;
+    }
+    let tip = |local: &gix::Repository, name: &FullName| -> Result<Option<ObjectId>> {
+        Ok(local
+            .try_find_reference(name.as_ref())
+            .map_err(gix_error)?
+            .and_then(|mut r| r.peel_to_id().ok().map(|id| id.detach())))
+    };
+    let before = tip(&local, branch)?.ok_or_else(|| GitError::RefNotFound {
+        name: branch.to_string(),
+        stderr: String::new(),
+    })?;
+    drop(local);
+
+    let refspec = format!("{}:{}", upstream.merge, branch);
+    let cmd = GitCommand::new(repo, CommandKind::Network)
+        .arg("fetch")
+        .arg("--progress")
+        .with_progress()
+        .with_hooks()
+        .arg("--")
+        .arg(&upstream.remote)
+        .arg(refspec);
+    let refresh = RefreshSet::REMOTES | RefreshSet::LOG | RefreshSet::BRANCHES | RefreshSet::TAGS;
+    match cli::run_checked(repo, cmd, ctx, OpClass::Fetch) {
+        Ok(out) => {
+            let after = tip(&repo.local(), branch)?.unwrap_or(before);
+            let value = if after == before {
+                FastForwardOutcome::UpToDate
+            } else {
+                FastForwardOutcome::FastForwarded {
+                    from: before,
+                    to: after,
+                }
+            };
+            Ok(outcome(value, refresh, &[out]))
+        }
+        Err(err) if is_rejected_non_fast_forward(err.stderr().unwrap_or_default(), &short) => {
+            let local = repo.local();
+            let upstream_tip = match &upstream.tracking {
+                Some(tracking) => tip(&local, tracking)?,
+                None => None,
+            };
+            let ahead = match upstream_tip {
+                // Unrelated histories have no merge base: they diverged.
+                Some(upstream_tip) => {
+                    local
+                        .merge_base(upstream_tip, before)
+                        .ok()
+                        .flatten()
+                        .map(|base| base.detach())
+                        == Some(upstream_tip)
+                }
+                None => false,
+            };
+            let value = if ahead {
+                FastForwardOutcome::Ahead
+            } else {
+                FastForwardOutcome::Diverged
+            };
+            Ok(outcome(value, refresh, &[]))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// `git fetch` reports a refused update of a local branch as ` ! [rejected]  main -> main  (non-fast-forward)`.
+fn is_rejected_non_fast_forward(stderr: &str, branch: &str) -> bool {
+    stderr.split(['\r', '\n']).map(str::trim).any(|line| {
+        line.starts_with('!')
+            && line.contains("[rejected]")
+            && line.contains("(non-fast-forward)")
+            && line
+                .split_once(" -> ")
+                .is_some_and(|(_, dst)| dst.split_whitespace().next() == Some(branch))
+    })
 }
 
 fn no_upstream(branch: Option<String>) -> GitError {

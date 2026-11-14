@@ -16,11 +16,11 @@ use crate::backend::loaders;
 use crate::backend::oplog::push_marker;
 use crate::backend::present::OpFailure;
 use crate::backend::{
-    ByteSlice as _, ConfigScope, FetchOptions, FetchReport, FetchTarget, ForceMode, FullName,
-    GitError, GitErrorKind, HeadState, MergeOutcome, MergeOutcomeOrRebase, NetworkMarker,
-    OperationDescriptor, OperationKind, PullMode, PullOptions, PushOptions, PushRefSpec,
-    PushRefStatus, PushReport, RefList, RefreshSet, RemoteInfo, Scope, TagFetch, TagPush,
-    UntrackedCapture, git,
+    ByteSlice as _, ConfigScope, FastForwardOutcome, FetchOptions, FetchReport, FetchTarget,
+    ForceMode, FullName, GitError, GitErrorKind, HeadState, MergeOutcome, MergeOutcomeOrRebase,
+    NetworkMarker, OperationDescriptor, OperationKind, PullMode, PullOptions, PushOptions,
+    PushRefSpec, PushRefStatus, PushReport, RefList, RefreshSet, RemoteInfo, Scope, TagFetch,
+    TagPush, UntrackedCapture, Upstream, git,
 };
 use crate::dialogs::choice::{self, ChoiceResult, ChoiceSpec};
 use crate::notifications::ToastKind;
@@ -43,6 +43,19 @@ pub(crate) fn push_title(report: &PushReport) -> String {
             )
         }
         _ => format!("Push to {}", report.remote),
+    }
+}
+
+/// How a branch's upstream is named in menus and toasts: its remote-tracking ref (`origin/main`), else
+/// `<remote>/<branch>`.
+pub(crate) fn upstream_label(upstream: &Upstream) -> String {
+    match &upstream.tracking {
+        Some(tracking) => tracking.shorten().to_str_lossy().into_owned(),
+        None => format!(
+            "{}/{}",
+            upstream.remote,
+            upstream.merge.shorten().to_str_lossy()
+        ),
     }
 }
 
@@ -230,6 +243,83 @@ impl RepoTab {
             window,
             cx,
         )
+    }
+
+    /// Pulls the upstream of `branch`, a local branch no worktree has checked out, without checking it out
+    /// (`network::fetch_fast_forward`): the branch moves only when that is a fast-forward; otherwise the upstream is
+    /// fetched all the same and a toast says why the branch stayed. Snapshot `Pull {branch}` (refs only).
+    /// Refresh: REMOTES | BRANCHES | LOG | TAGS.
+    pub fn pull_fast_forward(
+        &mut self,
+        branch: FullName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let name = branch.shorten().to_str_lossy().into_owned();
+        let (remote, source) = {
+            let model = self.ctx.model.read(cx);
+            let upstream = model
+                .refs
+                .value
+                .as_ref()
+                .and_then(|refs| refs.local.iter().find(|b| b.full == branch))
+                .and_then(|b| b.upstream.clone());
+            match upstream {
+                Some(upstream) => {
+                    let source = upstream_label(&upstream);
+                    (upstream.remote, source)
+                }
+                None => (String::new(), "its upstream".to_owned()),
+            }
+        };
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::Pull,
+            title: format!("Pull {name}"),
+            detail: Some(format!("fast-forward from {source}")),
+            scope: Scope::RefsOnly,
+            untracked: UntrackedCapture::None,
+        };
+        let overlay = format!("Pulling changes from {source} to '{name}'");
+        let label = if remote.is_empty() {
+            "Pull".to_owned()
+        } else {
+            format!("Pull from {remote}")
+        };
+        let spec = OpSpec::new(OpKind::Pull, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::network::fetch_fast_forward(repo, env.perm(), ctx, &branch)
+        })
+        .record(descriptor)
+        .cancellable(Cancellable::Yes)
+        .label(label)
+        .detail(overlay)
+        .base_refresh(
+            RefreshSet::REMOTES | RefreshSet::BRANCHES | RefreshSet::LOG | RefreshSet::TAGS,
+        )
+        .toast_with(move |outcome: &FastForwardOutcome| {
+            Some(match outcome {
+                FastForwardOutcome::FastForwarded { .. } => (
+                    ToastKind::Positive,
+                    format!("'{name}' fast-forwarded to {source}").into(),
+                ),
+                FastForwardOutcome::UpToDate => (
+                    ToastKind::Positive,
+                    format!("'{name}' is already up to date").into(),
+                ),
+                FastForwardOutcome::Ahead => (
+                    ToastKind::Positive,
+                    format!("'{name}' is ahead of {source}: nothing to pull").into(),
+                ),
+                FastForwardOutcome::Diverged => (
+                    ToastKind::Warning,
+                    format!(
+                        "'{name}' and {source} have diverged: the changes were fetched, but '{name}' was not moved. Check it out to merge or rebase."
+                    )
+                    .into(),
+                ),
+            })
+        });
+        self.run_op(spec, window, cx)
     }
 
     fn run_pull(

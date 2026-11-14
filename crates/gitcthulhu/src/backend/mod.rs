@@ -80,6 +80,7 @@ pub use gitcthulhu_git::{
     EntryKind,
     EolStyle,
     FastForward,
+    FastForwardOutcome,
     FetchOptions,
     FetchReport,
     FetchTarget,

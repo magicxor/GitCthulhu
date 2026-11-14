@@ -458,46 +458,52 @@ pub fn fetch_fast_forward(
         .arg(&upstream.remote)
         .arg(refspec);
     let refresh = RefreshSet::REMOTES | RefreshSet::LOG | RefreshSet::BRANCHES | RefreshSet::TAGS;
-    match cli::run_checked(repo, cmd, ctx, OpClass::Fetch) {
-        Ok(out) => {
-            let after = tip(&repo.local(), branch)?.unwrap_or(before);
-            let value = if after == before {
-                FastForwardOutcome::UpToDate
-            } else {
-                FastForwardOutcome::FastForwarded {
-                    from: before,
-                    to: after,
-                }
-            };
-            Ok(outcome(value, refresh, &[out]))
-        }
-        Err(err) if only_branch_rejected(err.stderr().unwrap_or_default(), &short) => {
-            let local = repo.local();
-            let upstream_tip = match &upstream.tracking {
-                Some(tracking) => tip(&local, tracking)?,
-                None => None,
-            };
-            let ahead = match upstream_tip {
-                // Unrelated histories have no merge base: they diverged.
-                Some(upstream_tip) => {
-                    local
-                        .merge_base(upstream_tip, before)
-                        .ok()
-                        .flatten()
-                        .map(|base| base.detach())
-                        == Some(upstream_tip)
-                }
-                None => false,
-            };
-            let value = if ahead {
-                FastForwardOutcome::Ahead
-            } else {
-                FastForwardOutcome::Diverged
-            };
-            Ok(outcome(value, refresh, &[]))
-        }
-        Err(err) => Err(err),
+    // Unchecked, like `run_push`: a rejection of the branch alone is an outcome, and the command's log and hook
+    // warnings belong to it.
+    let out = cli::run(repo.runtime(), cmd, ctx)?;
+    if out.success() {
+        let after = tip(&repo.local(), branch)?.unwrap_or(before);
+        let value = if after == before {
+            FastForwardOutcome::UpToDate
+        } else {
+            FastForwardOutcome::FastForwarded {
+                from: before,
+                to: after,
+            }
+        };
+        return Ok(outcome(value, refresh, &[out]));
     }
+    let err = classify(OpClass::Fetch, &out, &post_state::read(repo)?);
+    let stopped_early = matches!(
+        err.kind(),
+        GitErrorKind::Cancelled | GitErrorKind::AuthCancelled | GitErrorKind::HookFailed
+    );
+    if stopped_early || !only_branch_rejected(&out.stderr, &short) {
+        return Err(err);
+    }
+    let local = repo.local();
+    let upstream_tip = match &upstream.tracking {
+        Some(tracking) => tip(&local, tracking)?,
+        None => None,
+    };
+    let ahead = match upstream_tip {
+        // Unrelated histories have no merge base: they diverged.
+        Some(upstream_tip) => {
+            local
+                .merge_base(upstream_tip, before)
+                .ok()
+                .flatten()
+                .map(|base| base.detach())
+                == Some(upstream_tip)
+        }
+        None => false,
+    };
+    let value = if ahead {
+        FastForwardOutcome::Ahead
+    } else {
+        FastForwardOutcome::Diverged
+    };
+    Ok(outcome(value, refresh, &[out]))
 }
 
 /// Whether the only thing that failed in a fetch is the non-fast-forward update of the local branch `branch`, which
@@ -516,7 +522,8 @@ fn only_branch_rejected(stderr: &str, branch: &str) -> bool {
             && line.contains("(non-fast-forward)")
             && line
                 .split_once(" -> ")
-                .is_some_and(|(_, dst)| dst.split_whitespace().next() == Some(branch));
+                // Git pads with ASCII spaces, which a refname cannot hold (other whitespace, like U+00A0, it can).
+                .is_some_and(|(_, dst)| dst.split_ascii_whitespace().next() == Some(branch));
         if !ours {
             return false;
         }
@@ -944,6 +951,32 @@ mod tests {
             count_updated_refs(not_updates),
             0,
             "remote text and FETCH_HEAD-only lines are not ref updates"
+        );
+    }
+
+    #[test]
+    fn only_branch_rejected_needs_the_branch_alone() {
+        let nbsp = "feature\u{a0}x";
+        let rejected = format!(
+            "From file:///r\n ! [rejected]        {nbsp}    -> {nbsp}  (non-fast-forward)\n   abc..def  {nbsp} -> origin/{nbsp}\n"
+        );
+        assert!(
+            only_branch_rejected(&rejected, nbsp),
+            "a refname may hold U+00A0: only ASCII spaces end the destination"
+        );
+        assert!(
+            !only_branch_rejected(&rejected, "feature"),
+            "another branch's rejection is not ours"
+        );
+        let with_tag =
+            format!("{rejected} ! [rejected]        v1  -> v1  (would clobber existing tag)\n");
+        assert!(
+            !only_branch_rejected(&with_tag, nbsp),
+            "a rejected tag keeps the fetch a failure"
+        );
+        assert!(
+            !only_branch_rejected("fatal: couldn't find remote ref refs/heads/x\n", "x"),
+            "no rejection line, no branch rejection"
         );
     }
 

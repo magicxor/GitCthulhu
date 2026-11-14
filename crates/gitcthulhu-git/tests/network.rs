@@ -718,6 +718,11 @@ fn fetch_fast_forward_diverged_fetches_but_leaves_the_branch() {
         "both sides have commits"
     );
     assert_eq!(
+        out.log.commands.len(),
+        1,
+        "the rejected fetch's command stays in the outcome's log"
+    );
+    assert_eq!(
         rev(&w.work, "feature"),
         before,
         "the branch stayed where it was"

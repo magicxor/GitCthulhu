@@ -763,6 +763,146 @@ fn fixture_pull_from_and_fetch_remote(cx: &mut TestAppContext) {
     );
 }
 
+/// Pull of a branch that is not checked out: fast-forwards it without a checkout, records an undoable snapshot,
+/// and a divergence fetches but leaves the branch with a warning.
+#[gpui_kit::test]
+fn fixture_pull_fast_forward_of_another_branch(cx: &mut TestAppContext) {
+    let r = Remote::new();
+    r.fx.git(&["branch", "feature"]);
+    r.fx.git(&["push", "-q", "-u", "origin", "feature"]);
+    let other = r.other.as_str();
+    r.fx.git(&["-C", other, "fetch", "-q", "origin"]);
+    r.fx.git(&[
+        "-C",
+        other,
+        "checkout",
+        "-q",
+        "-b",
+        "feature",
+        "origin/feature",
+    ]);
+    let publish_feature = |file: &str| {
+        std::fs::write(std::path::Path::new(other).join(file), "x\n").expect("write");
+        r.fx.git(&["-C", other, "add", "-A"]);
+        r.fx.git(&["-C", other, "commit", "-q", "-m", &format!("theirs {file}")]);
+        r.fx.git(&["-C", other, "push", "-q", "origin", "feature"]);
+    };
+    publish_feature("f.txt");
+    let rev = |name: &str| r.fx.git(&["rev-parse", name]).trim().to_owned();
+    let (feature_before, main_before) = (rev("feature"), rev("main"));
+    let (handle, app, tab) = mount_fixture(cx, &r.fx, DEFAULT_SIZE);
+
+    run_on(cx, handle, &tab, |t, w, cx| {
+        t.pull_fast_forward(full("refs/heads/feature"), w, cx)
+    });
+    for _ in 0..30 {
+        cx.run_until_parked();
+    }
+    let remote_feature = r.remote_git(&["rev-parse", "feature"]).trim().to_owned();
+    assert_eq!(
+        rev("feature"),
+        remote_feature,
+        "feature moved to the remote's tip"
+    );
+    assert_eq!(rev("main"), main_before, "the current branch did not move");
+    assert_eq!(
+        r.fx.git(&["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/main",
+        "nothing was checked out"
+    );
+    assert!(
+        oplog_entries(&tab, cx)
+            .iter()
+            .any(|e| e.title == "Pull feature"),
+        "the pull is recorded as `Pull feature`"
+    );
+    let toasts = cx.update(|cx| toast_texts(&app, cx));
+    assert!(
+        toasts
+            .iter()
+            .any(|t| t == "'feature' fast-forwarded to origin/feature"),
+        "the toast names the upstream: {toasts:?}"
+    );
+
+    run_on(cx, handle, &tab, |t, w, cx| {
+        assert!(t.undo(w, cx), "undo starts");
+    });
+    for _ in 0..30 {
+        cx.run_until_parked();
+    }
+    assert_eq!(rev("feature"), feature_before, "undo moves feature back");
+
+    // Diverged: a local commit on feature (made without a checkout) and a new remote one.
+    let local_commit =
+        r.fx.git(&[
+            "commit-tree",
+            "feature^{tree}",
+            "-p",
+            "feature",
+            "-m",
+            "mine",
+        ])
+        .trim()
+        .to_owned();
+    r.fx.git(&["update-ref", "refs/heads/feature", &local_commit]);
+    publish_feature("g.txt");
+    run_on(cx, handle, &tab, |t, w, cx| {
+        t.pull_fast_forward(full("refs/heads/feature"), w, cx)
+    });
+    for _ in 0..30 {
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        rev("feature"),
+        local_commit,
+        "a diverged branch stays where it was"
+    );
+    assert_eq!(
+        rev("origin/feature"),
+        r.remote_git(&["rev-parse", "feature"]).trim(),
+        "the remote's commits were fetched all the same"
+    );
+    let toasts = cx.update(|cx| toast_texts(&app, cx));
+    assert!(
+        toasts
+            .iter()
+            .any(|t| t.starts_with("'feature' and origin/feature have diverged")),
+        "the divergence is explained: {toasts:?}"
+    );
+}
+
+/// Push of a branch to its upstream goes to `branch.<b>.merge` on `branch.<b>.remote`, not to a name derived from
+/// the remote-tracking ref (a custom fetch refspec may track `review/feature` as `origin/feature`).
+#[gpui_kit::test]
+fn fixture_push_branch_to_upstream_uses_the_configured_merge_ref(cx: &mut TestAppContext) {
+    let r = Remote::new();
+    r.fx.git(&["branch", "feature"]);
+    let (handle, _app, tab) = mount_fixture(cx, &r.fx, DEFAULT_SIZE);
+    run_on(cx, handle, &tab, |t, w, cx| {
+        t.push_branch_to_upstream(
+            full("refs/heads/feature"),
+            "origin".to_owned(),
+            full("refs/heads/review/feature"),
+            w,
+            cx,
+        )
+    });
+    for _ in 0..30 {
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        r.remote_git(&["rev-parse", "review/feature"]).trim(),
+        r.fx.git(&["rev-parse", "feature"]).trim(),
+        "the branch was pushed to the configured merge ref"
+    );
+    assert!(
+        r.remote_git(&["branch", "--list", "feature"])
+            .trim()
+            .is_empty(),
+        "nothing was pushed under the local name"
+    );
+}
+
 #[gpui_kit::test]
 fn fixture_push_family_records_markers(cx: &mut TestAppContext) {
     let r = Remote::new();

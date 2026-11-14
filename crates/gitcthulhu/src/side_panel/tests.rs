@@ -1106,12 +1106,23 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
     assert_eq!(
         item_ids(&items),
         [
+            "branch-pull",
+            "branch-push",
+            "---",
             "branch-rename",
             "branch-upstream",
             "---",
             "branch-copy-name"
         ],
-        "the current branch: no checkout, merge, rebase or delete"
+        "the current branch: no checkout, merge, rebase or delete; the toolbar's Pull and Push"
+    );
+    assert_eq!(
+        item_labels(&items)[..2],
+        [
+            "Pull from \"origin/main\"".to_owned(),
+            "Push to \"origin/main\"".to_owned()
+        ],
+        "pull and push name the upstream"
     );
 
     let items = menu_of(
@@ -1135,7 +1146,7 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
             "---",
             "branch-copy-name"
         ],
-        "a local branch other than the current one (with X6's Create worktree…)"
+        "a local branch other than the current one without an upstream: no pull or push (with X6's Create worktree…)"
     );
     assert_eq!(
         item_labels(&items),
@@ -1150,6 +1161,127 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
             "Copy branch name"
         ]
     );
+
+    // Another branch with an upstream: Pull fast-forwards it without a checkout, Push pushes it to its upstream.
+    cx.update(|cx| {
+        let model = tab.read(cx).ctx().model.clone();
+        model.update(cx, |m, cx| {
+            let mut value = (**m.refs.value.as_ref().expect("refs")).clone();
+            tracking(&mut value.local[0], "origin");
+            m.set_refs(Arc::new(value), cx);
+        });
+    });
+    let feature = model_refs(&tab, cx).local[0].clone();
+    let items = menu_of(
+        &tab,
+        cx,
+        |c, _| refs::local_branch_target(c, &feature),
+        refs::local_branch,
+    );
+    assert_eq!(
+        item_ids(&items)[5..9],
+        ["branch-pull", "branch-push", "---", "branch-rename"],
+        "pull and push form their own group after merge and rebase"
+    );
+    assert_eq!(
+        item_labels(&items)[4..6],
+        [
+            "Pull from \"origin/feature\" (fast-forward only)".to_owned(),
+            "Push to \"origin/feature\"".to_owned()
+        ],
+        "another branch is only fast-forwarded"
+    );
+    let mut elsewhere = feature.clone();
+    elsewhere.checked_out_in = Some("C:/elsewhere".into());
+    let items = menu_of(
+        &tab,
+        cx,
+        |c, _| refs::local_branch_target(c, &elsewhere),
+        refs::local_branch,
+    );
+    assert!(
+        !item_ids(&items).contains(&"branch-pull".to_owned())
+            && item_ids(&items).contains(&"branch-push".to_owned()),
+        "Git refuses to fetch into a branch another worktree has checked out; pushing it is fine: {:?}",
+        item_ids(&items)
+    );
+
+    // The builder reads the upstream from the model.
+    let set_upstream = |cx: &mut TestAppContext, index: usize, upstream: Upstream| {
+        cx.update(|cx| {
+            let model = tab.read(cx).ctx().model.clone();
+            model.update(cx, |m, cx| {
+                let mut value = (**m.refs.value.as_ref().expect("refs")).clone();
+                value.local[index].upstream = Some(upstream);
+                m.set_refs(Arc::new(value), cx);
+            });
+        });
+    };
+    let labels_of = |cx: &mut TestAppContext, index: usize| {
+        let branch = model_refs(&tab, cx).local[index].clone();
+        let items = menu_of(
+            &tab,
+            cx,
+            |c, _| refs::local_branch_target(c, &branch),
+            refs::local_branch,
+        );
+        item_labels(&items)
+    };
+
+    // A custom fetch refspec tracks `review/feature` on origin as `origin/feature`: Pull names the remote-tracking ref
+    // the UI shows, Push the branch it actually updates.
+    set_upstream(
+        cx,
+        0,
+        Upstream {
+            remote: "origin".into(),
+            merge: full("refs/heads/review/feature"),
+            tracking: Some(full("refs/remotes/origin/feature")),
+            gone: false,
+        },
+    );
+    assert_eq!(
+        labels_of(cx, 0)[4..6],
+        [
+            "Pull from \"origin/feature\" (fast-forward only)".to_owned(),
+            "Push to \"origin/review/feature\"".to_owned()
+        ],
+        "Push goes to branch.<b>.merge on branch.<b>.remote"
+    );
+
+    // An upstream in the local repository (`branch.<b>.remote = .`): pulling from it works, a push never goes there.
+    let local_upstream = Upstream {
+        remote: ".".into(),
+        merge: full("refs/heads/Zeta"),
+        tracking: Some(full("refs/heads/Zeta")),
+        gone: false,
+    };
+    set_upstream(cx, 0, local_upstream.clone());
+    let labels = labels_of(cx, 0);
+    assert!(
+        labels.contains(&"Pull from \"Zeta\" (fast-forward only)".to_owned())
+            && !labels.iter().any(|l| l.starts_with("Push")),
+        "another branch tracking a local branch: Pull only: {labels:?}"
+    );
+    set_upstream(cx, 1, local_upstream);
+    assert_eq!(
+        labels_of(cx, 1)[..2],
+        ["Pull from \"Zeta\"".to_owned(), "Push".to_owned()],
+        "the current branch tracking a local branch: the toolbar's Push picks the remote itself"
+    );
+    // Back to origin upstreams for the checks below.
+    for (index, name) in [(0, "feature"), (1, "main")] {
+        set_upstream(
+            cx,
+            index,
+            Upstream {
+                remote: "origin".into(),
+                merge: full(&format!("refs/heads/{name}")),
+                tracking: Some(full(&format!("refs/remotes/origin/{name}"))),
+                gone: false,
+            },
+        );
+    }
 
     let origin_main = refs.remotes[0].branches[1].clone();
     let items = menu_of(
@@ -1206,6 +1338,10 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
         [
             "branch-checkout",
             "branch-create-worktree",
+            "---",
+            "branch-pull",
+            "branch-push",
+            "---",
             "branch-rename",
             "branch-upstream",
             "---",
@@ -1213,7 +1349,24 @@ fn branch_menu_items_by_condition(cx: &mut TestAppContext) {
             "---",
             "branch-copy-name"
         ],
-        "detached HEAD: merge and rebase are hidden, and so is their separator (08 §2.13: Checkout -> Rename); X6's Create worktree… joins Checkout's group"
+        "detached HEAD: merge and rebase are hidden, pull and push keep their own group; X6's Create worktree… joins Checkout's group"
+    );
+    let zeta = refs.local[2].clone();
+    let items = menu_of(
+        &tab,
+        cx,
+        |c, _| refs::local_branch_target(c, &zeta),
+        refs::local_branch,
+    );
+    assert_eq!(
+        item_ids(&items)[..4],
+        [
+            "branch-checkout",
+            "branch-create-worktree",
+            "branch-rename",
+            "branch-upstream"
+        ],
+        "detached HEAD, no upstream: no merge, rebase, pull or push, nor their separators (08 §2.13: Checkout -> Rename)"
     );
     let items = menu_of(
         &tab,
@@ -1420,6 +1573,9 @@ fn branch_menu_calls_extender_slots(cx: &mut TestAppContext) {
         item_ids(&items),
         [
             "x-after-checkout",
+            "---",
+            "branch-pull",
+            "branch-push",
             "---",
             "branch-rename",
             "branch-upstream",

@@ -461,6 +461,13 @@ fn public_functions_have_the_documented_signatures() {
             &OpContext,
             &PullOptions,
         ) -> Result<OpOutcome<MergeOutcomeOrRebase>>;
+    let _ = network::fetch_fast_forward
+        as fn(
+            &Repo,
+            &mut RepoExclusive,
+            &OpContext,
+            &FullName,
+        ) -> Result<OpOutcome<FastForwardOutcome>>;
     let _ = network::push as fn(&Repo, &OpContext, &PushOptions) -> Result<OpOutcome<PushReport>>;
     let _ = network::push_current_branch
         as fn(&Repo, &OpContext, ForceMode, TagPush, bool) -> Result<OpOutcome<PushReport>>;

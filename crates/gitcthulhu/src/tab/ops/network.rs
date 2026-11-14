@@ -16,11 +16,11 @@ use crate::backend::loaders;
 use crate::backend::oplog::push_marker;
 use crate::backend::present::OpFailure;
 use crate::backend::{
-    ByteSlice as _, ConfigScope, FetchOptions, FetchReport, FetchTarget, ForceMode, FullName,
-    GitError, GitErrorKind, HeadState, MergeOutcome, MergeOutcomeOrRebase, NetworkMarker,
-    OperationDescriptor, OperationKind, PullMode, PullOptions, PushOptions, PushRefSpec,
-    PushRefStatus, PushReport, RefList, RefreshSet, RemoteInfo, Scope, TagFetch, TagPush,
-    UntrackedCapture, git,
+    ByteSlice as _, ConfigScope, FastForwardOutcome, FetchOptions, FetchReport, FetchTarget,
+    ForceMode, FullName, GitError, GitErrorKind, HeadState, MergeOutcome, MergeOutcomeOrRebase,
+    NetworkMarker, OperationDescriptor, OperationKind, PullMode, PullOptions, PushOptions,
+    PushRefSpec, PushRefStatus, PushReport, RefList, RefreshSet, RemoteInfo, Scope, TagFetch,
+    TagPush, UntrackedCapture, Upstream, git,
 };
 use crate::dialogs::choice::{self, ChoiceResult, ChoiceSpec};
 use crate::notifications::ToastKind;
@@ -44,6 +44,31 @@ pub(crate) fn push_title(report: &PushReport) -> String {
         }
         _ => format!("Push to {}", report.remote),
     }
+}
+
+/// How a branch's upstream is named in menus and toasts: its remote-tracking ref (`origin/main`), else
+/// `<remote>/<branch>`.
+pub(crate) fn upstream_label(upstream: &Upstream) -> String {
+    match &upstream.tracking {
+        Some(tracking) => tracking.shorten().to_str_lossy().into_owned(),
+        None => format!(
+            "{}/{}",
+            upstream.remote,
+            upstream.merge.shorten().to_str_lossy()
+        ),
+    }
+}
+
+/// Where a push of a branch to its upstream goes, `<remote>/<branch>` (`branch.<b>.remote` and `.merge`); `None` for
+/// an upstream in the local repository (`.`), which a push does not go to.
+pub(crate) fn push_destination_label(upstream: &Upstream) -> Option<String> {
+    (upstream.remote != ".").then(|| {
+        format!(
+            "{}/{}",
+            upstream.remote,
+            upstream.merge.shorten().to_str_lossy()
+        )
+    })
 }
 
 /// The report of a successful push or of one of the three rejections (they carry the full report).
@@ -230,6 +255,83 @@ impl RepoTab {
             window,
             cx,
         )
+    }
+
+    /// Pulls the upstream of `branch`, a local branch no worktree has checked out, without checking it out
+    /// (`network::fetch_fast_forward`): the branch moves only when that is a fast-forward; otherwise the upstream is
+    /// fetched all the same and a toast says why the branch stayed. Snapshot `Pull {branch}` (refs only).
+    /// Refresh: REMOTES | BRANCHES | LOG | TAGS.
+    pub fn pull_fast_forward(
+        &mut self,
+        branch: FullName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let name = branch.shorten().to_str_lossy().into_owned();
+        let (remote, source) = {
+            let model = self.ctx.model.read(cx);
+            let upstream = model
+                .refs
+                .value
+                .as_ref()
+                .and_then(|refs| refs.local.iter().find(|b| b.full == branch))
+                .and_then(|b| b.upstream.clone());
+            match upstream {
+                Some(upstream) => {
+                    let source = upstream_label(&upstream);
+                    (upstream.remote, source)
+                }
+                None => (String::new(), "its upstream".to_owned()),
+            }
+        };
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::Pull,
+            title: format!("Pull {name}"),
+            detail: Some(format!("fast-forward from {source}")),
+            scope: Scope::RefsOnly,
+            untracked: UntrackedCapture::None,
+        };
+        let overlay = format!("Pulling changes from {source} to '{name}'");
+        let label = if remote.is_empty() {
+            "Pull".to_owned()
+        } else {
+            format!("Pull from {remote}")
+        };
+        let spec = OpSpec::new(OpKind::Pull, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::network::fetch_fast_forward(repo, env.perm(), ctx, &branch)
+        })
+        .record(descriptor)
+        .cancellable(Cancellable::Yes)
+        .label(label)
+        .detail(overlay)
+        .base_refresh(
+            RefreshSet::REMOTES | RefreshSet::BRANCHES | RefreshSet::LOG | RefreshSet::TAGS,
+        )
+        .toast_with(move |outcome: &FastForwardOutcome| {
+            Some(match outcome {
+                FastForwardOutcome::FastForwarded { .. } => (
+                    ToastKind::Positive,
+                    format!("'{name}' fast-forwarded to {source}").into(),
+                ),
+                FastForwardOutcome::UpToDate => (
+                    ToastKind::Positive,
+                    format!("'{name}' is already up to date").into(),
+                ),
+                FastForwardOutcome::Ahead => (
+                    ToastKind::Positive,
+                    format!("'{name}' is ahead of {source}: nothing to pull").into(),
+                ),
+                FastForwardOutcome::Diverged => (
+                    ToastKind::Warning,
+                    format!(
+                        "'{name}' and {source} have diverged: the changes were fetched, but '{name}' was not moved. Check it out to merge or rebase."
+                    )
+                    .into(),
+                ),
+            })
+        });
+        self.run_op(spec, window, cx)
     }
 
     fn run_pull(
@@ -633,12 +735,51 @@ impl RepoTab {
                 return false;
             }
         };
+        self.push_ref(
+            local,
+            remote,
+            destination,
+            force,
+            set_upstream,
+            skip_hooks,
+            window,
+            cx,
+        )
+    }
+
+    /// Pushes the local branch `local` to its upstream, the branch `merge` (`refs/heads/x`) on `remote`, as
+    /// configured (a custom fetch refspec may name its remote-tracking ref differently). Unguarded, marker `Push`.
+    /// Refresh: REMOTES | BRANCHES | LOG.
+    pub fn push_branch_to_upstream(
+        &mut self,
+        local: FullName,
+        remote: String,
+        merge: FullName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.push_ref(local, remote, merge, false, false, false, window, cx)
+    }
+
+    /// Pushes `local` to `destination` (`refs/heads/x`) on `remote`, forced per "Push with lease".
+    #[allow(clippy::too_many_arguments)]
+    fn push_ref(
+        &mut self,
+        local: FullName,
+        remote: String,
+        destination: FullName,
+        force: bool,
+        set_upstream: bool,
+        skip_hooks: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let force_mode = self.force_mode(force, cx);
         let options = PushOptions {
             remote: remote.clone(),
             refspecs: vec![PushRefSpec {
                 src: Some(local.clone()),
-                dst: destination,
+                dst: destination.clone(),
                 expected_remote: None,
             }],
             force: force_mode,
@@ -647,16 +788,26 @@ impl RepoTab {
             push_options: Vec::new(),
             skip_hooks,
         };
+        let label = format!("Push to {remote}");
         let spec = OpSpec::new(OpKind::Push, move |env| {
             git::network::push(env.repo, env.ctx, &options)
         })
         .unguarded()
         .marker(|result| marker_of(OperationKind::Push, push_title, result))
         .cancellable(Cancellable::Yes)
-        .label(format!("Push to {remote}"))
+        .label(label)
         .base_refresh(RefreshSet::REMOTES | RefreshSet::BRANCHES | RefreshSet::LOG)
         .retry_without_hooks(move |tab, window, cx| {
-            tab.push_branch_to_with(local, remote_branch, force, set_upstream, true, window, cx);
+            tab.push_ref(
+                local,
+                remote,
+                destination,
+                force,
+                set_upstream,
+                true,
+                window,
+                cx,
+            );
         });
         self.run_op(spec, window, cx)
     }

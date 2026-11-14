@@ -134,7 +134,7 @@ fn branches_with_config(gix_repo: &gix::Repository) -> HashSet<BString> {
         .collect()
 }
 
-fn upstream_of(
+pub(crate) fn upstream_of(
     gix_repo: &gix::Repository,
     full: &FullName,
     short: &str,

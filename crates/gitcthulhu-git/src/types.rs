@@ -2139,6 +2139,24 @@ pub struct PullOptions {
     pub autostash: bool,
 }
 
+/// The result of `network::fetch_fast_forward` (a pull of a branch that is not checked out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastForwardOutcome {
+    /// The branch moved forward to its upstream.
+    FastForwarded {
+        /// The branch's tip before.
+        from: ObjectId,
+        /// The branch's tip now (the upstream's).
+        to: ObjectId,
+    },
+    /// The branch already points to its upstream.
+    UpToDate,
+    /// The upstream is behind the branch: there is nothing to bring in.
+    Ahead,
+    /// Both sides have commits of their own: the upstream was fetched, the branch stayed where it was.
+    Diverged,
+}
+
 /// How a pull integrates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullMode {

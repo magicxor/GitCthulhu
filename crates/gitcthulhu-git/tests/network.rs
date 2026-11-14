@@ -9,10 +9,10 @@ use std::{
 };
 
 use gitcthulhu_git::{
-    CancelToken, CloneOptions, FetchOptions, FetchTarget, ForceMode, GitError, GitErrorKind,
-    MergeOutcome, MergeOutcomeOrRebase, NoPrompter, OpContext, OpWarning, Progress, PullMode,
-    PullOptions, PushOptions, PushRefSpec, PushRefStatus, RebaseOutcome, RefreshSet, Result,
-    TagFetch, TagPush, network,
+    CancelToken, CloneOptions, FastForwardOutcome, FetchOptions, FetchTarget, ForceMode, GitError,
+    GitErrorKind, MergeOutcome, MergeOutcomeOrRebase, NoPrompter, OpContext, OpWarning, Progress,
+    PullMode, PullOptions, PushOptions, PushRefSpec, PushRefStatus, RebaseOutcome, RefreshSet,
+    Result, TagFetch, TagPush, network,
 };
 use support::{TestEnv, TestRepo};
 
@@ -579,6 +579,238 @@ fn pull_fast_forwards() {
         ),
         "fast-forward: {:?}",
         out.value
+    );
+}
+
+// ---- fetch_fast_forward: a pull of a branch that is not checked out ----
+
+/// `world()` plus a branch `feature` pushed with upstream tracking (HEAD stays on `main`), and a second clone that has
+/// `feature` checked out.
+fn feature_world() -> (World, TestRepo) {
+    let w = world();
+    w.work.git(&["branch", "-q", "feature"]);
+    w.work.git(&["push", "-q", "-u", "origin", "feature"]);
+    let other = w.other("other");
+    other.git(&["checkout", "-q", "-b", "feature", "origin/feature"]);
+    (w, other)
+}
+
+fn commit_and_push_feature(other: &TestRepo) {
+    other.write("o.txt", "from other\n");
+    other.commit_all("other");
+    other.git(&["push", "-q", "origin", "feature"]);
+}
+
+/// A commit on the work repository's `feature` while HEAD stays on `main`.
+fn commit_on_local_feature(w: &World) {
+    w.work.git(&["checkout", "-q", "feature"]);
+    w.work.write("w.txt", "from work\n");
+    w.work.commit_all("work");
+    w.work.git(&["checkout", "-q", "main"]);
+}
+
+fn rev(repo: &TestRepo, name: &str) -> String {
+    repo.git(&["rev-parse", name]).trim().to_owned()
+}
+
+fn fetch_fast_forward(
+    w: &World,
+    branch: &str,
+) -> Result<gitcthulhu_git::OpOutcome<FastForwardOutcome>> {
+    let repo = w.work.open();
+    let mut guard = w.work.exclusive(&repo);
+    network::fetch_fast_forward(
+        &repo,
+        guard.write_permission(),
+        &ctx_of(&w.work),
+        &full(branch),
+    )
+}
+
+#[test]
+fn fetch_fast_forward_moves_a_branch_that_is_not_checked_out() {
+    let (w, other) = feature_world();
+    commit_and_push_feature(&other);
+    let (main_before, feature_before) = (rev(&w.work, "main"), rev(&w.work, "feature"));
+
+    let out = fetch_fast_forward(&w, "refs/heads/feature").expect("fast-forward");
+
+    let remote_feature = rev(&other, "feature");
+    match out.value {
+        FastForwardOutcome::FastForwarded { from, to } => {
+            assert_eq!(from.to_string(), feature_before, "from is the old tip");
+            assert_eq!(to.to_string(), remote_feature, "to is the remote's tip");
+        }
+        value => panic!("expected a fast-forward, got {value:?}"),
+    }
+    assert_eq!(
+        rev(&w.work, "feature"),
+        remote_feature,
+        "the branch moved to the remote's tip"
+    );
+    assert_eq!(
+        rev(&w.work, "origin/feature"),
+        remote_feature,
+        "the remote-tracking ref was updated too"
+    );
+    assert_eq!(
+        w.work.git(&["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/main",
+        "nothing was checked out"
+    );
+    assert_eq!(
+        rev(&w.work, "main"),
+        main_before,
+        "the current branch did not move"
+    );
+    assert_eq!(
+        w.work.git(&["status", "--porcelain"]),
+        "",
+        "the worktree was not touched"
+    );
+    assert!(
+        out.refresh
+            .contains(RefreshSet::BRANCHES | RefreshSet::REMOTES | RefreshSet::LOG),
+        "the branch list, remotes and log change: {:?}",
+        out.refresh
+    );
+}
+
+#[test]
+fn fetch_fast_forward_up_to_date() {
+    let (w, _other) = feature_world();
+    let out = fetch_fast_forward(&w, "refs/heads/feature").expect("nothing to do");
+    assert_eq!(
+        out.value,
+        FastForwardOutcome::UpToDate,
+        "the remote has nothing new"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_ahead_leaves_the_branch() {
+    let (w, _other) = feature_world();
+    commit_on_local_feature(&w);
+    let before = rev(&w.work, "feature");
+    let out = fetch_fast_forward(&w, "refs/heads/feature").expect("ahead is not an error");
+    assert_eq!(
+        out.value,
+        FastForwardOutcome::Ahead,
+        "only the local side has commits"
+    );
+    assert_eq!(
+        rev(&w.work, "feature"),
+        before,
+        "the branch did not move back"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_diverged_fetches_but_leaves_the_branch() {
+    let (w, other) = feature_world();
+    commit_and_push_feature(&other);
+    commit_on_local_feature(&w);
+    let before = rev(&w.work, "feature");
+    let out = fetch_fast_forward(&w, "refs/heads/feature").expect("divergence is not an error");
+    assert_eq!(
+        out.value,
+        FastForwardOutcome::Diverged,
+        "both sides have commits"
+    );
+    assert_eq!(
+        out.log.commands.len(),
+        1,
+        "the rejected fetch's command stays in the outcome's log"
+    );
+    assert_eq!(
+        rev(&w.work, "feature"),
+        before,
+        "the branch stayed where it was"
+    );
+    assert_eq!(
+        rev(&w.work, "origin/feature"),
+        rev(&other, "feature"),
+        "the remote's commits were fetched all the same"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_diverged_with_compact_output_and_another_local_name() {
+    let (w, other) = feature_world();
+    // A local branch named differently from its remote branch: compact output would print `team/*`.
+    w.work.git(&["config", "fetch.output", "compact"]);
+    w.work
+        .git(&["branch", "-q", "--track", "team/feature", "origin/feature"]);
+    w.work.git(&["checkout", "-q", "team/feature"]);
+    w.work.write("w.txt", "from work\n");
+    w.work.commit_all("work");
+    w.work.git(&["checkout", "-q", "main"]);
+    commit_and_push_feature(&other);
+    let before = rev(&w.work, "team/feature");
+    let out = fetch_fast_forward(&w, "refs/heads/team/feature")
+        .expect("the rejection is recognised whatever fetch.output says");
+    assert_eq!(
+        out.value,
+        FastForwardOutcome::Diverged,
+        "both sides have commits"
+    );
+    assert_eq!(
+        rev(&w.work, "team/feature"),
+        before,
+        "the branch stayed where it was"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_keeps_other_failures() {
+    let (w, other) = feature_world();
+    // The remote moves a tag the work repository has, and every fetch of origin fetches all tags.
+    w.work.git(&["tag", "v1"]);
+    w.work.git(&["config", "remote.origin.tagOpt", "--tags"]);
+    commit_and_push_feature(&other);
+    other.git(&["tag", "v1"]);
+    other.git(&["push", "-q", "origin", "v1"]);
+    commit_on_local_feature(&w);
+    let result = fetch_fast_forward(&w, "refs/heads/feature");
+    let err = result.expect_err("a rejected tag is a failure even when the branch only diverged");
+    assert!(
+        err.stderr()
+            .is_some_and(|stderr| stderr.contains("would clobber existing tag")),
+        "the tag's rejection is reported: {err:?}"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_refuses_the_checked_out_branch() {
+    let w = world();
+    let other = w.other("other");
+    other.write(
+        "o.txt", "o
+",
+    );
+    other.commit_all("other");
+    other.git(&["push", "-q", "origin", "main"]);
+    let before = rev(&w.work, "main");
+    let result = fetch_fast_forward(&w, "refs/heads/main");
+    assert!(
+        result.is_err(),
+        "Git refuses to fetch into the checked-out branch: {result:?}"
+    );
+    assert_eq!(
+        rev(&w.work, "main"),
+        before,
+        "the checked-out branch did not move"
+    );
+}
+
+#[test]
+fn fetch_fast_forward_without_upstream_is_no_upstream() {
+    let w = world();
+    w.work.git(&["branch", "-q", "lonely"]);
+    assert_kind(
+        fetch_fast_forward(&w, "refs/heads/lonely"),
+        GitErrorKind::NoUpstream,
+        "a branch without an upstream has nothing to pull",
     );
 }
 

@@ -93,6 +93,11 @@ impl Frame {
     }
 }
 
+/// Whether a commit row of the log is a stash (selected as `Selection::Stash` when listed).
+pub fn is_stash_row(row: &LogRow) -> bool {
+    row.commit.as_ref().is_some_and(|c| c.is_stash) || row.graph.kind == NodeKind::Stash
+}
+
 /// The current time.
 pub fn now() -> GitTime {
     let seconds = std::time::SystemTime::now()
@@ -298,10 +303,12 @@ impl LogView {
         self.row_shell(ix, f.selected == Selected::Uncommitted, f)
             .child(Self::graph_cell(f).child(node))
             .child(message)
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.ctx
                     .ui
                     .update(cx, |ui, cx| ui.select(Selection::UncommittedChanges, cx));
+                // Up / Down move the selection from here on.
+                window.focus(&this.focus, cx);
             }))
             .test_support()
             .into_any_element()
@@ -402,7 +409,7 @@ impl LogView {
     ) -> AnyElement {
         let t = f.tokens;
         let id = commit.id;
-        let is_stash = commit.is_stash || row.graph.kind == NodeKind::Stash;
+        let is_stash = is_stash_row(row);
         let selected = f.selected == Selected::Commit(id);
         let matched = f.search.as_ref().is_some_and(|s| s.active && s.matches(ix));
         let dimmed = f.search.as_ref().is_some_and(|s| s.active) && !matched;
@@ -491,8 +498,10 @@ impl LogView {
         self.row_shell(ix, selected, f)
             .child(Self::graph_cell(f).child(node))
             .child(message)
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.select_commit(id, is_stash, ix, cx);
+                // Up / Down move the selection from here on.
+                window.focus(&this.focus, cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,

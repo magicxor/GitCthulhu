@@ -1405,6 +1405,94 @@ fn clicking_rows_selects(cx: &mut TestAppContext) {
     );
 }
 
+fn press(cx: &mut TestAppContext, handle: AnyWindowHandle, key: &str) {
+    frame(cx, handle, |window, cx| window.press(key, cx));
+    cx.run_until_parked();
+}
+
+fn commit_selection(id: ObjectId) -> crate::tab::ui::Selection {
+    crate::tab::ui::Selection::Commit {
+        id,
+        is_stash: false,
+        scroll_to: false,
+    }
+}
+
+/// Up / Down move the selection to the neighbouring row after a click on a row (stash rows select the stash, the
+/// uncommitted row the uncommitted changes); at either end of the list the selection stays put.
+#[gpui_kit::test]
+fn arrow_keys_move_the_commit_selection(cx: &mut TestAppContext) {
+    let seed = RepoSeed::branchy().with_changes(&[], &[("a.txt", ChangeKind::Modified)]);
+    let (handle, _app, tab) = mount_seeded(cx, seed, DEFAULT_SIZE);
+    let ui = ui_of(&tab, cx);
+    let selection = |cx: &mut TestAppContext| cx.update(|cx| ui.read(cx).selection.clone());
+    frame(cx, handle, |window, cx| {
+        window.click((ids::MESSAGE, 3usize), cx)
+    });
+    assert_eq!(selection(cx), commit_selection(oid(12)));
+    press(cx, handle, "down");
+    assert_eq!(
+        selection(cx),
+        crate::tab::ui::Selection::Stash {
+            id: oid(13),
+            index: 0
+        },
+        "Down onto a stash row selects the stash"
+    );
+    press(cx, handle, "up");
+    press(cx, handle, "up");
+    assert_eq!(selection(cx), commit_selection(oid(11)));
+    press(cx, handle, "up");
+    press(cx, handle, "up");
+    assert_eq!(selection(cx), crate::tab::ui::Selection::UncommittedChanges);
+    press(cx, handle, "up");
+    assert_eq!(
+        selection(cx),
+        crate::tab::ui::Selection::UncommittedChanges,
+        "Up on the first row keeps it"
+    );
+    press(cx, handle, "down");
+    assert_eq!(selection(cx), commit_selection(oid(10)));
+    for _ in 0..6 {
+        press(cx, handle, "down");
+    }
+    assert_eq!(
+        selection(cx),
+        commit_selection(oid(15)),
+        "Down on the last row keeps it"
+    );
+}
+
+/// Without the uncommitted row Up stops at the first commit; a click on a chip also gives the list the focus.
+#[gpui_kit::test]
+fn arrow_keys_after_a_chip_click_stop_at_the_first_commit(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::branchy(), DEFAULT_SIZE);
+    let ui = ui_of(&tab, cx);
+    let selection = |cx: &mut TestAppContext| cx.update(|cx| ui.read(cx).selection.clone());
+    frame(cx, handle, |window, cx| window.click(ids::chip(2, 0), cx));
+    assert_eq!(selection(cx), commit_selection(oid(11)));
+    press(cx, handle, "down");
+    assert_eq!(selection(cx), commit_selection(oid(12)));
+    press(cx, handle, "up");
+    press(cx, handle, "up");
+    press(cx, handle, "up");
+    assert_eq!(
+        selection(cx),
+        commit_selection(oid(10)),
+        "the hidden uncommitted row is not selectable"
+    );
+}
+
+/// The arrows do nothing while the list does not have the focus.
+#[gpui_kit::test]
+fn arrow_keys_need_the_focus(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::branchy(), DEFAULT_SIZE);
+    let ui = ui_of(&tab, cx);
+    let before = cx.update(|cx| ui.read(cx).selection.clone());
+    press(cx, handle, "down");
+    assert_eq!(cx.update(|cx| ui.read(cx).selection.clone()), before);
+}
+
 // ── history operations (21 §2.9, §2.11) ─────────────────────────────────────────────────────────────
 
 #[gpui_kit::test]

@@ -18,7 +18,7 @@ use crate::settings;
 use crate::status_pane::commit_box::{self, CommitBox};
 use crate::tab::RepoTab;
 use crate::tab::ops::OpKind;
-use crate::test_support::geometry::{assert_height, bounds};
+use crate::test_support::geometry::{assert_height, assert_painted_on_top, bounds};
 use crate::test_support::{
     DEFAULT_SIZE, Fixture, RepoSeed, mount_fixture, mount_seeded, toast_texts,
 };
@@ -949,6 +949,25 @@ fn pick_provider(cx: &mut TestAppContext, handle: AnyWindowHandle, index: usize)
         handle,
         settings_dialog::ids::select_option(page::ids::PROVIDER, index),
     );
+}
+
+#[gpui_kit::test]
+fn provider_popup_is_painted_over_the_dialog(cx: &mut TestAppContext) {
+    let (handle, _app, _tab) = mount_seeded(cx, RepoSeed::linear(1), DEFAULT_SIZE);
+    start_services(cx);
+    open_ai_page(cx, handle);
+    click(
+        cx,
+        handle,
+        settings_dialog::ids::select(page::ids::PROVIDER),
+    );
+    cx.update_window(handle, |_, window, _| {
+        assert_painted_on_top(
+            window,
+            settings_dialog::ids::select_popup(page::ids::PROVIDER),
+        );
+    })
+    .expect("window");
 }
 
 #[gpui_kit::test]

@@ -12,7 +12,9 @@ use super::*;
 use crate::app_view::AppView;
 use crate::backend::{GitStatus, GitTime};
 use crate::settings::{AvatarProvider, LinesHeight, ProxyType, Settings};
-use crate::test_support::geometry::{assert_height, assert_rect, assert_width, bounds};
+use crate::test_support::geometry::{
+    assert_height, assert_painted_on_top, assert_rect, assert_width, bounds,
+};
 use crate::test_support::{
     DEFAULT_SIZE, RepoSeed, calls, init_app, mount_seeded, open_app, toast_texts, window_size,
 };
@@ -1338,6 +1340,33 @@ fn dropdown_popup_uses_the_menu_chrome(cx: &mut TestAppContext) {
             (trigger.size.height.as_f32() - 40.).abs() <= 0.5,
             "{trigger:?}"
         );
+    })
+    .expect("window");
+}
+
+#[gpui_kit::test]
+fn dropdown_popups_are_painted_over_the_dialog(cx: &mut TestAppContext) {
+    // The dialog is a deferred layer of its own: a popup of a lower priority took the clicks but stayed hidden
+    // under it.
+    let (handle, _) = open_settings(cx, window_size(1280., 800.), None);
+    for key in ["theme", "scale"] {
+        click(cx, handle, ids::select(key));
+        cx.update_window(handle, |_, window, cx| {
+            assert_painted_on_top(window, ids::select_popup(key));
+            window.press("escape", cx);
+        })
+        .expect("window");
+        render(cx, handle);
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[gpui_kit::test]
+fn shell_popup_is_painted_over_the_dialog(cx: &mut TestAppContext) {
+    let (handle, _) = open_settings(cx, window_size(1280., 800.), Some(SettingsPage::Terminal));
+    click(cx, handle, ids::select(terminal::SHELL));
+    cx.update_window(handle, |_, window, _| {
+        assert_painted_on_top(window, ids::select_popup(terminal::SHELL));
     })
     .expect("window");
 }

@@ -9,7 +9,7 @@
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
     AnyElement, AnyWindowHandle, AppContext as _, Bounds, Context, ElementId, Entity, IntoElement,
-    Pixels, Render, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
+    Pixels, Point, Render, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 
 /// Tolerance of the layout assertions in pixels.
@@ -83,6 +83,63 @@ pub fn assert_above(window: &Window, a: impl Into<ElementId>, b: impl Into<Eleme
     assert!(
         (actual - gap).abs() <= TOLERANCE,
         "{a:?} ({ba:?}) and {b:?} ({bb:?}) are {actual} apart vertically, expected {gap}"
+    );
+}
+
+/// Asserts that `id`, an element with a background of its own, is painted over every quad that covers all of it
+/// (a dialog's surface and overlay). Hit testing alone cannot tell: a deferred popup takes the pointer even when
+/// a layer of higher priority (a dialog) is painted over it.
+#[track_caller]
+pub fn assert_painted_on_top(window: &Window, id: impl Into<ElementId>) {
+    let id = id.into();
+    let b = bounds(window, id.clone());
+    let scale = window.scale_factor();
+    // The element's rectangle in the scene's scaled pixels, as (left, top, right, bottom).
+    let edges = |o: Point<f32>, s: gpui_kit::Size<f32>| (o.x, o.y, o.x + s.width, o.y + s.height);
+    let own = edges(
+        point(b.origin.x.as_f32() * scale, b.origin.y.as_f32() * scale),
+        size(
+            b.size.width.as_f32() * scale,
+            b.size.height.as_f32() * scale,
+        ),
+    );
+    let tolerance = TOLERANCE * scale;
+    let quads: Vec<_> = window
+        .painted_quads()
+        .into_iter()
+        .map(|q| {
+            let r = edges(
+                point(q.bounds.origin.x.0, q.bounds.origin.y.0),
+                size(q.bounds.size.width.0, q.bounds.size.height.0),
+            );
+            (q.order, r)
+        })
+        .collect();
+    let same = |r: (f32, f32, f32, f32)| {
+        (r.0 - own.0).abs() <= tolerance
+            && (r.1 - own.1).abs() <= tolerance
+            && (r.2 - own.2).abs() <= tolerance
+            && (r.3 - own.3).abs() <= tolerance
+    };
+    let covers = |r: (f32, f32, f32, f32)| {
+        r.0 <= own.0 + tolerance
+            && r.1 <= own.1 + tolerance
+            && r.2 >= own.2 - tolerance
+            && r.3 >= own.3 - tolerance
+    };
+    let painted = quads
+        .iter()
+        .filter(|(_, r)| same(*r))
+        .map(|(order, _)| *order)
+        .max()
+        .unwrap_or_else(|| panic!("{id:?} ({b:?}) paints no background of its own"));
+    let over: Vec<_> = quads
+        .iter()
+        .filter(|(order, r)| *order > painted && covers(*r) && !same(*r))
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{id:?} ({b:?}) is painted under quads covering it (order, scaled edges): {over:?}"
     );
 }
 

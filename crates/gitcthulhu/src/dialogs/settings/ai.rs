@@ -28,6 +28,7 @@ mod imp {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    use gpui_kit::base::POPUP_PRIORITY;
     use gpui_kit::prelude::FluentBuilder as _;
     use gpui_kit::{
         AnyElement, App, AppContext as _, BoxShadow, Context, Entity, Global,
@@ -537,7 +538,8 @@ mod imp {
 
         // ── rendering ────────────────────────────────────────────────────────────────────────
 
-        /// A dropdown (the look of the other pages' dropdowns: 180 dp box, the popup drawn inside the dialog).
+        /// A dropdown (the look of the other pages' dropdowns: 180 dp box, the popup drawn from inside the dialog,
+        /// over it).
         fn select(
             &mut self,
             key: &'static str,
@@ -653,7 +655,7 @@ mod imp {
                             ),
                     ),
                 )
-                .with_priority(1)
+                .with_priority(POPUP_PRIORITY)
             });
             div()
                 .relative()

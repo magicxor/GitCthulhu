@@ -27,7 +27,9 @@ use crate::dialogs::{about, signoff, stash, submodule, tag};
 use crate::dialogs::{author, branch, choice, clone, confirm, credentials, error, remote, reset};
 use crate::metrics::dialogs as m;
 use crate::tab::ops::OpKind;
-use crate::test_support::geometry::{assert_height, assert_width, bounds, init_visual, open_probe};
+use crate::test_support::geometry::{
+    assert_height, assert_painted_on_top, assert_width, bounds, init_visual, open_probe,
+};
 use crate::test_support::seed::{full, oid};
 use crate::test_support::{
     DEFAULT_SIZE, Fixture, RepoSeed, TestCall, calls, inert_tab_ctx, mount_fixture, mount_seeded,
@@ -1225,6 +1227,10 @@ fn change_upstream_dialog_preselects_and_filters(cx: &mut TestAppContext) {
     );
     // Open the branch dropdown: `HEAD` of the other remote is excluded and the tracking branch is listed.
     click(cx, handle, "upstream-branch-button");
+    cx.update_window(handle, |_, window, _| {
+        assert_painted_on_top(window, "upstream-branch-popup");
+    })
+    .expect("window");
     assert!(
         present(cx, handle, "upstream-branch-option-0"),
         "the tracking branch is listed"

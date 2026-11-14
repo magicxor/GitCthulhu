@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
+use gpui_kit::base::POPUP_PRIORITY;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, ElementId, Entity, EventEmitter,
@@ -370,7 +371,8 @@ impl Render for FilterDropdown {
                         ),
                 ),
             )
-            .with_priority(1)
+            // Above the kit dialog's layer (priority 10 and up), which hosts every `FilterDropdown`.
+            .with_priority(POPUP_PRIORITY)
             .into_any_element()
         });
         // The unstyled wrapper carries the bounds tracker, so the popup hangs from the trigger's border box.

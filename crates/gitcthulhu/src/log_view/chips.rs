@@ -344,6 +344,7 @@ impl LogView {
                         // checks the ref out. The chip handles the click, so the row's listener does not run again.
                         cx.stop_propagation();
                         this.select_commit(click_chip.target, false, row, cx);
+                        window.focus(&this.focus, cx);
                         if ev.click_count() >= 2 {
                             this.checkout_chip(&click_chip, window, cx);
                         }

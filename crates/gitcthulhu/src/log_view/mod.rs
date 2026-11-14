@@ -4,17 +4,19 @@
 //!
 //! Data comes only from `RepoModel` / `RepoUi` (layout row 0 is always the synthetic uncommitted row; while it is
 //! hidden visible index `v` = layout row `v + 1`). Rows render from `ChunkedRows` by index; there are no per-row
-//! entities. Operations start from event handlers through `TabCtx::with_tab`.
+//! entities. Operations start from event handlers through `TabCtx::with_tab`. After a click on a row the list has the
+//! keyboard focus: Up / Down select the previous / next row like a click does.
 
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, DragMoveEvent, InteractiveElement as _, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Pixels, Render, ScrollDelta,
-    ScrollStrategy, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _, Subscription,
-    TestSupportExt as _, UniformListScrollHandle, Window, div, point, px, uniform_list,
+    App, AppContext as _, Context, DragMoveEvent, FocusHandle, InteractiveElement as _,
+    IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Pixels,
+    Render, ScrollDelta, ScrollStrategy, ScrollWheelEvent, StatefulInteractiveElement as _,
+    Styled as _, Subscription, TestSupportExt as _, UniformListScrollHandle, Window, div, point,
+    px, uniform_list,
 };
 
 use crate::backend::{InProgress, ObjectId, RefreshSet, Status};
@@ -41,6 +43,19 @@ mod tests;
 use chips::ChipIndex;
 use graph::{GraphDecoration, LANE_W};
 use rows::{DateCache, Frame, Selected, UncommittedInfo};
+
+/// Key context of the list area (Up / Down move the selection).
+pub const LOG_LIST_CONTEXT: &str = "LogList";
+
+gpui_kit::actions!(
+    gitcthulhu_log,
+    [
+        /// Selects the previous row of the log (Up).
+        SelectPreviousCommit,
+        /// Selects the next row of the log (Down).
+        SelectNextCommit,
+    ]
+);
 
 /// Element ids of the log view.
 pub mod ids {
@@ -153,6 +168,9 @@ struct GraphDrag;
 pub struct LogView {
     ctx: TabCtx,
     scroll: UniformListScrollHandle,
+    /// Keyboard focus of the list (taken by a click on a row); a zero-size target, so it is not an ancestor of the
+    /// search field.
+    focus: FocusHandle,
     /// Horizontal graph scroll in pixels (fix of 08 §9.2: never dp).
     hscroll: Pixels,
     /// The largest horizontal scroll of the last frame.
@@ -206,6 +224,7 @@ impl LogView {
         Self {
             ctx,
             scroll: UniformListScrollHandle::new(),
+            focus: cx.focus_handle(),
             hscroll: px(0.),
             hscroll_max: px(0.),
             drag: None,
@@ -290,6 +309,48 @@ impl LogView {
     /// Scrolls to the first row (the pill, 08 §2.10).
     pub fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
         self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Up / Down: selects the previous / next row like a click and scrolls it into view. At either end of the loaded
+    /// rows the selection stays put (scrolling to the last rows loads the next page); a selection that is not in the
+    /// list moves to the first row.
+    fn move_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let (target, offset, commit) = {
+            let model = self.ctx.model.read(cx);
+            let Some(snapshot) = model.log.value.as_ref() else {
+                return;
+            };
+            let offset = Self::visible_offset(model);
+            let from = match &self.ctx.ui.read(cx).selection {
+                Selection::UncommittedChanges => (offset == 0).then_some(0),
+                other => other.commit().and_then(|(id, _)| {
+                    snapshot
+                        .rows
+                        .position(|r| r.commit.as_ref().is_some_and(|c| c.id == id))
+                }),
+            };
+            let target = match from {
+                Some(from) if forward => from + 1,
+                Some(from) if from > offset => from - 1,
+                Some(_) => return,
+                None => offset,
+            };
+            let Some(row) = snapshot.rows.get(target) else {
+                return;
+            };
+            let commit = row.commit.as_ref().map(|c| (c.id, rows::is_stash_row(row)));
+            (target, offset, commit)
+        };
+        match commit {
+            Some((id, is_stash)) => self.select_commit(id, is_stash, target, cx),
+            None => self
+                .ctx
+                .ui
+                .update(cx, |ui, cx| ui.select(Selection::UncommittedChanges, cx)),
+        }
+        self.scroll
+            .scroll_to_item(target - offset, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -775,9 +836,17 @@ impl Render for LogView {
             .flex_1()
             .min_h_0()
             .w_full()
+            .key_context(LOG_LIST_CONTEXT)
+            .on_action(
+                cx.listener(|this, _: &SelectPreviousCommit, _, cx| this.move_selection(false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectNextCommit, _, cx| this.move_selection(true, cx)),
+            )
             .on_scroll_wheel(
                 cx.listener(|this, ev: &ScrollWheelEvent, _, cx| this.on_wheel(ev, cx)),
             )
+            .child(div().track_focus(&self.focus).size_0())
             .children(list)
             .child(list_scrollbar(ids::LIST_SCROLLBAR, &self.scroll))
             .child(
@@ -826,9 +895,12 @@ impl Render for LogView {
     }
 }
 
-/// Registers the log's key bindings (search navigation in the `LogSearch` context).
+/// Registers the log's key bindings: search navigation in the `LogSearch` context, Up / Down in
+/// [`LOG_LIST_CONTEXT`].
 pub fn register(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("up", SelectPreviousCommit, Some(LOG_LIST_CONTEXT)),
+        KeyBinding::new("down", SelectNextCommit, Some(LOG_LIST_CONTEXT)),
         KeyBinding::new(
             "enter",
             search::LogSearchNext,

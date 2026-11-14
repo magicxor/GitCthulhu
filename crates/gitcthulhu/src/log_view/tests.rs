@@ -211,9 +211,9 @@ fn compact_rows_are_34(cx: &mut TestAppContext) {
 /// (fix of 08 §9.3).
 #[gpui_kit::test]
 fn graph_width_clamp_and_drag(cx: &mut TestAppContext) {
-    assert_eq!(graph_width(0.), 120.);
-    assert_eq!(graph_width(-50.), 100.);
-    assert_eq!(clamp_padding(-50.), -20.);
+    assert_eq!(graph_width_from(120., 0.), 120.);
+    assert_eq!(graph_width_from(120., -50.), 100.);
+    assert_eq!(clamp_padding_from(120., -50.), -20.);
     assert_eq!(graph_real_width(120., None), 120., "empty log: 2 + 2 lanes");
     assert_eq!(graph_real_width(120., Some(0)), 120.);
     assert_eq!(graph_real_width(120., Some(6)), 240.);
@@ -1839,6 +1839,43 @@ fn wide_graphs_open_with_a_column_that_fits_their_lanes(cx: &mut TestAppContext)
         );
         assert_width(window, ids::HEADER_GRAPH, wanted);
     });
+}
+
+/// A drag starts from the width on screen: narrowing a fitted (wider than 120 dp) column and pressing its divider
+/// again does not jump back towards the default.
+#[gpui_kit::test]
+fn a_second_drag_of_a_wide_graph_starts_from_its_current_width(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, RepoSeed::branchy(), DEFAULT_SIZE);
+    cx.update(|cx| {
+        let model = tab.read(cx).ctx().model.clone();
+        model.update(cx, |m, cx| {
+            let wide = m.log.value.as_ref().map(|s| LogSnapshot {
+                rows: s.rows.clone(),
+                max_lane: 5,
+                exhausted: s.exhausted,
+                generation: s.generation,
+            });
+            m.log.value = wide.map(std::sync::Arc::new);
+            cx.notify();
+        });
+    });
+    frame(cx, handle, |_, _| ());
+    frame(cx, handle, |window, _| {
+        assert_width(window, ids::HEADER_GRAPH, 210.);
+    });
+    for (divider, dx, wanted) in [
+        (ids::HEADER_DIVIDER, -100., 110.),
+        (ids::HEADER_DIVIDER, 10., 120.),
+        (ids::LIST_DIVIDER, 15., 135.),
+    ] {
+        let centre = frame(cx, handle, |window, _| bounds(window, divider).center());
+        frame(cx, handle, |window, cx| {
+            window.drag(centre, point(centre.x + px(dx), centre.y), cx);
+        });
+        frame(cx, handle, |window, _| {
+            assert_width(window, ids::HEADER_GRAPH, wanted);
+        });
+    }
 }
 
 /// The corner radii (in dp) of an element's style: top-left, top-right, bottom-right, bottom-left.

@@ -116,22 +116,14 @@ pub mod ids {
     }
 }
 
-/// Width of the graph column for a drag padding (08 §2.2): `max(100, 120 + padding)`.
-pub fn graph_width(padding: f32) -> f32 {
-    graph_width_from(m::GRAPH_DEFAULT_W, padding)
-}
-
-/// Width of the graph column for a drag padding on top of `default_w` (see [`default_graph_width`]).
+/// Width of the graph column for a drag padding on top of `default_w` (08 §2.2, see [`default_graph_width`]):
+/// `max(100, default_w + padding)`.
 pub fn graph_width_from(default_w: f32, padding: f32) -> f32 {
     (default_w + padding).max(m::GRAPH_MIN_W)
 }
 
-/// The padding accumulator, clamped so that dragging below the minimum width leaves no dead zone (fix of 08 §9.3).
-pub fn clamp_padding(padding: f32) -> f32 {
-    clamp_padding_from(m::GRAPH_DEFAULT_W, padding)
-}
-
-/// [`clamp_padding`] for a column whose default width is `default_w`.
+/// The padding accumulator of a column whose default width is `default_w`, clamped so that dragging below the
+/// minimum width leaves no dead zone (fix of 08 §9.3).
 pub fn clamp_padding_from(default_w: f32, padding: f32) -> f32 {
     padding.max(m::GRAPH_MIN_W - default_w)
 }
@@ -396,7 +388,10 @@ impl LogView {
 
     fn on_divider_press(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
         let padding = self.ctx.ui.read(cx).graph_padding;
-        self.drag = Some((ev.position.x, clamp_padding(padding)));
+        self.drag = Some((
+            ev.position.x,
+            clamp_padding_from(self.graph_default, padding),
+        ));
     }
 
     fn on_divider_drag(&mut self, x: Pixels, window: &mut Window, cx: &mut Context<Self>) {

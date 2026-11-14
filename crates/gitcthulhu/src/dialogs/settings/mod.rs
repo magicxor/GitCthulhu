@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
+use gpui_kit::base::POPUP_PRIORITY;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -845,7 +846,9 @@ impl SettingsView {
 
     /// A dropdown (09 §0.3 `DropDownMenuText`): a 180 dp box showing `current`; clicking opens the options.
     ///
-    /// The popup is drawn inside the dialog: the window's menu layer lies underneath the dialog layer.
+    /// The popup is drawn from inside the dialog: the window's menu layer lies underneath the dialog layer. Deferred
+    /// draws are painted by priority across the window and the kit dialog's own priority is 10 and up, so the popup
+    /// takes the kit's `POPUP_PRIORITY`: with a lower one it is hidden under the dialog yet still takes the clicks.
     fn select(
         &mut self,
         key: &'static str,
@@ -966,7 +969,7 @@ impl SettingsView {
                         ),
                 ),
             )
-            .with_priority(1)
+            .with_priority(POPUP_PRIORITY)
         });
         div()
             .relative()

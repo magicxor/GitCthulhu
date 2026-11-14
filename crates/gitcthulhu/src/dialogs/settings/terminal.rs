@@ -19,6 +19,7 @@ pub fn page(_window: &mut Window, _cx: &mut App) -> AnyElement {
 
 #[cfg(feature = "terminal")]
 mod rows {
+    use gpui_kit::base::POPUP_PRIORITY;
     use gpui_kit::prelude::FluentBuilder as _;
     use gpui_kit::{
         AnyElement, App, AppContext as _, BoxShadow, Context, Entity, InteractiveElement as _,
@@ -174,7 +175,7 @@ mod rows {
     }
 
     /// The Shell dropdown (09 §0.3 `DropDownMenuText`, as the dialog's other dropdowns): a 180 dp box showing the
-    /// choice; its options pop up below it, drawn inside the dialog.
+    /// choice; its options pop up below it, drawn from inside the dialog, over it.
     fn shell_select(
         state: &Entity<PageState>,
         current: &TerminalShell,
@@ -274,7 +275,7 @@ mod rows {
                     .children(rows)
                     .test_support(),
             )
-            .with_priority(1)
+            .with_priority(POPUP_PRIORITY)
         });
         div()
             .relative()

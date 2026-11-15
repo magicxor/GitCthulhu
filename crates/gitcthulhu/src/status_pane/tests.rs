@@ -1155,12 +1155,22 @@ fn menu_items_copy_and_reveal_through_the_platform(cx: &mut TestAppContext) {
     assert_eq!(copied.len(), 2);
     let absolute = std::path::PathBuf::from(&copied[0]);
     assert!(absolute.is_absolute(), "absolute path: {absolute:?}");
+    // Compared as text: `Path::ends_with` compares components and would accept Git's `/` inside a Windows path,
+    // which the Windows shell rejects ("Open file in folder" did nothing).
+    let tail = format!("dir{}a.txt", std::path::MAIN_SEPARATOR);
+    assert!(copied[0].ends_with(&tail), "{:?}", copied[0]);
     assert!(
-        absolute.ends_with(std::path::Path::new("dir").join("a.txt")),
-        "{absolute:?}"
+        !cfg!(windows) || !copied[0].contains('/'),
+        "only native separators: {:?}",
+        copied[0]
     );
     assert_eq!(copied[1], "dir/a.txt", "the relative path is Git's");
-    assert_eq!(REVEALED.with(|c| c.borrow().len()), 1);
+    let revealed = REVEALED.with(|c| c.borrow().clone());
+    assert_eq!(
+        revealed.iter().map(|p| p.as_os_str()).collect::<Vec<_>>(),
+        [std::ffi::OsStr::new(&copied[0])],
+        "the revealed path is the copied one"
+    );
     let _ = tab;
 }
 

@@ -42,9 +42,13 @@ pub fn copy_text(cx: &mut App, text: &str) {
     }
 }
 
-/// The absolute path of the repository-relative `path` below `workdir`.
+/// The absolute path of the repository-relative `path` below `workdir`, with the platform's separators only (Git's
+/// `/` left inside a Windows path makes the shell reject it: "Open file in folder" did nothing).
 pub fn absolute_path(workdir: &Path, path: &RelaPath) -> PathBuf {
-    workdir.join(path.as_bytes().to_path_lossy())
+    workdir
+        .join(path.as_bytes().to_path_lossy())
+        .components()
+        .collect()
 }
 
 /// What "Open file in folder" shows.

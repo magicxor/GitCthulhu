@@ -1402,6 +1402,33 @@ fn tag_menu_without_remotes(cx: &mut TestAppContext) {
     assert_eq!(item_ids(&items), ["tag-checkout", "---", "tag-delete"]);
 }
 
+/// A remote entry without URLs (the leftover tracking refs of a deleted remote) gets no "Delete from" item: the
+/// remote is not configured, so the push would fail.
+#[gpui_kit::test]
+fn tag_menu_skips_unconfigured_remotes(cx: &mut TestAppContext) {
+    let mut seed = refs_seed();
+    let upstream = &mut seed.refs.remotes[1];
+    assert_eq!(upstream.name, "upstream");
+    (upstream.fetch_url, upstream.push_url) = (None, None);
+    let (_handle, _app, tab) = mount_seeded(cx, seed, DEFAULT_SIZE);
+    let tag_info = model_refs(&tab, cx).tags[0].clone();
+    let items = menu_of(
+        &tab,
+        cx,
+        |c, _| refs::tag_target(c, tag_info.full.clone(), tag_info.target),
+        refs::tag,
+    );
+    assert_eq!(
+        item_ids(&items),
+        [
+            "tag-checkout",
+            "---",
+            "tag-delete",
+            "tag-delete-remote-origin"
+        ]
+    );
+}
+
 /// The tag, stash, remote and submodule menus (07 §6.6, 09 §4.2-4.5).
 #[gpui_kit::test]
 fn other_ref_menus(cx: &mut TestAppContext) {
@@ -1421,8 +1448,8 @@ fn other_ref_menus(cx: &mut TestAppContext) {
             "tag-checkout",
             "---",
             "tag-delete",
-            "tag-delete-remote",
-            "tag-delete-remote"
+            "tag-delete-remote-origin",
+            "tag-delete-remote-upstream"
         ]
     );
     assert_eq!(
@@ -1645,8 +1672,8 @@ fn branch_menu_calls_extender_slots(cx: &mut TestAppContext) {
             "tag-checkout",
             "---",
             "tag-delete",
-            "tag-delete-remote",
-            "tag-delete-remote",
+            "tag-delete-remote-origin",
+            "tag-delete-remote-upstream",
             "x-end"
         ]
     );

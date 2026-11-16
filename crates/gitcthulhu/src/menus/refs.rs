@@ -31,7 +31,7 @@ type TabCall = Rc<dyn Fn(&mut RepoTab, &mut Window, &mut Context<RepoTab>)>;
 
 /// An action that runs `f` on the tab of `tab` (the menu closes first, then the call runs).
 fn on_tab(
-    id: &'static str,
+    id: impl Into<gpui_kit::SharedString>,
     label: impl Into<gpui_kit::SharedString>,
     tab: &TabCtx,
     f: impl Fn(&mut RepoTab, &mut Window, &mut Context<RepoTab>) + 'static,
@@ -534,21 +534,28 @@ pub fn tag(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
             })
             .with_icon(AppIcon::Delete),
         );
-        // Tags have no remote-tracking refs: every remote is offered (Git reports a tag the remote lacks).
+        // Tags have no remote-tracking refs: every configured remote is offered (Git reports a tag the remote
+        // lacks). Entries without a URL only group the leftover tracking refs of a deleted remote.
         let remotes: Vec<String> = {
             let model = tab.model.read(cx);
             model
                 .refs
                 .value
                 .as_ref()
-                .map(|refs| refs.remotes.iter().map(|r| r.name.clone()).collect())
+                .map(|refs| {
+                    refs.remotes
+                        .iter()
+                        .filter(|r| r.fetch_url.is_some() || r.push_url.is_some())
+                        .map(|r| r.name.clone())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         for remote in remotes {
             let (r, n) = (remote.clone(), name.clone());
             items.push(
                 on_tab(
-                    "tag-delete-remote",
+                    format!("tag-delete-remote-{remote}"),
                     format!("Delete from \"{remote}\""),
                     tab,
                     move |t, w, c| {

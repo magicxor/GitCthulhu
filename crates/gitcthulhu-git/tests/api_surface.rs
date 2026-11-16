@@ -131,6 +131,15 @@ fn public_functions_have_the_documented_signatures() {
         as fn(&Repo, &mut RepoExclusive, &OpContext, &SelectionRequest) -> Result<OpOutcome<()>>;
     let _ = stage::delete_untracked
         as fn(&Repo, &mut RepoExclusive, &OpContext, &[RelaPath], bool) -> Result<OpOutcome<()>>;
+    let _ = stage::restore_from_commit
+        as fn(
+            &Repo,
+            &mut RepoExclusive,
+            &OpContext,
+            ObjectId,
+            &RelaPath,
+            &RelaPath,
+        ) -> Result<OpOutcome<()>>;
     let _ = stage::nested_repositories as fn(&Repo, &[RelaPath]) -> Result<Vec<RelaPath>>;
     let _ = stage::resolve_conflict
         as fn(

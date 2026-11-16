@@ -3,8 +3,9 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    App, ClickEvent, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div,
+    App, ClickEvent, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, Window, div,
 };
 
 use super::ids;
@@ -62,12 +63,15 @@ impl HistoryItem {
 pub(super) struct RowEnv {
     pub tokens: Tokens,
     pub on_select: Rc<dyn Fn(usize, &mut Window, &mut App)>,
+    /// Right button press on row `ix`: opens its context menu.
+    pub on_menu: Rc<dyn Fn(usize, &MouseDownEvent, &mut Window, &mut App)>,
 }
 
 /// Row `ix` of the list.
 pub(super) fn row(env: &RowEnv, item: &HistoryItem, ix: usize) -> impl IntoElement + use<> {
     let t = &env.tokens;
     let on_select = env.on_select.clone();
+    let on_menu = env.on_menu.clone();
     let hover = t.hover_layer();
     div()
         .id((ids::HISTORY_ROW, ix))
@@ -80,6 +84,9 @@ pub(super) fn row(env: &RowEnv, item: &HistoryItem, ix: usize) -> impl IntoEleme
         .text_color(t.on_background)
         .hover(move |s| s.bg(hover))
         .on_click(move |_: &ClickEvent, window, cx| on_select(ix, window, cx))
+        .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+            on_menu(ix, ev, window, cx)
+        })
         .child(div().flex_none().px(dp(m::ROW_PAD_H)).child(Avatar::new(
             item.name.clone(),
             item.email.clone(),

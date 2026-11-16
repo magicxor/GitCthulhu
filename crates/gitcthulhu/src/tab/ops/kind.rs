@@ -20,6 +20,7 @@ pub enum OpKind {
     DiscardHunk,
     DiscardLine,
     DeleteFile,
+    RestoreFile,
     ResolveConflict,
     Commit,
     Amend,
@@ -78,7 +79,7 @@ pub enum OpKind {
 
 impl OpKind {
     /// Every kind (tests).
-    pub const ALL: [OpKind; 70] = {
+    pub const ALL: [OpKind; 71] = {
         use OpKind::*;
         [
             StageFile,
@@ -97,6 +98,7 @@ impl OpKind {
             DiscardHunk,
             DiscardLine,
             DeleteFile,
+            RestoreFile,
             ResolveConflict,
             Commit,
             Amend,
@@ -190,6 +192,11 @@ impl OpKind {
             DiscardHunk => ("Discarding hunk", None, "Discard hunk failed"),
             DiscardLine => ("Discarding line", None, "Discard line failed"),
             DeleteFile => ("Deleting file", Some("File deleted"), "Delete file failed"),
+            RestoreFile => (
+                "Restoring file",
+                Some("File restored"),
+                "Restore file failed",
+            ),
             ResolveConflict => (
                 "Resolving conflict",
                 Some("Conflict resolved"),

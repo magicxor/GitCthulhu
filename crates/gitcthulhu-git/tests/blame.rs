@@ -2,7 +2,10 @@
 
 mod support;
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use gitcthulhu_git::{
     BlameOptions, BlameResult, BlameRev, CancelToken, GitErrorKind, RelaPath, Repo, blame::blame,
@@ -521,16 +524,17 @@ fn cancel_returns_promptly() {
     );
 
     // The computation takes most of a second in a debug build (gix blame has no interrupt flag); a cancel 20 ms in
-    // must not wait for it.
+    // must not wait for it. The canceller reports when it really cancelled: a busy runner can oversleep the 20 ms by
+    // far, and a cancel that comes after the result has nothing left to interrupt.
     let token = CancelToken::new();
     let canceller = {
         let token = token.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             token.cancel();
+            Instant::now()
         })
     };
-    let started = std::time::Instant::now();
     let outcome = blame(
         &repo,
         &RelaPath::from("big.txt"),
@@ -542,28 +546,21 @@ fn cancel_returns_promptly() {
         },
         &token,
     );
-    let elapsed = started.elapsed();
-    canceller.join().expect("the canceller finishes");
-    match outcome {
-        Err(err) => {
-            assert_eq!(err.kind(), GitErrorKind::Cancelled, "cancelled: {err:?}");
-            assert!(
-                elapsed < Duration::from_millis(400),
-                "the call returns right after the cancel, without waiting for the computation: {elapsed:?}"
-            );
-        }
-        // An optimised build can finish the whole blame before the cancel arrives; a debug build takes far longer
-        // than 20 ms, so there the cancel must have won.
-        Ok(_) => {
-            let optimised = !cfg!(debug_assertions);
-            assert!(
-                optimised,
-                "a debug build cannot finish this blame in 20 ms ({elapsed:?}), so the cancel must have won"
-            );
-        }
+    let returned = Instant::now();
+    let cancelled = canceller.join().expect("the canceller finishes");
+    // Either way the call must not outlive the cancel by more than a few polls of the token: a result long after the
+    // cancel means the waiting caller ignored it.
+    let after_cancel = returned.saturating_duration_since(cancelled);
+    if let Err(err) = &outcome {
+        assert_eq!(err.kind(), GitErrorKind::Cancelled, "cancelled: {err:?}");
     }
+    assert!(
+        after_cancel < Duration::from_millis(400),
+        "the call returns right after the cancel, without waiting for the computation: {after_cancel:?} after it \
+         (finished: {})",
+        outcome.is_ok()
+    );
 }
-
 fn head_of_main(fixture: &TestRepo) -> ObjectId {
     fixture.git(&["reset", "-q", "--hard", "main"]);
     head(fixture)

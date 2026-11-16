@@ -2345,3 +2345,261 @@ fn partial_stage_in_a_sparse_index() {
     );
     assert!(t.index_is_sparse(), "the index is still sparse");
 }
+
+// ───────────────────────────── restore from a commit ─────────────────────────────
+
+/// The file gets its content of the commit, as an unstaged change: the index keeps the staged content.
+#[test]
+fn restore_from_commit_same_path_writes_worktree_only() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("f.txt", b"one\n");
+    let first = t.commit_all("one");
+    t.write("f.txt", b"two\n");
+    t.commit_all("two");
+    t.write("f.txt", b"staged\n");
+    t.git(&["add", "f.txt"]);
+    t.write("f.txt", b"worktree\n");
+    let staged = index_id(&t, "f.txt");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    let outcome = stage::restore_from_commit(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        first,
+        &"f.txt".into(),
+        &"f.txt".into(),
+    )
+    .expect("git restore works");
+    assert_eq!(outcome.refresh, RefreshSet::STATUS, "status only");
+    assert_eq!(
+        t.read("f.txt").as_bstr(),
+        b"one\n".as_bstr(),
+        "the worktree file has the commit's content"
+    );
+    assert_eq!(index_id(&t, "f.txt"), staged, "the index is untouched");
+}
+
+/// A file renamed since the commit: the old path's content is written to the current path, the old path stays absent.
+#[test]
+fn restore_from_commit_renamed_writes_current_path() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("old.txt", b"old content\n");
+    let first = t.commit_all("one");
+    t.git(&["mv", "old.txt", "new.txt"]);
+    t.write("new.txt", b"new content\n");
+    t.commit_all("renamed");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    stage::restore_from_commit(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        first,
+        &"old.txt".into(),
+        &"new.txt".into(),
+    )
+    .expect("the blob is written");
+    assert_eq!(
+        t.read("new.txt").as_bstr(),
+        b"old content\n".as_bstr(),
+        "the current path has the old path's content of the commit"
+    );
+    assert!(
+        !t.path.join("old.txt").exists(),
+        "the old path is not recreated"
+    );
+    assert_eq!(
+        index_id(&t, "new.txt"),
+        head_id(&t, "new.txt"),
+        "the index is untouched"
+    );
+}
+
+/// A path the commit does not have is refused before anything is written: with the same source and target path
+/// `git restore` would otherwise delete the tracked file.
+#[test]
+fn restore_from_commit_missing_path_is_not_found() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("f.txt", b"one\n");
+    let first = t.commit_all("one");
+    t.write("g.txt", b"g\n");
+    t.commit_all("add g");
+    t.write("g.txt", b"local\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    for source in ["g.txt", "missing.txt"] {
+        let result = stage::restore_from_commit(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            first,
+            &source.into(),
+            &"g.txt".into(),
+        );
+        expect_kind(result, GitErrorKind::NotFound);
+        assert_eq!(
+            t.read("g.txt"),
+            b"local\n".to_vec(),
+            "{source}: nothing is written"
+        );
+    }
+}
+
+/// An untracked or ignored file in the way is refused (the undo snapshot may not hold it) and stays as it is.
+#[test]
+fn restore_from_commit_refuses_untracked_target() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("f.txt", b"one\n");
+    t.write(".gitignore", b"ignored.txt\n");
+    let first = t.commit_all("one");
+    t.git(&["rm", "-q", "--cached", "f.txt"]);
+    t.write("ignored.txt", b"ignored\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    for (target, content) in [("f.txt", "one\n"), ("ignored.txt", "ignored\n")] {
+        let result = stage::restore_from_commit(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            first,
+            &"f.txt".into(),
+            &target.into(),
+        );
+        match result {
+            Err(GitError::WouldOverwrite { paths, .. }) => {
+                assert_eq!(
+                    paths,
+                    [RelaPath::from(target)],
+                    "the file in the way is named"
+                )
+            }
+            other => panic!("{target}: expected WouldOverwrite, got {other:?}"),
+        }
+        assert_eq!(
+            t.read(target).as_bstr(),
+            content.as_bytes().as_bstr(),
+            "{target} is kept"
+        );
+    }
+}
+
+/// A directory in the way is refused too: a file where the index only has entries below that path, and a directory
+/// (holding an ignored file) where a tracked file was.
+#[test]
+fn restore_from_commit_refuses_directory_shapes() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("f.txt", b"one\n");
+    t.write("t.txt", b"tracked\n");
+    t.write("d/child.txt", b"child\n");
+    t.write(".gitignore", b"*.log\n");
+    let first = t.commit_all("one");
+    std::fs::remove_dir_all(t.path.join("d")).expect("the directory can be removed");
+    t.write("d", b"local file\n");
+    t.remove("t.txt");
+    t.write("t.txt/keep.log", b"ignored\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    for (source, target) in [("f.txt", "d"), ("t.txt", "t.txt")] {
+        let result = stage::restore_from_commit(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            first,
+            &source.into(),
+            &target.into(),
+        );
+        match result {
+            Err(GitError::WouldOverwrite { paths, .. }) => {
+                assert_eq!(
+                    paths,
+                    [RelaPath::from(target)],
+                    "the path in the way is named"
+                )
+            }
+            other => panic!("{target}: expected WouldOverwrite, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        t.read("d"),
+        b"local file\n".to_vec(),
+        "the untracked file is kept"
+    );
+    assert_eq!(
+        t.read("t.txt/keep.log"),
+        b"ignored\n".to_vec(),
+        "the ignored file is kept"
+    );
+}
+
+/// A file where a parent directory of the target should be is refused and kept: Git would delete it to make room.
+#[test]
+fn restore_from_commit_refuses_file_in_place_of_parent() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("p/f.txt", b"one\n");
+    let first = t.commit_all("one");
+    std::fs::remove_dir_all(t.path.join("p")).expect("the directory can be removed");
+    t.write("p", b"local file\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    let result = stage::restore_from_commit(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        first,
+        &"p/f.txt".into(),
+        &"p/f.txt".into(),
+    );
+    match result {
+        Err(GitError::WouldOverwrite { paths, .. }) => {
+            assert_eq!(paths, [RelaPath::from("p")], "the file in the way is named")
+        }
+        other => panic!("expected WouldOverwrite, got {other:?}"),
+    }
+    assert_eq!(t.read("p"), b"local file\n".to_vec(), "the file is kept");
+}
+
+/// Local edits of a file marked assume-unchanged or skip-worktree are invisible to status and so to the undo
+/// snapshot: such a target is refused and its edits stay.
+#[test]
+fn restore_from_commit_refuses_flagged_target() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("old.txt", b"one\n");
+    t.write("a.txt", b"a\n");
+    t.write("s.txt", b"s\n");
+    let first = t.commit_all("one");
+    t.git(&["update-index", "--assume-unchanged", "a.txt"]);
+    t.git(&["update-index", "--skip-worktree", "s.txt"]);
+    t.write("a.txt", b"local a\n");
+    t.write("s.txt", b"local s\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    for (source, target) in [("a.txt", "a.txt"), ("old.txt", "s.txt")] {
+        let result = stage::restore_from_commit(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            first,
+            &source.into(),
+            &target.into(),
+        );
+        expect_kind(result, GitErrorKind::Unsupported);
+    }
+    assert_eq!(
+        t.read("a.txt"),
+        b"local a\n".to_vec(),
+        "assume-unchanged edits stay"
+    );
+    assert_eq!(
+        t.read("s.txt"),
+        b"local s\n".to_vec(),
+        "skip-worktree edits stay"
+    );
+}

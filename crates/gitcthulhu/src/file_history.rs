@@ -5,7 +5,8 @@
 //! Reads: the pager is created in the background together with its first page; the next page is requested when
 //! the last visible row gets within [`m::PAGE_AHEAD`] rows of the end. The diff of a clicked commit is shown by a
 //! read-only [`DiffView`] (the same list, selection, context menu, highlighting and line cutting as the main diff);
-//! a click on another commit retargets it and cancels the read in flight.
+//! a click on another commit retargets it and cancels the read in flight. A right click on a row opens its context
+//! menu ([`FileHistoryView::row_menu`]).
 //!
 //! Like Gitnuro (09 §2.2) the view opens with no commit selected and an empty diff area; the diff appears on the
 //! first click.
@@ -14,20 +15,23 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, UniformListScrollHandle, WeakEntity, Window, div, uniform_list,
+    App, AppContext as _, Context, Entity, IntoElement, MouseDownEvent, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, UniformListScrollHandle, WeakEntity, Window, div,
+    uniform_list,
 };
 use parking_lot::Mutex;
 
 use crate::app_view::show_toast;
 use crate::backend::history::HistoryPager;
 use crate::backend::{
-    Against, ByteSlice as _, CancelToken, DiffTarget, FileHistoryPage, GitError, GitErrorKind,
-    GitTime, RelaPath,
+    Against, ByteSlice as _, CancelToken, ChangeKind, DiffTarget, FileHistoryPage, GitError,
+    GitErrorKind, GitTime, RelaPath,
 };
 use crate::blame::view_header;
 use crate::diff::DiffView;
 use crate::diff::model::DiffDoc;
+use crate::icons::AppIcon;
+use crate::menus::{self, MenuItem};
 use crate::metrics::dp;
 use crate::metrics::history as m;
 use crate::notifications::ToastKind;
@@ -65,6 +69,9 @@ pub mod ids {
     pub const HISTORY_DATE: &str = "history-date";
     /// The diff area.
     pub const HISTORY_DIFF: &str = "history-diff";
+    /// The "Restore file from this commit" item of a row's context menu (the menu host registers it as
+    /// `menu-item-<id>`).
+    pub const HISTORY_RESTORE: &str = "history-restore";
 }
 
 /// Opens the history of `path` (replaces everything under the toolbar; Esc closes it). The "File history" menu
@@ -273,6 +280,36 @@ impl FileHistoryView {
         cx.notify();
     }
 
+    /// The context menu of row `ix`: "Restore file from this commit" writes the file's content at that commit to the
+    /// worktree file of [`Self::path`] (also for a commit before a rename). Disabled for the commit that deleted the
+    /// file: there is no content to restore.
+    pub fn row_menu(&self, ix: usize) -> Vec<MenuItem> {
+        let Some(item) = self.items.get(ix) else {
+            return Vec::new();
+        };
+        let entry = &item.entry;
+        let (ctx, commit, source, path) = (
+            self.ctx.clone(),
+            entry.commit.id,
+            entry.path.clone(),
+            self.path.clone(),
+        );
+        vec![
+            MenuItem::action(
+                ids::HISTORY_RESTORE,
+                "Restore file from this commit",
+                move |window, cx| {
+                    let (source, path) = (source.clone(), path.clone());
+                    ctx.with_tab(window, cx, move |tab, window, cx| {
+                        tab.restore_file_from_commit(commit, source, path, window, cx);
+                    });
+                },
+            )
+            .with_icon(AppIcon::Undo)
+            .enabled(entry.kind != ChangeKind::Deleted),
+        ]
+    }
+
     fn list(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let tokens = *cx.tokens();
         let view: WeakEntity<Self> = cx.weak_entity();
@@ -282,7 +319,22 @@ impl FileHistoryView {
                 view.update(cx, |this, cx| this.select(ix, cx)).ok();
             }) as Rc<dyn Fn(usize, &mut Window, &mut App)>
         };
-        let env = Rc::new(rows::RowEnv { tokens, on_select });
+        let on_menu = {
+            let view = view.clone();
+            Rc::new(
+                move |ix: usize, ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                    let Ok(items) = view.read_with(cx, |this, _| this.row_menu(ix)) else {
+                        return;
+                    };
+                    menus::open_context_menu(window, cx, ev.position, items);
+                },
+            ) as Rc<dyn Fn(usize, &MouseDownEvent, &mut Window, &mut App)>
+        };
+        let env = Rc::new(rows::RowEnv {
+            tokens,
+            on_select,
+            on_menu,
+        });
         let items = self.items.clone();
         let count = items.len();
         let more = !self.exhausted && !self.failed;

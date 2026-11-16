@@ -20,16 +20,17 @@ use bstr::{BStr, ByteSlice};
 use but_core::index::{Edit, Stat};
 use gix::{
     ObjectId,
-    index::entry::{Mode, Stage},
+    index::entry::{Flags, Mode, Stage},
 };
 
 use crate::{
     CommandLog, DiffOptions, DiscardMode, EntryKind, GitError, OpClass, OpContext, OpOutcome,
-    OpWarning, PartialAvailability, PartialBlock, RefreshSet, RelaPath, Repo, RepoExclusive,
-    Resolution, Result, Selection, SelectionRequest, Side, WhitespaceMode,
+    OpWarning, OverwriteKind, PartialAvailability, PartialBlock, RefreshSet, RelaPath, Repo,
+    RepoExclusive, Resolution, Result, Selection, SelectionRequest, Side, WhitespaceMode,
     cli::{self, CommandKind, GitCommand},
     internal::{
         content::{self, SideContent, WorktreeReader},
+        errors::gix_error,
         linediff::{self, LineImage, Op, dominant_eol, edit_script, split_lines},
         partial,
     },
@@ -260,6 +261,131 @@ pub fn discard_paths(
         RefreshSet::STATUS | RefreshSet::REPO_STATE
     };
     Ok(run.outcome(refresh))
+}
+
+/// Overwrite the worktree file `path` with the content `source_path` had in `commit`; the index is not changed (the
+/// result shows as an unstaged change).
+///
+/// The source entry is checked first: `git restore` would delete a tracked file that `commit` does not have.
+///
+/// - `source_path == path`: `git restore --source=<commit> --worktree`, so filters, the executable bit and symbolic
+///   links behave natively.
+/// - `source_path != path` (the file was renamed since `commit`; `git restore` cannot write one path's content to
+///   another): the blob at `source_path` is converted to worktree form with the attributes of `path` and written
+///   atomically (the permissions of an existing file are kept). Only regular files can be restored this way.
+///
+/// What the undo snapshot may not hold is never overwritten: an existing worktree file at `path` without an index
+/// entry of its own (untracked or ignored), a directory at `path`, or a file where one of its parent directories
+/// should be. It is refused with [`GitError::WouldOverwrite`] before anything changes. A target marked
+/// assume-unchanged or skip-worktree is refused with `Unsupported`: status, and so the snapshot, skips its edits.
+///
+/// Errors: `NotFound` if `commit` is not a commit or has no file at `source_path`, `InvalidName` for paths outside
+/// the worktree or a source that cannot be restored (a directory or submodule; a symbolic link after a rename),
+/// `WouldOverwrite` and `Unsupported` (above), `CommandFailed` from Git. Refresh: `STATUS`.
+pub fn restore_from_commit(
+    repo: &Repo,
+    _perm: &mut RepoExclusive,
+    ctx: &OpContext,
+    commit: ObjectId,
+    source_path: &RelaPath,
+    path: &RelaPath,
+) -> Result<OpOutcome<()>> {
+    ctx.cancel.check()?;
+    let workdir = require_workdir(repo)?.to_owned();
+    validate_paths(&[source_path.clone(), path.clone()])?;
+    let gix = repo.local();
+    let not_found = || GitError::NotFound {
+        what: "file",
+        name: format!(
+            "{}:{}",
+            commit.to_hex_with_len(7),
+            source_path.to_str_lossy()
+        ),
+    };
+    let tree = gix
+        .find_commit(commit)
+        .map_err(|_| GitError::NotFound {
+            what: "commit",
+            name: commit.to_string(),
+        })?
+        .tree_id()
+        .map_err(gix_error)?
+        .detach();
+    let entry = content::tree_entry(&gix, tree, source_path.as_ref())?.ok_or_else(not_found)?;
+    let same_path = source_path == path;
+    let restorable = match entry.kind {
+        EntryKind::Blob | EntryKind::BlobExecutable => true,
+        EntryKind::Link => same_path,
+        EntryKind::Tree | EntryKind::Submodule => false,
+    };
+    if !restorable {
+        return Err(GitError::InvalidName {
+            what: "regular file",
+            name: source_path.to_str_lossy().into_owned(),
+        });
+    }
+
+    // Only an index entry at `path` itself (any stage) makes it tracked: entries below it would mean a directory.
+    let index = read_index(&gix)?;
+    let entries = index
+        .entry_range(path.as_ref())
+        .map(|range| &index.entries()[range]);
+    let flagged = Flags::ASSUME_VALID | Flags::SKIP_WORKTREE;
+    if entries.is_some_and(|entries| entries.iter().any(|e| e.flags.intersects(flagged))) {
+        // Status does not look at such a file, so the snapshot would not hold its local edits.
+        return Err(GitError::Unsupported {
+            what: "restoring a file marked assume-unchanged or skip-worktree",
+        });
+    }
+    // Refuses a path through a symbolic link before anything is inspected below it.
+    content::writable_worktree_path(&workdir, path.as_ref())?;
+    if let Some(blocking) = path_in_the_way(&workdir, path, entries.is_some()) {
+        return Err(GitError::WouldOverwrite {
+            kind: OverwriteKind::Untracked,
+            paths: vec![blocking],
+            stderr: String::new(),
+        });
+    }
+
+    let mut run = Run::default();
+    if same_path {
+        let cmd = GitCommand::new(repo, CommandKind::Mutation)
+            .args(["restore", "--worktree"])
+            .arg(format!("--source={commit}"))
+            .pathspecs(std::slice::from_ref(path));
+        run.git(repo, ctx, cmd, OpClass::Restore)?;
+        return Ok(run.outcome(RefreshSet::STATUS));
+    }
+    content::fetch_missing_objects(repo, &[entry.id], &ctx.cancel)?;
+    let blob = gix.find_blob(entry.id).map_err(|_| not_found())?;
+    let mut reader = WorktreeReader::new(&gix)?;
+    let bytes = reader.convert_to_worktree(&blob.data, path.as_ref())?;
+    ctx.cancel.check()?;
+    // Checked right before the write: never write through a symbolic link or junction.
+    let target = content::writable_worktree_path(&workdir, path.as_ref())?;
+    atomic_write(&target, &bytes, Some(mode_of_kind(entry.kind)))?;
+    Ok(run.outcome(RefreshSet::STATUS))
+}
+
+/// What a write of the file `path` would replace that the undo snapshot may not hold: a non-directory at one of its
+/// parent directories (Git would delete it to make room), a directory at `path`, or a file at `path` without an index
+/// entry of its own (`tracked` = there is one). The path in the way, or `None`.
+fn path_in_the_way(workdir: &Path, path: &RelaPath, tracked: bool) -> Option<RelaPath> {
+    let mut ends = path
+        .find_iter("/")
+        .map(|slash| (slash, true))
+        .chain(std::iter::once((path.len(), false)));
+    ends.find_map(|(end, is_parent)| {
+        let rela = path[..end].as_bstr();
+        let meta =
+            std::fs::symlink_metadata(workdir.join(gix::path::from_bstr(rela).ok()?)).ok()?;
+        let blocks = if is_parent {
+            !meta.is_dir()
+        } else {
+            meta.is_dir() || !tracked
+        };
+        blocks.then(|| RelaPath::from(rela))
+    })
 }
 
 /// Delete untracked files and directories with `std::fs`, after verifying that every path is untracked (no index

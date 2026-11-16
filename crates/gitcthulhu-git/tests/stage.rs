@@ -2536,3 +2536,70 @@ fn restore_from_commit_refuses_directory_shapes() {
         "the ignored file is kept"
     );
 }
+
+/// A file where a parent directory of the target should be is refused and kept: Git would delete it to make room.
+#[test]
+fn restore_from_commit_refuses_file_in_place_of_parent() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("p/f.txt", b"one\n");
+    let first = t.commit_all("one");
+    std::fs::remove_dir_all(t.path.join("p")).expect("the directory can be removed");
+    t.write("p", b"local file\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    let result = stage::restore_from_commit(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        first,
+        &"p/f.txt".into(),
+        &"p/f.txt".into(),
+    );
+    match result {
+        Err(GitError::WouldOverwrite { paths, .. }) => {
+            assert_eq!(paths, [RelaPath::from("p")], "the file in the way is named")
+        }
+        other => panic!("expected WouldOverwrite, got {other:?}"),
+    }
+    assert_eq!(t.read("p"), b"local file\n".to_vec(), "the file is kept");
+}
+
+/// Local edits of a file marked assume-unchanged or skip-worktree are invisible to status and so to the undo
+/// snapshot: such a target is refused and its edits stay.
+#[test]
+fn restore_from_commit_refuses_flagged_target() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("old.txt", b"one\n");
+    t.write("a.txt", b"a\n");
+    t.write("s.txt", b"s\n");
+    let first = t.commit_all("one");
+    t.git(&["update-index", "--assume-unchanged", "a.txt"]);
+    t.git(&["update-index", "--skip-worktree", "s.txt"]);
+    t.write("a.txt", b"local a\n");
+    t.write("s.txt", b"local s\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    for (source, target) in [("a.txt", "a.txt"), ("old.txt", "s.txt")] {
+        let result = stage::restore_from_commit(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            first,
+            &source.into(),
+            &target.into(),
+        );
+        expect_kind(result, GitErrorKind::Unsupported);
+    }
+    assert_eq!(
+        t.read("a.txt"),
+        b"local a\n".to_vec(),
+        "assume-unchanged edits stay"
+    );
+    assert_eq!(
+        t.read("s.txt"),
+        b"local s\n".to_vec(),
+        "skip-worktree edits stay"
+    );
+}

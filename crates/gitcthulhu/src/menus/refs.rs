@@ -527,15 +527,14 @@ pub fn tag(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
         }
         separator(&mut items);
         let name = short_name(&full);
-        let n = name.clone();
         items.push(
             on_tab("tag-delete", "Delete locally", tab, move |t, w, c| {
-                t.delete_tag(n.clone(), w, c);
+                t.delete_tag(name.clone(), w, c);
             })
             .with_icon(AppIcon::Delete),
         );
-        // Tags have no remote-tracking refs: every configured remote is offered (Git reports a tag the remote
-        // lacks). Entries without a URL only group the leftover tracking refs of a deleted remote.
+        // Tags have no remote-tracking refs: every configured remote is offered (deleting a tag the remote lacks
+        // changes nothing). Entries without a URL only group the leftover tracking refs of a deleted remote.
         let remotes: Vec<String> = {
             let model = tab.model.read(cx);
             model
@@ -552,14 +551,15 @@ pub fn tag(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
                 .unwrap_or_default()
         };
         for remote in remotes {
-            let (r, n) = (remote.clone(), name.clone());
+            // The full ref: the short name of a tag named like `refs/heads/x` would delete the remote branch `x`.
+            let (r, f) = (remote.clone(), full.clone());
             items.push(
                 on_tab(
                     format!("tag-delete-remote-{remote}"),
                     format!("Delete from \"{remote}\""),
                     tab,
                     move |t, w, c| {
-                        t.delete_remote_tag(r.clone(), n.clone(), w, c);
+                        t.delete_remote_tag(r.clone(), f.clone(), w, c);
                     },
                 )
                 .with_icon(AppIcon::Delete),

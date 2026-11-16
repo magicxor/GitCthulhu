@@ -271,8 +271,9 @@ impl RepoTab {
 
     /// Overwrites the worktree file `path` with the content `source_path` had in `commit`
     /// (`stage::restore_from_commit`; `source_path` differs from `path` when the file was renamed since). The index
-    /// is not changed. Recorded as a full snapshot that captures `path`, so the overwritten content comes back on
-    /// undo. Refresh: STATUS.
+    /// is not changed. Recorded as a full snapshot, so the overwritten content comes back on undo; the backend refuses
+    /// to overwrite an untracked or ignored file, which the snapshot may not hold, so nothing needs asking first.
+    /// Refresh: STATUS.
     pub fn restore_file_from_commit(
         &mut self,
         commit: ObjectId,

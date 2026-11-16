@@ -25,8 +25,8 @@ use gix::{
 
 use crate::{
     CommandLog, DiffOptions, DiscardMode, EntryKind, GitError, OpClass, OpContext, OpOutcome,
-    OpWarning, PartialAvailability, PartialBlock, RefreshSet, RelaPath, Repo, RepoExclusive,
-    Resolution, Result, Selection, SelectionRequest, Side, WhitespaceMode,
+    OpWarning, OverwriteKind, PartialAvailability, PartialBlock, RefreshSet, RelaPath, Repo,
+    RepoExclusive, Resolution, Result, Selection, SelectionRequest, Side, WhitespaceMode,
     cli::{self, CommandKind, GitCommand},
     internal::{
         content::{self, SideContent, WorktreeReader},
@@ -266,15 +266,20 @@ pub fn discard_paths(
 /// Overwrite the worktree file `path` with the content `source_path` had in `commit`; the index is not changed (the
 /// result shows as an unstaged change).
 ///
+/// The source entry is checked first: `git restore` would delete a tracked file that `commit` does not have.
+///
 /// - `source_path == path`: `git restore --source=<commit> --worktree`, so filters, the executable bit and symbolic
 ///   links behave natively.
 /// - `source_path != path` (the file was renamed since `commit`; `git restore` cannot write one path's content to
 ///   another): the blob at `source_path` is converted to worktree form with the attributes of `path` and written
-///   atomically (the permissions of an existing file are kept). Only regular files can be restored this way: a
-///   symbolic link or submodule at `source_path` is refused with [`GitError::InvalidName`].
+///   atomically (the permissions of an existing file are kept). Only regular files can be restored this way.
+///
+/// An existing worktree file at `path` that the index does not track (untracked or ignored) is never overwritten:
+/// the undo snapshot may not hold it. It is refused with [`GitError::WouldOverwrite`] before anything changes.
 ///
 /// Errors: `NotFound` if `commit` is not a commit or has no file at `source_path`, `InvalidName` for paths outside
-/// the worktree, `CommandFailed` from Git. Refresh: `STATUS`.
+/// the worktree or a source that cannot be restored (a directory or submodule; a symbolic link after a rename),
+/// `WouldOverwrite` (above), `CommandFailed` from Git. Refresh: `STATUS`.
 pub fn restore_from_commit(
     repo: &Repo,
     _perm: &mut RepoExclusive,
@@ -286,16 +291,6 @@ pub fn restore_from_commit(
     ctx.cancel.check()?;
     let workdir = require_workdir(repo)?.to_owned();
     validate_paths(&[source_path.clone(), path.clone()])?;
-    let mut run = Run::default();
-    if source_path == path {
-        let cmd = GitCommand::new(repo, CommandKind::Mutation)
-            .args(["restore", "--worktree"])
-            .arg(format!("--source={commit}"))
-            .pathspecs(std::slice::from_ref(path));
-        run.git(repo, ctx, cmd, OpClass::Restore)?;
-        return Ok(run.outcome(RefreshSet::STATUS));
-    }
-
     let gix = repo.local();
     let not_found = || GitError::NotFound {
         what: "file",
@@ -315,11 +310,39 @@ pub fn restore_from_commit(
         .map_err(gix_error)?
         .detach();
     let entry = content::tree_entry(&gix, tree, source_path.as_ref())?.ok_or_else(not_found)?;
-    if !matches!(entry.kind, EntryKind::Blob | EntryKind::BlobExecutable) {
+    let same_path = source_path == path;
+    let restorable = match entry.kind {
+        EntryKind::Blob | EntryKind::BlobExecutable => true,
+        EntryKind::Link => same_path,
+        EntryKind::Tree | EntryKind::Submodule => false,
+    };
+    if !restorable {
         return Err(GitError::InvalidName {
             what: "regular file",
             name: source_path.to_str_lossy().into_owned(),
         });
+    }
+
+    let index = read_index(&gix)?;
+    let tracked = TrackedLookup::new(&gix, &index)?.is_tracked(path.as_ref())
+        || content::is_conflicted(&index, path.as_ref());
+    let target = content::writable_worktree_path(&workdir, path.as_ref())?;
+    if !tracked && std::fs::symlink_metadata(&target).is_ok() {
+        return Err(GitError::WouldOverwrite {
+            kind: OverwriteKind::Untracked,
+            paths: vec![path.clone()],
+            stderr: String::new(),
+        });
+    }
+
+    let mut run = Run::default();
+    if same_path {
+        let cmd = GitCommand::new(repo, CommandKind::Mutation)
+            .args(["restore", "--worktree"])
+            .arg(format!("--source={commit}"))
+            .pathspecs(std::slice::from_ref(path));
+        run.git(repo, ctx, cmd, OpClass::Restore)?;
+        return Ok(run.outcome(RefreshSet::STATUS));
     }
     content::fetch_missing_objects(repo, &[entry.id], &ctx.cancel)?;
     let blob = gix.find_blob(entry.id).map_err(|_| not_found())?;

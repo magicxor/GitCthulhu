@@ -501,7 +501,7 @@ fn remote_and_branch(target: &MenuTarget, full: &FullName, cx: &App) -> Option<(
         .map(|b| (b.remote.clone(), b.name.clone()))
 }
 
-/// The tag menu (slot `End`): Checkout tag's commit and Delete tag.
+/// The tag menu (slot `End`): Checkout tag's commit, then Delete locally and Delete from each remote.
 pub fn tag(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
     let mut items = Vec::new();
     if let Some(full) = target.branch.clone() {
@@ -525,13 +525,39 @@ pub fn tag(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
                 .with_icon(AppIcon::Start),
             );
         }
+        separator(&mut items);
         let name = short_name(&full);
+        let n = name.clone();
         items.push(
-            on_tab("tag-delete", "Delete tag", tab, move |t, w, c| {
-                t.delete_tag(name.clone(), w, c);
+            on_tab("tag-delete", "Delete locally", tab, move |t, w, c| {
+                t.delete_tag(n.clone(), w, c);
             })
             .with_icon(AppIcon::Delete),
         );
+        // Tags have no remote-tracking refs: every remote is offered (Git reports a tag the remote lacks).
+        let remotes: Vec<String> = {
+            let model = tab.model.read(cx);
+            model
+                .refs
+                .value
+                .as_ref()
+                .map(|refs| refs.remotes.iter().map(|r| r.name.clone()).collect())
+                .unwrap_or_default()
+        };
+        for remote in remotes {
+            let (r, n) = (remote.clone(), name.clone());
+            items.push(
+                on_tab(
+                    "tag-delete-remote",
+                    format!("Delete from \"{remote}\""),
+                    tab,
+                    move |t, w, c| {
+                        t.delete_remote_tag(r.clone(), n.clone(), w, c);
+                    },
+                )
+                .with_icon(AppIcon::Delete),
+            );
+        }
     }
     extend(cx, MenuSlot::End, target, &mut items);
     trim_separator(&mut items);

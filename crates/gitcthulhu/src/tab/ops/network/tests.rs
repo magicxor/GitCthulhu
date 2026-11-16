@@ -903,6 +903,88 @@ fn fixture_push_branch_to_upstream_uses_the_configured_merge_ref(cx: &mut TestAp
     );
 }
 
+/// Waits (test and wall time) until the running operation is over: a push is a real process.
+fn wait_for_op(cx: &mut TestAppContext, tab: &Entity<RepoTab>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        if cx.update(|cx| tab.read(cx).busy().is_none()) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the operation finished"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        cx.executor().advance_clock(Duration::from_millis(20));
+    }
+}
+
+/// A tag name that is not UTF-8 (Git allows any bytes) is refused, not converted: the lossy name would be another
+/// ref (`0xff` becomes U+FFFD) and the push could delete that tag instead.
+#[gpui_kit::test]
+fn fixture_delete_remote_tag_refuses_a_non_utf8_name(cx: &mut TestAppContext) {
+    let r = Remote::new();
+    r.fx.git(&["tag", "\u{FFFD}"]);
+    r.fx.git(&["push", "-q", "origin", "refs/tags/\u{FFFD}"]);
+    let (handle, _app, tab) = mount_fixture(cx, &r.fx, DEFAULT_SIZE);
+    let tag = FullName::try_from(bstr::BString::from(b"refs/tags/\xff".to_vec()))
+        .expect("Git allows any bytes in a ref name");
+    run_on(cx, handle, &tab, move |t, w, cx| {
+        t.delete_remote_tag("origin".to_owned(), tag, w, cx)
+    });
+    wait_for_op(cx, &tab);
+    assert!(
+        r.remote_git(&["tag", "--list"]).contains('\u{FFFD}'),
+        "the tag of the lossy name stays"
+    );
+    assert!(marker_titles(&tab, cx).is_empty(), "nothing was pushed");
+}
+
+/// A tag may be named like a ref of another namespace (`git tag refs/heads/feature` is `refs/tags/refs/heads/feature`).
+/// Deleting it on a remote that has only the branch `feature` must not delete that branch (`git push --delete
+/// refs/heads/feature` would); once the remote has the tag, the tag is deleted and the branch stays.
+#[gpui_kit::test]
+fn fixture_delete_remote_tag_named_like_a_branch(cx: &mut TestAppContext) {
+    let r = Remote::new();
+    r.fx.git(&["branch", "feature"]);
+    r.fx.git(&["push", "-q", "origin", "feature"]);
+    r.fx.git(&["tag", "refs/heads/feature"]);
+    let (handle, _app, tab) = mount_fixture(cx, &r.fx, DEFAULT_SIZE);
+    let tag = full("refs/tags/refs/heads/feature");
+    let finish = |cx: &mut TestAppContext| wait_for_op(cx, &tab);
+    let has_branch = || {
+        r.remote_git(&["branch", "--list", "feature"])
+            .contains("feature")
+    };
+
+    let t = tag.clone();
+    run_on(cx, handle, &tab, move |tab, w, cx| {
+        tab.delete_remote_tag("origin".to_owned(), t, w, cx)
+    });
+    finish(cx);
+    // Git reports the deletion of a missing ref as done (with a warning): what matters is that the branch stays.
+    assert!(has_branch(), "the remote has no such tag: its branch stays");
+
+    r.fx.git(&["push", "-q", "origin", "refs/tags/refs/heads/feature"]);
+    run_on(cx, handle, &tab, move |tab, w, cx| {
+        tab.delete_remote_tag("origin".to_owned(), tag, w, cx)
+    });
+    finish(cx);
+    assert!(has_branch(), "the branch named like the tag stays");
+    assert!(
+        r.remote_git(&["tag", "--list", "refs/heads/feature"])
+            .trim()
+            .is_empty(),
+        "the tag is deleted"
+    );
+    assert_eq!(
+        marker_titles(&tab, cx).last().map(String::as_str),
+        Some("Delete tag 'refs/heads/feature' on origin"),
+        "the marker names the tag by its short name"
+    );
+}
+
 #[gpui_kit::test]
 fn fixture_push_family_records_markers(cx: &mut TestAppContext) {
     let r = Remote::new();
@@ -937,7 +1019,7 @@ fn fixture_push_family_records_markers(cx: &mut TestAppContext) {
     assert!(r.remote_git(&["tag", "--list", "v1"]).contains("v1"));
 
     run_on(cx, handle, &tab, |t, w, cx| {
-        t.delete_remote_tag("origin".to_owned(), "v1".to_owned(), w, cx)
+        t.delete_remote_tag("origin".to_owned(), full("refs/tags/v1"), w, cx)
     });
     settle(cx);
     assert!(r.remote_git(&["tag", "--list", "v1"]).trim().is_empty());

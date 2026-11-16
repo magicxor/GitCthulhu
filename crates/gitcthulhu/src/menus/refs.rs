@@ -31,7 +31,7 @@ type TabCall = Rc<dyn Fn(&mut RepoTab, &mut Window, &mut Context<RepoTab>)>;
 
 /// An action that runs `f` on the tab of `tab` (the menu closes first, then the call runs).
 fn on_tab(
-    id: &'static str,
+    id: impl Into<gpui_kit::SharedString>,
     label: impl Into<gpui_kit::SharedString>,
     tab: &TabCtx,
     f: impl Fn(&mut RepoTab, &mut Window, &mut Context<RepoTab>) + 'static,
@@ -501,7 +501,7 @@ fn remote_and_branch(target: &MenuTarget, full: &FullName, cx: &App) -> Option<(
         .map(|b| (b.remote.clone(), b.name.clone()))
 }
 
-/// The tag menu (slot `End`): Checkout tag's commit and Delete tag.
+/// The tag menu (slot `End`): Checkout tag's commit, then Delete locally and Delete from each remote.
 pub fn tag(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
     let mut items = Vec::new();
     if let Some(full) = target.branch.clone() {
@@ -525,13 +525,46 @@ pub fn tag(target: &MenuTarget, cx: &App) -> Vec<MenuItem> {
                 .with_icon(AppIcon::Start),
             );
         }
+        separator(&mut items);
         let name = short_name(&full);
         items.push(
-            on_tab("tag-delete", "Delete tag", tab, move |t, w, c| {
+            on_tab("tag-delete", "Delete locally", tab, move |t, w, c| {
                 t.delete_tag(name.clone(), w, c);
             })
             .with_icon(AppIcon::Delete),
         );
+        // Tags have no remote-tracking refs: every configured remote is offered (deleting a tag the remote lacks
+        // changes nothing). Entries without a URL only group the leftover tracking refs of a deleted remote.
+        let remotes: Vec<String> = {
+            let model = tab.model.read(cx);
+            model
+                .refs
+                .value
+                .as_ref()
+                .map(|refs| {
+                    refs.remotes
+                        .iter()
+                        .filter(|r| r.fetch_url.is_some() || r.push_url.is_some())
+                        .map(|r| r.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for remote in remotes {
+            // The full ref: the short name of a tag named like `refs/heads/x` would delete the remote branch `x`.
+            let (r, f) = (remote.clone(), full.clone());
+            items.push(
+                on_tab(
+                    format!("tag-delete-remote-{remote}"),
+                    format!("Delete from \"{remote}\""),
+                    tab,
+                    move |t, w, c| {
+                        t.delete_remote_tag(r.clone(), f.clone(), w, c);
+                    },
+                )
+                .with_icon(AppIcon::Delete),
+            );
+        }
     }
     extend(cx, MenuSlot::End, target, &mut items);
     trim_separator(&mut items);

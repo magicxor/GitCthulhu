@@ -54,8 +54,9 @@ pub fn files_with_conflict_markers(repo: &Repo, paths: &[RelaPath]) -> Vec<RelaP
 }
 
 /// The absolute path of the repository-relative `path` in the worktree, with the platform's separators. `None`
-/// for a bare repository or a path that is not valid on this platform. Pure path arithmetic, no I/O.
+/// for a bare repository or a path that is not valid on this platform. Pure path arithmetic, no I/O. Rebuilt from
+/// its components: Git's `/` left inside a Windows path makes the shell reject it (the reveal did nothing).
 pub fn absolute_path(repo: &Repo, path: &RelaPath) -> Option<std::path::PathBuf> {
     let workdir = repo.workdir()?;
-    Some(workdir.join(path.to_path().ok()?))
+    Some(workdir.join(path.to_path().ok()?).components().collect())
 }

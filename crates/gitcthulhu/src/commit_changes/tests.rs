@@ -506,9 +506,72 @@ fn open_in_folder_reveals_file_or_nearest_folder(cx: &mut TestAppContext) {
     }
     cx.update(|cx| {
         let recorded = platform::recorded(cx);
-        assert_eq!(recorded.revealed, vec![workdir.join("src").join("lib.rs")]);
+        // Compared as text: `PathBuf ==` compares components and would accept Git's `/` inside a Windows path,
+        // which the Windows shell rejects (the reveal did nothing).
+        assert_eq!(
+            os_strs(&recorded.revealed),
+            vec![workdir.join("src").join("lib.rs").into_os_string()]
+        );
         // docs/guide.md was removed in the commit, and so was its folder in the worktree.
-        assert_eq!(recorded.opened, vec![workdir.clone()]);
+        assert_eq!(
+            os_strs(&recorded.opened),
+            vec![workdir.clone().into_os_string()]
+        );
+    });
+}
+
+fn os_strs(paths: &[std::path::PathBuf]) -> Vec<std::ffi::OsString> {
+    paths.iter().map(|p| p.as_os_str().to_owned()).collect()
+}
+
+/// In a tab of a linked worktree, "Open file in folder" reveals the file in that worktree, not in the main one.
+#[gpui_kit::test]
+fn open_in_folder_in_linked_worktree_reveals_worktree_file(cx: &mut TestAppContext) {
+    let fx = Fixture::new();
+    fx.write("src/lib.rs", "fn a() {}\n");
+    fx.commit_all("init");
+    let wt = fx.dir.path().join("wt");
+    let wt_arg = wt.to_string_lossy().into_owned();
+    fx.git(&["worktree", "add", "-q", "-b", "side", &wt_arg]);
+    std::fs::write(wt.join("src").join("lib.rs"), "fn a() {}\nfn b() {}\n").expect("write");
+    let in_wt = |args: &[&str]| {
+        let mut all = vec!["-C", wt.to_str().expect("utf-8 path")];
+        all.extend_from_slice(args);
+        fx.git(&all)
+    };
+    in_wt(&["commit", "-q", "-am", "side change"]);
+    let id = ObjectId::from_hex(in_wt(&["rev-parse", "HEAD"]).trim().as_bytes()).expect("id");
+    let (handle, _app, tab) =
+        crate::test_support::mount_path_on(cx, &wt, fx.runtime(), DEFAULT_SIZE, false);
+    select_commit(cx, &tab, id);
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click(row(0), cx);
+        window.render_frame(cx);
+        window.click(
+            format!("menu-item-{}", menus::commit_files::ids::OPEN_IN_FOLDER),
+            cx,
+        );
+    })
+    .expect("window");
+    cx.run_until_parked();
+    let workdir = cx.update(|cx| {
+        tab.read(cx)
+            .ctx()
+            .backend
+            .handle()
+            .and_then(|handle| handle.workdir())
+            .expect("a workdir")
+    });
+    assert!(
+        workdir.ends_with("wt") && !workdir.starts_with(fx.path()),
+        "the tab shows the linked worktree: {workdir:?}"
+    );
+    cx.update(|cx| {
+        assert_eq!(
+            os_strs(&platform::recorded(cx).revealed),
+            vec![workdir.join("src").join("lib.rs").into_os_string()]
+        );
     });
 }
 

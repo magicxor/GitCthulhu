@@ -30,6 +30,7 @@ use crate::{
     cli::{self, CommandKind, GitCommand},
     internal::{
         content::{self, SideContent, WorktreeReader},
+        errors::gix_error,
         linediff::{self, LineImage, Op, dominant_eol, edit_script, split_lines},
         partial,
     },
@@ -260,6 +261,75 @@ pub fn discard_paths(
         RefreshSet::STATUS | RefreshSet::REPO_STATE
     };
     Ok(run.outcome(refresh))
+}
+
+/// Overwrite the worktree file `path` with the content `source_path` had in `commit`; the index is not changed (the
+/// result shows as an unstaged change).
+///
+/// - `source_path == path`: `git restore --source=<commit> --worktree`, so filters, the executable bit and symbolic
+///   links behave natively.
+/// - `source_path != path` (the file was renamed since `commit`; `git restore` cannot write one path's content to
+///   another): the blob at `source_path` is converted to worktree form with the attributes of `path` and written
+///   atomically (the permissions of an existing file are kept). Only regular files can be restored this way: a
+///   symbolic link or submodule at `source_path` is refused with [`GitError::InvalidName`].
+///
+/// Errors: `NotFound` if `commit` is not a commit or has no file at `source_path`, `InvalidName` for paths outside
+/// the worktree, `CommandFailed` from Git. Refresh: `STATUS`.
+pub fn restore_from_commit(
+    repo: &Repo,
+    _perm: &mut RepoExclusive,
+    ctx: &OpContext,
+    commit: ObjectId,
+    source_path: &RelaPath,
+    path: &RelaPath,
+) -> Result<OpOutcome<()>> {
+    ctx.cancel.check()?;
+    let workdir = require_workdir(repo)?.to_owned();
+    validate_paths(&[source_path.clone(), path.clone()])?;
+    let mut run = Run::default();
+    if source_path == path {
+        let cmd = GitCommand::new(repo, CommandKind::Mutation)
+            .args(["restore", "--worktree"])
+            .arg(format!("--source={commit}"))
+            .pathspecs(std::slice::from_ref(path));
+        run.git(repo, ctx, cmd, OpClass::Restore)?;
+        return Ok(run.outcome(RefreshSet::STATUS));
+    }
+
+    let gix = repo.local();
+    let not_found = || GitError::NotFound {
+        what: "file",
+        name: format!(
+            "{}:{}",
+            commit.to_hex_with_len(7),
+            source_path.to_str_lossy()
+        ),
+    };
+    let tree = gix
+        .find_commit(commit)
+        .map_err(|_| GitError::NotFound {
+            what: "commit",
+            name: commit.to_string(),
+        })?
+        .tree_id()
+        .map_err(gix_error)?
+        .detach();
+    let entry = content::tree_entry(&gix, tree, source_path.as_ref())?.ok_or_else(not_found)?;
+    if !matches!(entry.kind, EntryKind::Blob | EntryKind::BlobExecutable) {
+        return Err(GitError::InvalidName {
+            what: "regular file",
+            name: source_path.to_str_lossy().into_owned(),
+        });
+    }
+    content::fetch_missing_objects(repo, &[entry.id], &ctx.cancel)?;
+    let blob = gix.find_blob(entry.id).map_err(|_| not_found())?;
+    let mut reader = WorktreeReader::new(&gix)?;
+    let bytes = reader.convert_to_worktree(&blob.data, path.as_ref())?;
+    ctx.cancel.check()?;
+    // Checked right before the write: never write through a symbolic link or junction.
+    let target = content::writable_worktree_path(&workdir, path.as_ref())?;
+    atomic_write(&target, &bytes, Some(mode_of_kind(entry.kind)))?;
+    Ok(run.outcome(RefreshSet::STATUS))
 }
 
 /// Delete untracked files and directories with `std::fs`, after verifying that every path is untracked (no index

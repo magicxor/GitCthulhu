@@ -12,8 +12,8 @@ use crate::backend::handle::RepoHandle;
 use crate::backend::present::{OpFailure, confirm_unrestorable};
 use crate::backend::prompt::Asker;
 use crate::backend::{
-    ByteSlice as _, DiscardMode, OperationDescriptor, OperationKind, RefreshSet, RelaPath,
-    Resolution, Scope, SelectionRequest, SkipReason, SkippedFile, UntrackedCapture, git,
+    ByteSlice as _, DiscardMode, ObjectId, OperationDescriptor, OperationKind, RefreshSet,
+    RelaPath, Resolution, Scope, SelectionRequest, SkipReason, SkippedFile, UntrackedCapture, git,
 };
 use crate::tab::RepoTab;
 
@@ -263,6 +263,38 @@ impl RepoTab {
         })
         .prepare(move |handle, asker| {
             confirm_untracked_loss(handle, asker, &title, &confirm_paths, Some(&nested_agreed))
+        })
+        .record(descriptor)
+        .base_refresh(RefreshSet::STATUS);
+        self.run_op(spec, window, cx)
+    }
+
+    /// Overwrites the worktree file `path` with the content `source_path` had in `commit`
+    /// (`stage::restore_from_commit`; `source_path` differs from `path` when the file was renamed since). The index
+    /// is not changed. Recorded as a full snapshot that captures `path`, so the overwritten content comes back on
+    /// undo. Refresh: STATUS.
+    pub fn restore_file_from_commit(
+        &mut self,
+        commit: ObjectId,
+        source_path: RelaPath,
+        path: RelaPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let descriptor = OperationDescriptor {
+            kind: OperationKind::Discard,
+            title: format!(
+                "Restore {} from {}",
+                paths_title(std::slice::from_ref(&path)),
+                commit.to_hex_with_len(7)
+            ),
+            detail: None,
+            scope: Scope::Full,
+            untracked: UntrackedCapture::Paths(vec![path.clone()]),
+        };
+        let spec = OpSpec::new(OpKind::RestoreFile, move |env| {
+            let (repo, ctx) = (env.repo, env.ctx);
+            git::stage::restore_from_commit(repo, env.perm(), ctx, commit, &source_path, &path)
         })
         .record(descriptor)
         .base_refresh(RefreshSet::STATUS);

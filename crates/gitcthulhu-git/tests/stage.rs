@@ -2345,3 +2345,97 @@ fn partial_stage_in_a_sparse_index() {
     );
     assert!(t.index_is_sparse(), "the index is still sparse");
 }
+
+// ───────────────────────────── restore from a commit ─────────────────────────────
+
+/// The file gets its content of the commit, as an unstaged change: the index keeps the staged content.
+#[test]
+fn restore_from_commit_same_path_writes_worktree_only() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("f.txt", b"one\n");
+    let first = t.commit_all("one");
+    t.write("f.txt", b"two\n");
+    t.commit_all("two");
+    t.write("f.txt", b"staged\n");
+    t.git(&["add", "f.txt"]);
+    t.write("f.txt", b"worktree\n");
+    let staged = index_id(&t, "f.txt");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    let outcome = stage::restore_from_commit(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        first,
+        &"f.txt".into(),
+        &"f.txt".into(),
+    )
+    .expect("git restore works");
+    assert_eq!(outcome.refresh, RefreshSet::STATUS, "status only");
+    assert_eq!(
+        t.read("f.txt").as_bstr(),
+        b"one\n".as_bstr(),
+        "the worktree file has the commit's content"
+    );
+    assert_eq!(index_id(&t, "f.txt"), staged, "the index is untouched");
+}
+
+/// A file renamed since the commit: the old path's content is written to the current path, the old path stays absent.
+#[test]
+fn restore_from_commit_renamed_writes_current_path() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("old.txt", b"old content\n");
+    let first = t.commit_all("one");
+    t.git(&["mv", "old.txt", "new.txt"]);
+    t.write("new.txt", b"new content\n");
+    t.commit_all("renamed");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    stage::restore_from_commit(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        first,
+        &"old.txt".into(),
+        &"new.txt".into(),
+    )
+    .expect("the blob is written");
+    assert_eq!(
+        t.read("new.txt").as_bstr(),
+        b"old content\n".as_bstr(),
+        "the current path has the old path's content of the commit"
+    );
+    assert!(
+        !t.path.join("old.txt").exists(),
+        "the old path is not recreated"
+    );
+    assert_eq!(
+        index_id(&t, "new.txt"),
+        head_id(&t, "new.txt"),
+        "the index is untouched"
+    );
+}
+
+/// A path the commit does not have is refused before anything is written.
+#[test]
+fn restore_from_commit_missing_path_is_not_found() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("f.txt", b"one\n");
+    let first = t.commit_all("one");
+    t.write("g.txt", b"g\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    let result = stage::restore_from_commit(
+        &repo,
+        guard.write_permission(),
+        &ctx(&t),
+        first,
+        &"missing.txt".into(),
+        &"g.txt".into(),
+    );
+    expect_kind(result, GitErrorKind::NotFound);
+    assert_eq!(t.read("g.txt"), b"g\n".to_vec(), "nothing is written");
+}

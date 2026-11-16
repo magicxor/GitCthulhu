@@ -9,13 +9,14 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, ScrollStrategy, TestApp
 use super::{FileHistoryView, ids};
 use crate::backend::RelaPath;
 use crate::diff::model::DiffMode;
+use crate::menus::MenuItem;
 use crate::metrics;
 use crate::metrics::history as m;
 use crate::settings::DiffViewMode;
 use crate::tab::RepoTab;
 use crate::tab::ui::CloseableView;
 use crate::test_support::geometry::{assert_height, assert_rect, assert_width, bounds};
-use crate::test_support::{DEFAULT_SIZE, Fixture, mount_fixture};
+use crate::test_support::{DEFAULT_SIZE, Fixture, mount_fixture, mount_fixture_with};
 
 const FILE: &str = "src/lib.rs";
 
@@ -381,7 +382,66 @@ fn history_follows_renames_and_lists_deletions(cx: &mut TestAppContext) {
         assert_eq!(&*v.items()[0].summary, "remove");
         let doc = v.diff_doc(cx).expect("the deletion's diff");
         assert_eq!(doc.diff.kind, crate::backend::ChangeKind::Deleted);
+        assert!(
+            matches!(
+                v.row_menu(0).as_slice(),
+                [MenuItem::Action { enabled: false, .. }]
+            ),
+            "the deletion has no content to restore"
+        );
     });
+}
+
+/// A right click on a row offers "Restore file from this commit": the worktree file gets the content of that
+/// commit (read at the old path before a rename), the index stays, and undo brings the overwritten content back.
+#[gpui_kit::test]
+fn restore_file_from_a_history_row(cx: &mut TestAppContext) {
+    let f = Fixture::new();
+    f.write("old.txt", &revision(0));
+    f.commit_all("add old");
+    f.git(&["mv", "old.txt", "new.txt"]);
+    f.write("new.txt", &revision(1));
+    f.commit_all("rename and edit");
+    f.write("new.txt", "uncommitted\n");
+    let (handle, _app, tab) = mount_fixture_with(cx, &f, DEFAULT_SIZE, true);
+    let _view = open(cx, handle, &tab, "new.txt");
+    let restore = format!("menu-item-{}", ids::HISTORY_RESTORE);
+    cx.update_window(handle, |_, window, cx| {
+        window.right_click((ids::HISTORY_ROW, 1usize), cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find(restore.clone()).is_some(),
+            "the menu offers the restore"
+        );
+        window.click(restore.clone(), cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
+    cx.run_until_parked();
+    let read = |path: &str| std::fs::read_to_string(f.path().join(path)).ok();
+    assert_eq!(
+        read("new.txt"),
+        Some(revision(0)),
+        "the content of 'add old'"
+    );
+    assert_eq!(read("old.txt"), None, "the old name is not recreated");
+    assert_eq!(
+        f.git(&["diff", "--cached", "--name-only"]).trim(),
+        "",
+        "nothing is staged"
+    );
+
+    cx.update_window(handle, |_, window, cx| {
+        tab.update(cx, |t, cx| assert!(t.undo(window, cx), "undo starts"))
+    })
+    .expect("window");
+    cx.run_until_parked();
+    cx.run_until_parked();
+    assert_eq!(
+        read("new.txt").as_deref(),
+        Some("uncommitted\n"),
+        "undo restores the overwritten worktree content"
+    );
 }
 
 fn ctx_reload(cx: &mut TestAppContext, tab: &Entity<RepoTab>) {

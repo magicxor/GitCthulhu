@@ -2487,3 +2487,52 @@ fn restore_from_commit_refuses_untracked_target() {
         );
     }
 }
+
+/// A directory in the way is refused too: a file where the index only has entries below that path, and a directory
+/// (holding an ignored file) where a tracked file was.
+#[test]
+fn restore_from_commit_refuses_directory_shapes() {
+    let env = TestEnv::new();
+    let t = env.repo("r");
+    t.write("f.txt", b"one\n");
+    t.write("t.txt", b"tracked\n");
+    t.write("d/child.txt", b"child\n");
+    t.write(".gitignore", b"*.log\n");
+    let first = t.commit_all("one");
+    std::fs::remove_dir_all(t.path.join("d")).expect("the directory can be removed");
+    t.write("d", b"local file\n");
+    t.remove("t.txt");
+    t.write("t.txt/keep.log", b"ignored\n");
+    let repo = t.open();
+    let mut guard = repo.lock_exclusive();
+    for (source, target) in [("f.txt", "d"), ("t.txt", "t.txt")] {
+        let result = stage::restore_from_commit(
+            &repo,
+            guard.write_permission(),
+            &ctx(&t),
+            first,
+            &source.into(),
+            &target.into(),
+        );
+        match result {
+            Err(GitError::WouldOverwrite { paths, .. }) => {
+                assert_eq!(
+                    paths,
+                    [RelaPath::from(target)],
+                    "the path in the way is named"
+                )
+            }
+            other => panic!("{target}: expected WouldOverwrite, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        t.read("d"),
+        b"local file\n".to_vec(),
+        "the untracked file is kept"
+    );
+    assert_eq!(
+        t.read("t.txt/keep.log"),
+        b"ignored\n".to_vec(),
+        "the ignored file is kept"
+    );
+}

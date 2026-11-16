@@ -274,8 +274,9 @@ pub fn discard_paths(
 ///   another): the blob at `source_path` is converted to worktree form with the attributes of `path` and written
 ///   atomically (the permissions of an existing file are kept). Only regular files can be restored this way.
 ///
-/// An existing worktree file at `path` that the index does not track (untracked or ignored) is never overwritten:
-/// the undo snapshot may not hold it. It is refused with [`GitError::WouldOverwrite`] before anything changes.
+/// What the undo snapshot may not hold is never overwritten: an existing worktree file at `path` without an index
+/// entry of its own (untracked or ignored), or a directory at `path`. It is refused with [`GitError::WouldOverwrite`]
+/// before anything changes.
 ///
 /// Errors: `NotFound` if `commit` is not a commit or has no file at `source_path`, `InvalidName` for paths outside
 /// the worktree or a source that cannot be restored (a directory or submodule; a symbolic link after a rename),
@@ -323,11 +324,12 @@ pub fn restore_from_commit(
         });
     }
 
-    let index = read_index(&gix)?;
-    let tracked = TrackedLookup::new(&gix, &index)?.is_tracked(path.as_ref())
-        || content::is_conflicted(&index, path.as_ref());
+    // Only an index entry at `path` itself (any stage) makes it tracked: entries below it would mean a directory.
+    let tracked = read_index(&gix)?.entry_range(path.as_ref()).is_some();
     let target = content::writable_worktree_path(&workdir, path.as_ref())?;
-    if !tracked && std::fs::symlink_metadata(&target).is_ok() {
+    // A directory in the way (also where a tracked file was) holds files the snapshot may not hold.
+    let in_the_way = std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir() || !tracked);
+    if in_the_way {
         return Err(GitError::WouldOverwrite {
             kind: OverwriteKind::Untracked,
             paths: vec![path.clone()],

@@ -903,6 +903,44 @@ fn fixture_push_branch_to_upstream_uses_the_configured_merge_ref(cx: &mut TestAp
     );
 }
 
+/// Waits (test and wall time) until the running operation is over: a push is a real process.
+fn wait_for_op(cx: &mut TestAppContext, tab: &Entity<RepoTab>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        if cx.update(|cx| tab.read(cx).busy().is_none()) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the operation finished"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        cx.executor().advance_clock(Duration::from_millis(20));
+    }
+}
+
+/// A tag name that is not UTF-8 (Git allows any bytes) is refused, not converted: the lossy name would be another
+/// ref (`0xff` becomes U+FFFD) and the push could delete that tag instead.
+#[gpui_kit::test]
+fn fixture_delete_remote_tag_refuses_a_non_utf8_name(cx: &mut TestAppContext) {
+    let r = Remote::new();
+    r.fx.git(&["tag", "\u{FFFD}"]);
+    r.fx.git(&["push", "-q", "origin", "refs/tags/\u{FFFD}"]);
+    let (handle, _app, tab) = mount_fixture(cx, &r.fx, DEFAULT_SIZE);
+    let tag = FullName::try_from(bstr::BString::from(b"refs/tags/\xff".to_vec()))
+        .expect("Git allows any bytes in a ref name");
+    run_on(cx, handle, &tab, move |t, w, cx| {
+        t.delete_remote_tag("origin".to_owned(), tag, w, cx)
+    });
+    wait_for_op(cx, &tab);
+    assert!(
+        r.remote_git(&["tag", "--list"]).contains('\u{FFFD}'),
+        "the tag of the lossy name stays"
+    );
+    assert!(marker_titles(&tab, cx).is_empty(), "nothing was pushed");
+}
+
 /// A tag may be named like a ref of another namespace (`git tag refs/heads/feature` is `refs/tags/refs/heads/feature`).
 /// Deleting it on a remote that has only the branch `feature` must not delete that branch (`git push --delete
 /// refs/heads/feature` would); once the remote has the tag, the tag is deleted and the branch stays.
@@ -914,20 +952,7 @@ fn fixture_delete_remote_tag_named_like_a_branch(cx: &mut TestAppContext) {
     r.fx.git(&["tag", "refs/heads/feature"]);
     let (handle, _app, tab) = mount_fixture(cx, &r.fx, DEFAULT_SIZE);
     let tag = full("refs/tags/refs/heads/feature");
-    // The push is a real process: wait (test and wall time) until the operation is over.
-    let finish = |cx: &mut TestAppContext| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            cx.run_until_parked();
-            if cx.update(|cx| tab.read(cx).busy().is_none()) {
-                return;
-            }
-            assert!(std::time::Instant::now() < deadline, "the push finished");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            cx.executor()
-                .advance_clock(std::time::Duration::from_millis(20));
-        }
-    };
+    let finish = |cx: &mut TestAppContext| wait_for_op(cx, &tab);
     let has_branch = || {
         r.remote_git(&["branch", "--list", "feature"])
             .contains("feature")

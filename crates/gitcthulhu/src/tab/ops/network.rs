@@ -858,7 +858,8 @@ impl RepoTab {
     /// Deletes a tag on a remote. Unguarded, marker `Delete tag '{short name}' on {remote}`. Refresh: REMOTES | TAGS.
     ///
     /// `tag` is the full ref (`refs/tags/x`): the backend takes a name starting with `refs/` as is, so the short name
-    /// of a tag named like `refs/heads/x` would delete the remote branch `x`.
+    /// of a tag named like `refs/heads/x` would delete the remote branch `x`. A name that is not UTF-8 is refused
+    /// (`InvalidName`): its lossy conversion would name another ref.
     pub fn delete_remote_tag(
         &mut self,
         remote: String,
@@ -869,8 +870,13 @@ impl RepoTab {
         let title = format!("Delete tag '{}' on {remote}", tag.shorten().to_str_lossy());
         let label = format!("Push to {remote}");
         let spec = OpSpec::new(OpKind::DeleteRemoteTag, move |env| {
-            let tag = tag.as_bstr().to_str_lossy();
-            git::network::delete_remote_tag(env.repo, env.ctx, &remote, &tag)
+            let Ok(tag) = tag.as_bstr().to_str() else {
+                return Err(GitError::InvalidName {
+                    what: "tag",
+                    name: tag.as_bstr().to_str_lossy().into_owned(),
+                });
+            };
+            git::network::delete_remote_tag(env.repo, env.ctx, &remote, tag)
         })
         .unguarded()
         .marker(move |result| marker_of(OperationKind::DeleteRemoteTag, |_| title, result))

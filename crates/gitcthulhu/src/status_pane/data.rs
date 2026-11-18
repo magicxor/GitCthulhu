@@ -83,6 +83,17 @@ impl ListData {
         }
     }
 
+    /// The file row that shows `path`; `None` while the file is not displayed (filtered out, in a collapsed
+    /// directory, not in this list).
+    pub fn row_of(&self, path: &RelaPath) -> Option<usize> {
+        self.rows.iter().position(|row| match row {
+            TreeRow::File { index, .. } => {
+                self.entries.get(*index).is_some_and(|e| e.path == *path)
+            }
+            TreeRow::Dir { .. } => false,
+        })
+    }
+
     /// The paths of the visible file rows in display order: the order Shift-click ranges use (08 §4.5).
     pub fn visible_paths(&self) -> Vec<RelaPath> {
         visible_file_order(&self.rows)
@@ -177,5 +188,20 @@ mod tests {
             ["src/a/x.rs", "src/b.rs", "src2/c.rs"],
             "directories are not in the range order"
         );
+        // src/, a/, x.rs, b.rs, src2/, c.rs
+        assert_eq!(data.row_of(&RelaPath::from("src/b.rs")), Some(3));
+        assert_eq!(
+            data.row_of(&RelaPath::from("src")),
+            None,
+            "a directory is not a file row"
+        );
+        let collapsed: HashSet<Vec<u8>> = [b"src".to_vec()].into_iter().collect();
+        let data = ListData::build(&entries, None, true, &collapsed);
+        assert_eq!(
+            data.row_of(&RelaPath::from("src/b.rs")),
+            None,
+            "a file in a collapsed directory has no row"
+        );
+        assert_eq!(data.row_of(&RelaPath::from("src2/c.rs")), Some(2));
     }
 }

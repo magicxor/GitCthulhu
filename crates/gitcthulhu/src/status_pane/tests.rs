@@ -20,7 +20,7 @@ use crate::backend::{
 use crate::menus::{self, MenuItem, MenuKind, MenuTarget};
 use crate::metrics::{self, status as m};
 use crate::tab::RepoTab;
-use crate::tab::ui::FileList;
+use crate::tab::ui::{CloseableView, FileList};
 use crate::test_support::geometry::{
     assert_above, assert_height, assert_rect, assert_width, bounds,
 };
@@ -53,6 +53,30 @@ fn render(cx: &mut TestAppContext, handle: AnyWindowHandle) {
     cx.run_until_parked();
     cx.update_window(handle, |_, window, cx| window.render_frame(cx))
         .expect("window");
+}
+
+fn press(cx: &mut TestAppContext, handle: AnyWindowHandle, key: &str) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.press(key, cx);
+    })
+    .expect("window");
+    cx.run_until_parked();
+}
+
+/// The list that holds the file selection and the selected paths in the order they were added.
+fn selection(cx: &mut TestAppContext, tab: &Entity<RepoTab>) -> (Option<FileList>, Vec<String>) {
+    cx.update(|cx| {
+        let ui = tab.read(cx).ctx().ui.read(cx);
+        (
+            ui.files.list,
+            ui.files.paths.iter().map(|p| p.to_string()).collect(),
+        )
+    })
+}
+
+fn one(list: FileList, path: &str) -> (Option<FileList>, Vec<String>) {
+    (Some(list), vec![path.to_owned()])
 }
 
 fn type_message(
@@ -675,6 +699,176 @@ fn click_ctrl_and_shift_select_in_one_list(cx: &mut TestAppContext) {
         (Some(FileList::Staged), vec!["s.txt".into()]),
         "the selection lives in one list only"
     );
+}
+
+fn two_and_two() -> RepoSeed {
+    seed(
+        &[("s1.txt", ChangeKind::Added), ("s2.txt", ChangeKind::Added)],
+        &[
+            ("u1.txt", ChangeKind::Modified),
+            ("u2.txt", ChangeKind::Modified),
+        ],
+    )
+}
+
+/// After a click on a file row Up / Down walk the staged and the unstaged files as one cyclic sequence in screen
+/// order; the diff follows the selection.
+#[gpui_kit::test]
+fn arrow_keys_walk_both_lists_and_wrap(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, two_and_two(), DEFAULT_SIZE);
+    render(cx, handle);
+    cx.update_window(handle, |_, window, cx| {
+        window.click(rid(ids::STAGED.row, 0), cx)
+    })
+    .expect("window");
+    assert_eq!(selection(cx, &tab), one(FileList::Staged, "s1.txt"));
+    press(cx, handle, "down");
+    assert_eq!(selection(cx, &tab), one(FileList::Staged, "s2.txt"));
+    press(cx, handle, "down");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Unstaged, "u1.txt"),
+        "past the last staged file: on to the list below"
+    );
+    cx.update(|cx| {
+        assert!(
+            tab.read(cx)
+                .ctx()
+                .ui
+                .read(cx)
+                .views
+                .contains(CloseableView::Diff),
+            "the diff follows the selection"
+        );
+    });
+    press(cx, handle, "down");
+    assert_eq!(selection(cx, &tab), one(FileList::Unstaged, "u2.txt"));
+    press(cx, handle, "down");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Staged, "s1.txt"),
+        "past the very last file: back to the very first"
+    );
+    press(cx, handle, "up");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Unstaged, "u2.txt"),
+        "above the very first file: on to the very last"
+    );
+    press(cx, handle, "up");
+    press(cx, handle, "up");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Staged, "s2.txt"),
+        "above the first unstaged file: on to the list above"
+    );
+
+    // Several selected files: the arrows start at the most recently clicked one and leave one file selected.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(rid(ids::UNSTAGED.row, 0), cx);
+        click_with(
+            window,
+            cx,
+            rid(ids::UNSTAGED.row, 1),
+            Modifiers::shift(),
+            MouseButton::Left,
+        );
+    })
+    .expect("window");
+    assert_eq!(selection(cx, &tab).1, ["u1.txt", "u2.txt"]);
+    press(cx, handle, "up");
+    assert_eq!(selection(cx, &tab), one(FileList::Unstaged, "u1.txt"));
+}
+
+/// The arrows follow the order on the screen: with "swap staged and unstaged" the unstaged list comes first.
+#[gpui_kit::test]
+fn arrow_keys_follow_the_swapped_order(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, two_and_two(), DEFAULT_SIZE);
+    cx.update(|cx| crate::settings::update(cx, |s| s.swap_status_panes = true));
+    render(cx, handle);
+    cx.update_window(handle, |_, window, cx| {
+        window.click(rid(ids::UNSTAGED.row, 1), cx)
+    })
+    .expect("window");
+    press(cx, handle, "down");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Staged, "s1.txt"),
+        "the staged list is the lower one"
+    );
+    press(cx, handle, "down");
+    press(cx, handle, "down");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Unstaged, "u1.txt"),
+        "past the last staged file: back to the top"
+    );
+    press(cx, handle, "up");
+    assert_eq!(selection(cx, &tab), one(FileList::Staged, "s2.txt"));
+}
+
+/// Tree mode with nothing staged: the arrows skip directory rows and the empty list.
+#[gpui_kit::test]
+fn arrow_keys_skip_directories_and_an_empty_list(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(
+        cx,
+        seed(
+            &[],
+            &[
+                ("src/a.rs", ChangeKind::Modified),
+                ("src/sub/b.rs", ChangeKind::Added),
+                ("z.txt", ChangeKind::Modified),
+            ],
+        ),
+        DEFAULT_SIZE,
+    );
+    cx.update(|cx| crate::settings::update(cx, |s| s.changes_as_tree = true));
+    render(cx, handle);
+    // src/, a.rs, sub/, b.rs, z.txt
+    cx.update_window(handle, |_, window, cx| {
+        window.click(rid(ids::UNSTAGED.row, 1), cx)
+    })
+    .expect("window");
+    assert_eq!(selection(cx, &tab), one(FileList::Unstaged, "src/a.rs"));
+    press(cx, handle, "down");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Unstaged, "src/sub/b.rs"),
+        "the directory row is skipped"
+    );
+    press(cx, handle, "down");
+    press(cx, handle, "down");
+    assert_eq!(
+        selection(cx, &tab),
+        one(FileList::Unstaged, "src/a.rs"),
+        "nothing is staged: the unstaged list wraps onto itself"
+    );
+    press(cx, handle, "up");
+    assert_eq!(selection(cx, &tab), one(FileList::Unstaged, "z.txt"));
+    // Collapse sub/: its file is no longer a stop.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(rid(ids::UNSTAGED.dir_row, 2), cx);
+    })
+    .expect("window");
+    press(cx, handle, "up");
+    assert_eq!(selection(cx, &tab), one(FileList::Unstaged, "src/a.rs"));
+}
+
+/// The arrows belong to the lists: while the commit message has the focus they move its caret, not the selection.
+#[gpui_kit::test]
+fn arrows_in_the_commit_message_keep_the_selection(cx: &mut TestAppContext) {
+    let (handle, _app, tab) = mount_seeded(cx, two_and_two(), DEFAULT_SIZE);
+    render(cx, handle);
+    cx.update_window(handle, |_, window, cx| {
+        window.click(rid(ids::UNSTAGED.row, 0), cx)
+    })
+    .expect("window");
+    type_message(cx, handle, &tab, "subject");
+    press(cx, handle, "down");
+    press(cx, handle, "up");
+    assert_eq!(selection(cx, &tab), one(FileList::Unstaged, "u1.txt"));
 }
 
 #[gpui_kit::test]

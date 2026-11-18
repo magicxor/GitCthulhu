@@ -1,6 +1,7 @@
 //! The staged/unstaged changes lists (owned by G5; 08 §4.2-§4.5, spec 21 §4.4): header with the list/tree toggle,
 //! the file filter and the stage-all button; a virtualised list or tree of file rows with multi-selection through
-//! `RepoUi::click_file`, the hover action, double-click staging and context menus.
+//! `RepoUi::click_file`, the hover action, double-click staging and context menus. A click on a row gives the
+//! keyboard to the pane, whose Up / Down walk the files of both lists (`StatusPaneView::move_selection`).
 //!
 //! The rows are plain elements built for the visible range only (no per-row entities). The row data is rebuilt
 //! when the status, the filter, the view mode or the collapsed set change, never per frame.
@@ -10,10 +11,10 @@ use std::sync::Arc;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
-    UniformListScrollHandle, Window, div, uniform_list,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, Modifiers, MouseButton, ParentElement as _, Pixels,
+    Point, Render, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TestSupportExt as _, UniformListScrollHandle, Window, div, uniform_list,
 };
 
 use super::ListIds;
@@ -76,6 +77,8 @@ pub struct ChangesList {
     list: FileList,
     search: Entity<SearchField>,
     scroll: UniformListScrollHandle,
+    /// Keyboard focus of the pane's lists, taken by a click on a row.
+    focus: FocusHandle,
     collapsed: HashSet<Vec<u8>>,
     collapsed_rev: u64,
     data: Arc<ListData>,
@@ -84,8 +87,15 @@ pub struct ChangesList {
 }
 
 impl ChangesList {
-    /// The staged (`FileList::Staged`) or unstaged list of the tab of `ctx`.
-    pub fn new(ctx: TabCtx, list: FileList, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// The staged (`FileList::Staged`) or unstaged list of the tab of `ctx`. `focus` is the pane's keyboard focus
+    /// for both lists: a click on a row takes it, so Up / Down move the selection from then on.
+    pub fn new(
+        ctx: TabCtx,
+        list: FileList,
+        focus: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let ids = ids::of(list);
         let search =
             cx.new(|cx| SearchField::new(ids.search, "Search files by name or path", window, cx));
@@ -109,6 +119,7 @@ impl ChangesList {
             list,
             search,
             scroll: UniformListScrollHandle::new(),
+            focus,
             collapsed: HashSet::new(),
             collapsed_rev: 0,
             data: Arc::new(ListData::build(&[], None, false, &HashSet::new())),
@@ -280,6 +291,28 @@ impl ChangesList {
         self.ctx.ui.update(cx, |ui, cx| {
             ui.click_file(list, entry.path.clone(), mods, &order, cx)
         });
+        // Up / Down move the selection from here on.
+        window.focus(&self.focus, cx);
+    }
+
+    /// Selects the file of `row` alone, like a plain click (the diff follows), and scrolls it into view: where
+    /// the pane's Up / Down land.
+    pub(super) fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.data.entry_of_row(row).map(|entry| entry.path.clone()) else {
+            return;
+        };
+        let list = self.list;
+        self.ctx.ui.update(cx, |ui, cx| {
+            ui.click_file(
+                list,
+                path.clone(),
+                Modifiers::default(),
+                std::slice::from_ref(&path),
+                cx,
+            )
+        });
+        self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        cx.notify();
     }
 
     fn row_action(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -300,11 +333,13 @@ impl ChangesList {
         }
     }
 
-    fn toggle_dir(&mut self, path: Vec<u8>, cx: &mut Context<Self>) {
+    fn toggle_dir(&mut self, path: Vec<u8>, window: &mut Window, cx: &mut Context<Self>) {
         if !self.collapsed.remove(&path) {
             self.collapsed.insert(path);
         }
         self.collapsed_rev += 1;
+        // The arrows keep working in the list that was just folded or unfolded.
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -480,13 +515,15 @@ impl ChangesList {
                                         *depth,
                                         *expanded,
                                     )
-                                    .on_toggle(move |_, cx| {
-                                        toggle_this
-                                            .update(cx, |l, cx| {
-                                                l.toggle_dir(toggle_path.clone(), cx)
-                                            })
-                                            .ok();
-                                    }),
+                                    .on_toggle(
+                                        move |window, cx| {
+                                            toggle_this
+                                                .update(cx, |l, cx| {
+                                                    l.toggle_dir(toggle_path.clone(), window, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    ),
                                 )
                                 .into_any_element()
                         }

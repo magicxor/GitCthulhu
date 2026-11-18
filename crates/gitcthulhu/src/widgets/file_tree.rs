@@ -113,11 +113,162 @@ pub fn visible_file_order(rows: &[TreeRow]) -> Vec<usize> {
         .collect()
 }
 
+/// The nearest file row after (`forward`) or before `from`, skipping directory rows; with no `from` the first
+/// (`forward`) or the last file row. `None` when there is no such row (the end of `rows`).
+fn adjacent_file_row(rows: &[TreeRow], from: Option<usize>, forward: bool) -> Option<usize> {
+    let is_file = |row: &usize| matches!(rows[*row], TreeRow::File { .. });
+    match (from, forward) {
+        (Some(from), true) => (from + 1..rows.len()).find(is_file),
+        (Some(from), false) => (0..from.min(rows.len())).rev().find(is_file),
+        (None, true) => (0..rows.len()).find(is_file),
+        (None, false) => (0..rows.len()).rev().find(is_file),
+    }
+}
+
+/// The file row that Up / Down move to. `lists` are the rows of the lists from top to bottom; their file rows are
+/// walked as one cyclic sequence: directory rows and lists without files are skipped, the first file follows the
+/// last one and the other way round. `from` is the `(list, row)` of the current file; without it the walk starts
+/// at the first (`forward`) or the last file. `None` when there is no other file row to move to.
+pub fn cyclic_file_row(
+    lists: &[&[TreeRow]],
+    from: Option<(usize, usize)>,
+    forward: bool,
+) -> Option<(usize, usize)> {
+    let count = lists.len();
+    // Where the walk enters a list: its first file going down, its last one going up.
+    let enter = |list: usize| adjacent_file_row(lists[list], None, forward).map(|row| (list, row));
+    let Some((list, row)) = from else {
+        return if forward {
+            (0..count).find_map(enter)
+        } else {
+            (0..count).rev().find_map(enter)
+        };
+    };
+    adjacent_file_row(lists.get(list)?, Some(row), forward)
+        .map(|row| (list, row))
+        .or_else(|| {
+            // The other lists in walking order; the last step re-enters this list at its far end.
+            (1..=count)
+                .map(|step| {
+                    if forward {
+                        (list + step) % count
+                    } else {
+                        (list + count - step) % count
+                    }
+                })
+                .find_map(enter)
+        })
+        .filter(|target| Some(*target) != from)
+}
+
 #[cfg(test)]
 mod tests {
     use core::prelude::v1::test;
 
     use super::*;
+
+    const NO_ROWS: &[TreeRow] = &[];
+
+    #[test]
+    fn adjacent_file_row_skips_directories_and_stops_at_the_ends() {
+        // a/, b/, one.txt, two.txt, top.txt
+        let rows = flatten_tree(&["a/b/one.txt", "a/two.txt", "top.txt"], &HashSet::new());
+        assert_eq!(adjacent_file_row(&rows, None, true), Some(2));
+        assert_eq!(adjacent_file_row(&rows, None, false), Some(4));
+        assert_eq!(adjacent_file_row(&rows, Some(2), true), Some(3));
+        assert_eq!(adjacent_file_row(&rows, Some(3), false), Some(2));
+        assert_eq!(
+            adjacent_file_row(&rows, Some(2), false),
+            None,
+            "only directories above"
+        );
+        assert_eq!(adjacent_file_row(&rows, Some(4), true), None);
+        assert_eq!(adjacent_file_row(&rows, Some(0), true), Some(2));
+        assert_eq!(adjacent_file_row(NO_ROWS, None, true), None);
+    }
+
+    #[test]
+    fn cyclic_file_row_wraps_within_one_list() {
+        // a/, b/, one.txt, two.txt, top.txt
+        let rows = flatten_tree(&["a/b/one.txt", "a/two.txt", "top.txt"], &HashSet::new());
+        let lists = [rows.as_slice()];
+        assert_eq!(cyclic_file_row(&lists, Some((0, 2)), true), Some((0, 3)));
+        assert_eq!(cyclic_file_row(&lists, Some((0, 3)), false), Some((0, 2)));
+        assert_eq!(
+            cyclic_file_row(&lists, Some((0, 4)), true),
+            Some((0, 2)),
+            "past the last file: the first file, below the directory rows"
+        );
+        assert_eq!(
+            cyclic_file_row(&lists, Some((0, 2)), false),
+            Some((0, 4)),
+            "above the first file: the last one"
+        );
+        assert_eq!(
+            cyclic_file_row(&lists, None, true),
+            Some((0, 2)),
+            "no current file: Down starts at the first one"
+        );
+        assert_eq!(
+            cyclic_file_row(&lists, None, false),
+            Some((0, 4)),
+            "and Up at the last one"
+        );
+    }
+
+    #[test]
+    fn cyclic_file_row_crosses_lists_and_skips_empty_ones() {
+        let top = flatten_list(&["a", "b"]);
+        let bottom = flatten_list(&["c", "d"]);
+        let lists = [top.as_slice(), NO_ROWS, bottom.as_slice()];
+        assert_eq!(
+            cyclic_file_row(&lists, Some((0, 1)), true),
+            Some((2, 0)),
+            "past the end of a list: the first file of the next list with files"
+        );
+        assert_eq!(
+            cyclic_file_row(&lists, Some((2, 1)), true),
+            Some((0, 0)),
+            "past the last list: the first one"
+        );
+        assert_eq!(
+            cyclic_file_row(&lists, Some((2, 0)), false),
+            Some((0, 1)),
+            "above the start of a list: the last file of the previous list with files"
+        );
+        assert_eq!(
+            cyclic_file_row(&lists, Some((0, 0)), false),
+            Some((2, 1)),
+            "above the first list: the last one"
+        );
+        let lists = [NO_ROWS, bottom.as_slice(), NO_ROWS];
+        assert_eq!(cyclic_file_row(&lists, None, true), Some((1, 0)));
+        assert_eq!(cyclic_file_row(&lists, None, false), Some((1, 1)));
+        assert_eq!(
+            cyclic_file_row(&lists, Some((1, 1)), true),
+            Some((1, 0)),
+            "the only list with files wraps onto itself"
+        );
+    }
+
+    #[test]
+    fn cyclic_file_row_has_nowhere_to_go_without_another_file() {
+        let only = flatten_list(&["a"]);
+        let lists = [only.as_slice(), NO_ROWS];
+        assert_eq!(
+            cyclic_file_row(&lists, Some((0, 0)), true),
+            None,
+            "the only file stays the current one"
+        );
+        assert_eq!(cyclic_file_row(&lists, Some((0, 0)), false), None);
+        assert_eq!(cyclic_file_row(&[NO_ROWS, NO_ROWS], None, true), None);
+        assert_eq!(cyclic_file_row(&[], None, false), None);
+        assert_eq!(
+            cyclic_file_row(&lists, Some((2, 0)), true),
+            None,
+            "a position outside the lists"
+        );
+    }
 
     fn describe(rows: &[TreeRow]) -> Vec<String> {
         rows.iter()

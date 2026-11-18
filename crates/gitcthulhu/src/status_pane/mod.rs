@@ -3,11 +3,15 @@
 //!
 //! Layout (08 §4.1): a column with 8 dp padding at the end and the bottom, the two lists (equal heights, 4 dp gap
 //! below each, staged on top unless "swap staged and unstaged" is set) and the 192 dp commit box.
+//!
+//! Keyboard: after a click on a file row the lists have the keyboard focus and Up / Down select the file above /
+//! below. The files of both lists are one cyclic sequence in the order on the screen: the first file of the lower
+//! list follows the last file of the upper one, and the very first file follows the very last one.
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    Subscription, Window, div,
+    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    KeyBinding, ParentElement as _, Render, Styled as _, Subscription, Window, div,
 };
 
 use crate::metrics::{self, dp, status as m};
@@ -15,6 +19,7 @@ use crate::settings::SettingsGlobal;
 use crate::tab::TabCtx;
 use crate::tab::ui::FileList;
 use crate::theme::ActiveTokens as _;
+use crate::widgets::file_tree::cyclic_file_row;
 use crate::widgets::{LinearProgress, observed};
 
 pub mod actions;
@@ -26,6 +31,19 @@ mod tabs;
 
 use changes_list::ChangesList;
 use commit_box::CommitBox;
+
+/// Key context of the two changes lists (Up / Down move the file selection).
+pub const STATUS_LISTS_CONTEXT: &str = "StatusLists";
+
+gpui_kit::actions!(
+    gitcthulhu_status,
+    [
+        /// Selects the file above the selected one, across both lists (Up).
+        SelectPreviousFile,
+        /// Selects the file below the selected one, across both lists (Down).
+        SelectNextFile,
+    ]
+);
 
 /// Element ids of one changes list.
 #[derive(Clone, Copy, Debug)]
@@ -115,6 +133,9 @@ pub struct StatusPaneView {
     staged: Entity<ChangesList>,
     unstaged: Entity<ChangesList>,
     commit_box: Entity<CommitBox>,
+    /// Keyboard focus of the two lists (taken by a click on a row); a zero-size target, so it is not an ancestor
+    /// of the lists' filter fields.
+    focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -122,8 +143,13 @@ impl StatusPaneView {
     /// The status pane of the tab of `ctx`.
     pub fn new(ctx: TabCtx, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (staged_ctx, unstaged_ctx, box_ctx) = (ctx.clone(), ctx.clone(), ctx.clone());
-        let staged = cx.new(|cx| ChangesList::new(staged_ctx, FileList::Staged, window, cx));
-        let unstaged = cx.new(|cx| ChangesList::new(unstaged_ctx, FileList::Unstaged, window, cx));
+        let focus = cx.focus_handle();
+        let (staged_focus, unstaged_focus) = (focus.clone(), focus.clone());
+        let staged =
+            cx.new(|cx| ChangesList::new(staged_ctx, FileList::Staged, staged_focus, window, cx));
+        let unstaged = cx.new(|cx| {
+            ChangesList::new(unstaged_ctx, FileList::Unstaged, unstaged_focus, window, cx)
+        });
         let commit_box = cx.new(|cx| CommitBox::new(box_ctx, window, cx));
         let subscriptions = vec![
             cx.observe(&ctx.model, |_, _, cx| cx.notify()),
@@ -134,6 +160,7 @@ impl StatusPaneView {
             staged,
             unstaged,
             commit_box,
+            focus,
             _subscriptions: subscriptions,
         }
     }
@@ -157,18 +184,53 @@ impl StatusPaneView {
     pub fn unstaged(&self) -> &Entity<ChangesList> {
         &self.unstaged
     }
+
+    /// The two lists from top to bottom: staged first unless "swap staged and unstaged" is set (08 §4.1).
+    fn lists_in_screen_order(&self, cx: &App) -> [(FileList, &Entity<ChangesList>); 2] {
+        let mut lists = [
+            (FileList::Staged, &self.staged),
+            (FileList::Unstaged, &self.unstaged),
+        ];
+        if view_settings(cx).1 {
+            lists.reverse();
+        }
+        lists
+    }
+
+    /// Up / Down: selects the file above / below the selected one like a click (the diff follows) and scrolls it
+    /// into view. The files of both lists are one cyclic sequence in screen order, so the selection crosses from
+    /// one list into the other and wraps around at the very first and the very last file. Of several selected
+    /// files the most recently clicked one is the starting point. A selection that is not displayed (filtered
+    /// out, in a collapsed directory) moves to the first / last file.
+    fn move_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let lists = self.lists_in_screen_order(cx);
+        let data = lists.map(|(_, list)| list.read(cx).data().clone());
+        let from = {
+            let files = &self.ctx.ui.read(cx).files;
+            files
+                .anchor
+                .as_ref()
+                .or_else(|| files.paths.last())
+                .and_then(|path| {
+                    let at = lists
+                        .iter()
+                        .position(|(kind, _)| Some(*kind) == files.list)?;
+                    Some((at, data[at].row_of(path)?))
+                })
+        };
+        let rows = [data[0].rows.as_slice(), data[1].rows.as_slice()];
+        let Some((at, row)) = cyclic_file_row(&rows, from, forward) else {
+            return;
+        };
+        lists[at].1.update(cx, |list, cx| list.select_row(row, cx));
+    }
 }
 
 impl Render for StatusPaneView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.tokens();
-        let swap = view_settings(cx).1;
         let loading = self.ctx.model.read(cx).status.loading;
-        let (first, second) = if swap {
-            (self.unstaged.clone(), self.staged.clone())
-        } else {
-            (self.staged.clone(), self.unstaged.clone())
-        };
+        let [first, second] = self.lists_in_screen_order(cx).map(|(_, list)| list.clone());
         observed(ids::STATUS_PANE)
             .size_full()
             .relative()
@@ -183,6 +245,16 @@ impl Render for StatusPaneView {
                     .w_full()
                     .flex()
                     .flex_col()
+                    .key_context(STATUS_LISTS_CONTEXT)
+                    .on_action(cx.listener(|pane, _: &SelectPreviousFile, _, cx| {
+                        pane.move_selection(false, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|pane, _: &SelectNextFile, _, cx| {
+                            pane.move_selection(true, cx)
+                        }),
+                    )
+                    .child(div().track_focus(&self.focus).size_0())
                     .child(
                         div()
                             .flex_1()
@@ -226,9 +298,15 @@ pub(crate) fn view_settings(cx: &App) -> (bool, bool) {
         })
 }
 
-/// Registers the status pane's key bindings, actions and menu extenders (G5).
+/// Registers the status pane's key bindings, actions and menu extenders (G5): the commit box's and Up / Down in
+/// [`STATUS_LISTS_CONTEXT`].
 pub fn register(cx: &mut App) {
     commit_box::register(cx);
+    let context = Some(STATUS_LISTS_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPreviousFile, context),
+        KeyBinding::new("down", SelectNextFile, context),
+    ]);
 }
 
 #[cfg(test)]

@@ -6,7 +6,8 @@
 //! The previous commit's content stays visible while the next one loads (anti-flicker); a progress bar appears
 //! only when loading takes longer than 150 ms. Only one file can be selected; selecting it opens its diff in the
 //! centre pane (`RepoUi::click_file`). After a click on a row the list has the keyboard focus: Up / Down select the
-//! previous / next file (directory rows of tree mode are skipped). The loaded files are also published in `RepoUi::commit_files`, which is
+//! previous / next file (directory rows of tree mode are skipped, and the list is cyclic: the first file follows the
+//! last one). The loaded files are also published in `RepoUi::commit_files`, which is
 //! where `RepoUi::diff_target` takes renames and the untracked files of a stash from.
 
 use std::collections::HashSet;
@@ -24,6 +25,7 @@ use crate::notifications::ToastKind;
 use crate::tab::ui::{CloseableView, FileList};
 use crate::tab::{ReadSlot, RepoUiEvent, TabCtx};
 use crate::widgets::field::{SearchEvent, SearchField};
+use crate::widgets::file_tree::cyclic_file_row;
 
 pub mod platform;
 mod render;
@@ -474,7 +476,8 @@ impl CommitChangesView {
         cx.notify();
     }
 
-    /// Up / Down: selects the previous / next file row like a click (the diff follows) and scrolls it into view. A
+    /// Up / Down: selects the previous / next file row like a click (the diff follows) and scrolls it into view.
+    /// The list is cyclic: Down on the last file selects the first one, Up on the first file the last one. A
     /// selection that is not in the list (filtered out, in a collapsed directory) moves to the first / last file.
     fn move_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
         if !self.list_is_current() {
@@ -493,7 +496,8 @@ impl CommitChangesView {
         let path_of = |row: usize| Some(&loaded.files.get(self.rows.file_index(row)?)?.path);
         let from = selected
             .and_then(|selected| (0..self.rows.len()).find(|&row| path_of(row) == Some(&selected)));
-        let Some(row) = self.rows.adjacent_file_row(from, forward) else {
+        let from = from.map(|row| (0, row));
+        let Some((_, row)) = cyclic_file_row(&[self.rows.rows.as_slice()], from, forward) else {
             return;
         };
         let Some(path) = path_of(row).cloned() else {

@@ -836,7 +836,8 @@ fn selected_path(cx: &mut TestAppContext, ui: &Entity<RepoUi>) -> Option<RelaPat
     cx.update(|cx| ui.read(cx).files.single(FileList::CommitFiles).cloned())
 }
 
-/// Up / Down move the single selection to the neighbouring file after a click on a file row; the diff follows.
+/// Up / Down move the single selection to the neighbouring file after a click on a file row, wrapping around at
+/// the ends of the list; the diff follows.
 #[gpui_kit::test]
 fn arrow_keys_move_the_selection_in_list_mode(cx: &mut TestAppContext) {
     let h = history();
@@ -851,8 +852,14 @@ fn arrow_keys_move_the_selection_in_list_mode(cx: &mut TestAppContext) {
     press(cx, handle, "up");
     assert_eq!(
         selected_path(cx, &ui),
+        Some(RelaPath::from("src/renamed.rs")),
+        "Up on the first file wraps to the last one"
+    );
+    press(cx, handle, "down");
+    assert_eq!(
+        selected_path(cx, &ui),
         Some(RelaPath::from("docs/guide.md")),
-        "Up on the first file keeps it"
+        "Down on the last file wraps to the first one"
     );
     press(cx, handle, "down");
     press(cx, handle, "down");
@@ -863,14 +870,6 @@ fn arrow_keys_move_the_selection_in_list_mode(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(ui.read(cx).views.contains(CloseableView::Diff)));
     press(cx, handle, "up");
     assert_eq!(selected_path(cx, &ui), Some(RelaPath::from("src/lib.rs")));
-    press(cx, handle, "down");
-    press(cx, handle, "down");
-    press(cx, handle, "down");
-    assert_eq!(
-        selected_path(cx, &ui),
-        Some(RelaPath::from("src/renamed.rs")),
-        "Down on the last file keeps it"
-    );
 }
 
 /// Tree mode: the arrows skip directory rows and the files of collapsed directories.
